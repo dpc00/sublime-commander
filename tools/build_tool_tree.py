@@ -160,7 +160,7 @@ put("packages_and_dev/create", "new_build_system new_plugin new_snippet new_synt
 put("packages_and_dev/diagnostics", "profile_plugins profile_syntax_definition "
     "run_syntax_tests")
 put("app/windows", "new_window close_window resize_window")
-put("app/native_dialogs", "list_native_windows dismiss_native_window ui_press_key ui_type_text ui_click ui_hover")
+put("app/native_dialogs", "list_native_windows dismiss_native_window ui_press_key ui_type_text ui_set_text ui_click ui_hover")
 put("app/coordination", "claim_resource release_resource list_claims")
 put("app/prompts", "prompt_open_file prompt_save_as")
 put("app/license_and_updates", "purchase_license upgrade_license remove_license show_license_window "

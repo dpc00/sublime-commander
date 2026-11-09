@@ -55,6 +55,7 @@
      "ui_click",
      "ui_hover",
      "ui_press_key",
+     "ui_set_text",
      "ui_type_text"
     ]
    },

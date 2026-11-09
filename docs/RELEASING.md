@@ -1,26 +1,21 @@
----
-name: release
-description: Cut a complete sublime-commander release — version strings, CHANGELOG, guide and skill updates committed in the tagged commit, then GitHub, PyPI and npm — with the two git commands that prove nothing was left behind. Use before and after every tag.
----
-
 # Cutting a sublime-commander release
 
 Ten releases have gone out incomplete. Every one was the same miss: something the release claimed —
-a document, a skill, a note, a version string — was written but was **not in the commit the tag
-points at**. It was committed afterwards, so the tag shipped the previous text.
+a document, a note, a version string — was written but was **not in the commit the tag points at**.
+It was committed afterwards, so the tag shipped the previous text.
 
 ## The invariant
 
 > The tagged commit contains everything the release claims.
 
-Version strings, the `CHANGELOG.md` section, and every guide, skill or note written for that release
-are committed **in** the release commit, and the tag points at it.
+Version strings, the `CHANGELOG.md` section, and every guide or note written for that release are
+committed **in** the release commit, and the tag points at it.
 
 ## Sequence
 
-1. **Finish the prose first**, in one commit: `CHANGELOG.md` section for the version, and whatever the
-   change needs in `AGENT_GUIDE.md` (and `docs/AGENT_GUIDE.md`, which is the same text served by
-   `get_help`), `skills/`, and `.claude/memory/` notes.
+1. **Finish the prose first**, in one commit: the `CHANGELOG.md` section for the version, and
+   whatever the change needs in `AGENT_GUIDE.md` (and `docs/AGENT_GUIDE.md`, which is the same text
+   served by `get_help`), the skills, and `.claude/memory/` notes.
 2. **Bump both version strings in that same commit**:
    - `sublime_mcp.py` → `__version__`
    - `server.json` → `version`
@@ -41,7 +36,7 @@ are committed **in** the release commit, and the tag points at it.
 - There are no registry artifacts any more: releases are a tag and a GitHub release whose notes are
   the CHANGELOG section. That is not permission to tag early — readers get the guide *at the tag*, and
   the tag's copy is the one that must be current.
-- A release was once tagged while the code fix it announced was only in the live package file and never
-  committed. `git show v<version> --name-only` before publishing: the fix must be in the commit.
-- `docs/AGENT_GUIDE.md` and `AGENT_GUIDE.md` are duplicates; updating one and not the other leaves the
-  `get_help` text and the repo text disagreeing.
+- A release was once tagged while the code fix it announced was only in the live package file and
+  never committed. `git show v<version> --name-only` before publishing: the fix must be in the commit.
+- `docs/AGENT_GUIDE.md` and `AGENT_GUIDE.md` are duplicates; updating one and not the other leaves
+  the `get_help` text and the repo text disagreeing.

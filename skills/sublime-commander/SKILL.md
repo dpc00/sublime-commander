@@ -36,6 +36,13 @@ Never put a starting call and its read-back in one `batch`; the read runs immedi
 `settle_ms`/`wait_ms`/`wait_idle_s` are observation windows the caller asks for, not the tool
 deciding to wait. When writing or reviewing a handler, a sleep is a defect.
 
+## Where the rest of the guidance is
+
+`get_help(section=...)` carries the full text, and it is the only other briefing: "When a native
+dialog blocks Sublime (Windows)", "Reading the console", "Silent failures and timeouts", "Installs,
+restarts and quick panels", "Packages, menus, palette and input panels", "Tools with side effects".
+There are no other skill files to read.
+
 ## Tool choice: the editor, because it is faster
 
 Sublime Text is the fast path: a sublime-commander call runs inside the editor process that already holds

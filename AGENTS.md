@@ -61,7 +61,8 @@ then delete the fork and the clone.
 
 - `AGENT_GUIDE.md` — using sublime-commander's own tools; `docs/COMMAND_TOOLS.md` for the generated
   command tools.
+- `skills/sublime-commander/SKILL.md` — the short tool briefing; `AGENT_GUIDE.md` is the full text.
+- `docs/RELEASING.md` — cutting a release; `docs/PACKAGE_SKILLS.md` — documenting another package's
+  controls as a skill.
 - `.claude/memory/reference_condensed_all_notes_2026_10_31.md` — the dated one-notes file; its
   "Bug log" is where a halt, stall or wrong-tab action is recorded.
-- `skills/sublime-dialogs/SKILL.md` — native dialogs; `skills/screenshot-routing/SKILL.md` —
-  screenshots of the host Sublime.

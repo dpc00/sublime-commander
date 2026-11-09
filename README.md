@@ -61,7 +61,7 @@ discover_tools(query="screenshot")
 batch(calls=[{tool: "get_sheets", args: {}}, {tool: "get_console", args: {lines: 20}}])
 ```
 
-If you are writing the agent side, read [AGENT_GUIDE.md](AGENT_GUIDE.md) first: it is the order the tools should be used in, including the traps. The same guidance ships as a skill in `skills/sublime-commander`; `skills/package-skill-generator` turns a one-off investigation of any other Sublime package — a debugger, a language server — into a small reusable skill instead of another MCP server.
+If you are writing the agent side, read [AGENT_GUIDE.md](AGENT_GUIDE.md) first: it is the order the tools should be used in, including the traps. The same guidance ships as a skill in `skills/sublime-commander`; [docs/PACKAGE_SKILLS.md](docs/PACKAGE_SKILLS.md) turns a one-off investigation of any other Sublime package — a debugger, a language server — into a small reusable skill instead of another MCP server.
 
 ## Configuration
 

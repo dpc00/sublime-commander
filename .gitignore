@@ -47,3 +47,11 @@ CLAUDE.local.md
 
 mcp_cl.md
 .sass-cache/.nrepl-port
+
+# --- omp .gitignore basics (2026-11-09) ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+

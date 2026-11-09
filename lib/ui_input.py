@@ -22,6 +22,9 @@ SUPPORTED = sys.platform == "win32"
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WM_CHAR = 0x0102
+WM_SETTEXT = 0x000C
+WM_GETTEXT = 0x000D
+WM_GETTEXTLENGTH = 0x000E
 WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
 PW_RENDERFULLCONTENT = 0x00000002
@@ -481,6 +484,36 @@ def type_text(pid, hwnd, text, settle_ms=150):
             _user32.PostMessageW(hwnd, WM_CHAR, code, 1)
     _settle(settle_ms)
     return {"ok": True, "method": "post", "hwnd": hwnd, "characters": len(text)}
+
+
+def set_text(pid, hwnd, text, settle_ms=150):
+    """Replace the text of one native control (an edit box or combo) of process ``pid``.
+
+    WM_SETTEXT sets the value whether or not the control is focused, which is the only reliable
+    way to fill a native dialog's field: posting characters (ui_type_text) only reaches a control
+    that is already handling keyboard input, and a common file dialog's "File name:" box is a
+    child of the dialog, so typing at the dialog's own hwnd reaches nothing (measured 2026-11-09,
+    Image Link Insertion's Open dialog). Both messages are system messages, so Windows marshals
+    the string buffer across the process boundary; the value is read back and returned rather than
+    an unconditional ok."""
+    err = _check(pid, hwnd)
+    if err:
+        return err
+    value = "" if text is None else str(text)
+    if len(value) > 2000:
+        value = value[:2000]
+    buf = ctypes.create_unicode_buffer(value, len(value) + 1)
+    flags = 0x0001 | 0x0002  # SMTO_BLOCK | SMTO_ABORTIFHUNG
+    result = ctypes.c_size_t()
+    _user32.SendMessageTimeoutW(hwnd, WM_SETTEXT, 0, ctypes.cast(buf, ctypes.c_void_p).value or 0,
+                                flags, 2000, ctypes.byref(result))
+    _settle(settle_ms)
+    size = ctypes.c_size_t()
+    _user32.SendMessageTimeoutW(hwnd, WM_GETTEXTLENGTH, 0, 0, flags, 2000, ctypes.byref(size))
+    out = ctypes.create_unicode_buffer(int(size.value) + 2)
+    _user32.SendMessageTimeoutW(hwnd, WM_GETTEXT, len(out), ctypes.cast(out, ctypes.c_void_p).value or 0,
+                                flags, 2000, ctypes.byref(result))
+    return {"ok": True, "hwnd": hwnd, "text": out.value}
 
 
 def idle_seconds():

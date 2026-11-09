@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+A native dialog could be read and dismissed but not filled: `list_native_windows` gave a dialog's
+buttons and message text only, so the File name box of a common Open/Save dialog had no handle to
+name and `ui_type_text` posted at the dialog itself reached no control. Measured 2026-11-09 while
+retesting Image Link Insertion: its Open dialog blocked the main thread, the File name box was alive
+as an Edit inside a ComboBoxEx32, and the only option was to cancel.
+
+Dialogs now list `controls`: every text-bearing child (Edit, ComboBox, ListBox, list view, tree view)
+with hwnd, class, control id, parent class, text and rect. A new tool, `ui_set_text`, replaces a
+control's value with WM_SETTEXT and returns the text read back. Measured on build 4215: `ui_set_text`
+on the Open dialog's File name Edit, then `dismiss_native_window` clicking Open, opened the named
+file; with Image Link Insertion the same two calls let its chooser insert `![](pic.png)` — that flow
+could previously only be cancelled.
+
 The project is renamed **sublime-commander** (repository `dpc00/sublime-commander`); the Sublime
 package keeps its display name "MCP Commander" and the module stays `sublime_mcp.py`. Guides, skills,
 settings comments and code strings now say sublime-commander.

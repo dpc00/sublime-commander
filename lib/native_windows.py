@@ -285,6 +285,47 @@ if SUPPORTED:
             messages = _uia_texts(hwnd)
         return buttons, messages[:4]
 
+    # Children of a dialog that accept text or a selection. The common file dialogs put the
+    # "File name:" box in an Edit inside a ComboBoxEx32/ComboBox pair (the Edit's control id is
+    # the standard 1152, edt1), so a caller that needs to fill a dialog had no way to find it:
+    # typing into the dialog's own hwnd reached nothing and there was no child to name.
+    # Measured 2026-11-09: Image Link Insertion's native Open dialog could not be driven.
+    _TEXT_CONTROL_CLASSES = frozenset({
+        "Edit", "ComboBox", "ComboBoxEx32", "RichEdit20W", "RichEdit50W", "RichEdit60W",
+        "ListBox", "SysListView32", "SysTreeView32",
+    })
+
+    def _controls(hwnd, limit=80):
+        """Text-bearing descendants of a dialog: hwnd, class, id, parent class, text and rect.
+
+        Handles from here can be passed to ui_type_text (posts characters) and ui_set_text
+        (replaces the value), which is how a native file dialog's file-name box is filled."""
+        found = []
+        for child in _children(hwnd):
+            cls = _class(child)
+            if cls not in _TEXT_CONTROL_CLASSES:
+                continue
+            rect = wintypes.RECT()
+            _user32.GetWindowRect(child, ctypes.byref(rect))
+            found.append({
+                "hwnd": int(child),
+                "class": cls,
+                "id": _user32.GetDlgCtrlID(child),
+                "parent": _class(_user32.GetParent(child)),
+                "text": _text(child),
+                "rect": [rect.left, rect.top, rect.right, rect.bottom],
+            })
+            if len(found) >= limit:
+                break
+        return found
+
+
+def window_pid(hwnd):
+    """Process id that owns ``hwnd`` (a control handle from list_native_windows works too)."""
+    if not SUPPORTED:
+        raise NotImplementedError("native window handling is implemented for Windows only")
+    return _pid(hwnd)
+
 
 def list_windows(pid):
     """Visible top-level windows of process ``pid`` with class, title, kind and,
@@ -314,6 +355,7 @@ def list_windows(pid):
             }
             if entry["kind"] == "dialog":
                 entry["buttons"], entry["messages"] = _dialog_parts(hwnd)
+                entry["controls"] = _controls(hwnd)
             found.append(entry)
         return True
 

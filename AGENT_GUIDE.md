@@ -486,6 +486,16 @@ Observed on build 4200 (2026-10-07).
   label, and "Yes" counts: on Emmet's telemetry prompt it meant "Yes, enable telemetry", and on a
   `Save Changes?` it meant "Yes" (2026-11-08). Read the button labels from `list_native_windows`
   first and name one with `action: "button"` when the choice matters.
+- **A dialog's fields are windows of their own.** Every dialog now carries `controls`: each Edit,
+  ComboBox, ListBox, list view and tree view under it, with `hwnd`, class, control id, parent class,
+  text and rect. The File name box of a common Open/Save dialog is the Edit nested in the
+  ComboBoxEx32 on that row (control id 1148 on build 4215; ids vary by dialog). Fill it with
+  `ui_set_text(hwnd=<that Edit>, text="C:\\path\\file.png")`, which sets the value with WM_SETTEXT
+  and returns it read back, then click the dialog's button with `dismiss_native_window`
+  (`action: "button"`, `button: "Open"`). Measured 2026-11-09 on 4215: `ui_type_text` at the
+  dialog's own hwnd reached no control, and with this pair Image Link Insertion's chooser inserted
+  its link on the first try. A control that takes keystrokes can still be named directly in
+  `ui_type_text`.
 - **`get_view_regions` sees regions, not gutter icons.** It returns what a plugin stored with
   `view.add_regions(key, ...)`; a package that draws marks in the gutter through its own theme
   (GitGutter's changed/inserted/deleted lines) leaves nothing there. Measured 2026-11-09: with
@@ -692,12 +702,13 @@ every tool will time out. Two tools still work, because they never use the main
 thread:
 
 ```
-list_native_windows()                     # dialogs/menus with buttons + message text,
+list_native_windows()                     # dialogs/menus with buttons + message text + controls,
                                           # main_thread_blocked, blocked_by (the tool)
 dismiss_native_window()                   # default action "cancel": Cancel/No, else close
 dismiss_native_window(action="ok")        # OK / Yes / the default button (this CONFIRMS)
 dismiss_native_window(action="button", button="Remove")   # a named button
 dismiss_native_window(hwnd=..., action="close")           # a specific window
+ui_set_text(hwnd=<Edit from controls>, text="C:\\path\\file.png")   # fill a dialog's field
 ```
 
 The default action is `cancel`: on the `delete_file` confirmation it clicks

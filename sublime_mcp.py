@@ -4658,11 +4658,11 @@ _AUTH_TOKEN = ""
 # direct GET/POST routes).
 _WINDOWS_ONLY_TOOLS = frozenset({
     "get_console_full", "get_console_win", "list_native_windows", "dismiss_native_window",
-    "ui_screenshot", "ui_press_key", "ui_type_text", "ui_click", "ui_hover",
+    "ui_screenshot", "ui_press_key", "ui_type_text", "ui_set_text", "ui_click", "ui_hover",
 })
 _WINDOWS_ONLY_ROUTES = frozenset({
     "/console_full", "/console_win", "/list_native_windows", "/dismiss_native_window",
-    "/ui_screenshot", "/ui_press_key", "/ui_type_text", "/ui_click", "/ui_hover",
+    "/ui_screenshot", "/ui_press_key", "/ui_type_text", "/ui_set_text", "/ui_click", "/ui_hover",
 })
 _PLATFORM_UNAVAILABLE_TOOLS = _WINDOWS_ONLY_TOOLS if sys.platform != "win32" else frozenset()
 _PLATFORM_UNAVAILABLE_ROUTES = _WINDOWS_ONLY_ROUTES if sys.platform != "win32" else frozenset()
@@ -5578,6 +5578,26 @@ def _ui_type_text(body):
 _POST["/ui_type_text"] = _ui_type_text
 
 
+def _ui_set_text(body):
+    """Replace the text of one native control of this Sublime Text process."""
+    if not native_windows.SUPPORTED:
+        return {"error": "ui_set_text is implemented for Windows only"}
+    from .lib import ui_input
+    try:
+        hwnd = int(body.get("hwnd"))
+    except (TypeError, ValueError):
+        return {"error": "hwnd must be an integer from the controls list in list_native_windows"}
+    if body.get("text") is None:
+        return {"error": "text is required"}
+    pid = native_windows.window_pid(hwnd)
+    if pid not in _native_window_pids():
+        return {"error": "hwnd {} is not a window of this Sublime Text process".format(hwnd)}
+    return ui_input.set_text(pid, hwnd, body.get("text"), body.get("settle_ms", 150))
+
+
+_POST["/ui_set_text"] = _ui_set_text
+
+
 def _ui_click(body):
     """Click in one window of this Sublime Text process with the real mouse (gated)."""
     if not native_windows.SUPPORTED:
@@ -6357,8 +6377,11 @@ _MCP_TOOLS = [
      _p("/get_help")),
     ("list_native_windows",
      "List the native OS windows, dialogs and menus of this Sublime Text process (Windows only): "
-     "kind (dialog, menu, editor_window, window), title, hwnd, and for dialogs their buttons and "
-     "message text. Works while a native dialog has BLOCKED Sublime's main thread (every other tool "
+     "kind (dialog, menu, editor_window, window), title, hwnd, and for dialogs their buttons, "
+     "message text and controls (every text-bearing child: hwnd, class, id, parent class, text, rect; "
+     "a common file dialog's File name box is the Edit nested in the ComboBoxEx32/ComboBox pair on that "
+     "row, fill it with ui_set_text). "
+     "Works while a native dialog has BLOCKED Sublime's main thread (every other tool "
      "then times out); the result says whether the main thread is blocked and which tool blocked it.",
      {"type": "object", "properties": {}},
      _p("/list_native_windows")),
@@ -6430,9 +6453,21 @@ _MCP_TOOLS = [
      {"type": "object", "properties": {
          "text": {"type": "string", "description": "The text to type."},
          "settle_ms": {"type": "integer", "description": "Milliseconds to wait after typing so it has been handled (default 150, max 5000)."},
-         "hwnd": {"type": "integer", "description": "Window handle from list_native_windows (default: first editor window)."}},
+         "hwnd": {"type": "integer", "description": "Window handle from list_native_windows (default: first editor window). A control hwnd from a dialog's controls list works when that control handles keyboard input."}},
       "required": ["text"]},
      _p("/ui_type_text")),
+    ("ui_set_text",
+     "Replace the text of one native control of this Sublime Text process (Windows only): pass the hwnd of a "
+     "control from the controls list in list_native_windows, for example the Edit nested in the ComboBoxEx32 on "
+     "the File name row of a common Open/Save dialog, then answer the dialog with dismiss_native_window. Sets the "
+     "value with WM_SETTEXT (no focus needed) and returns the text read back. Use ui_type_text instead when the "
+     "target needs real keystrokes. At most 2000 characters.",
+     {"type": "object", "properties": {
+         "hwnd": {"type": "integer", "description": "Control handle from the controls list in list_native_windows."},
+         "text": {"type": "string", "description": "The text to set."},
+         "settle_ms": {"type": "integer", "description": "Milliseconds to wait after setting it (default 150, max 5000)."}},
+      "required": ["hwnd", "text"]},
+     _p("/ui_set_text")),
     ("ui_click",
      "Click in one window of this Sublime Text process (Windows only) with the REAL mouse, because "
      "Sublime draws its own editor, command palette and popups and ignores posted mouse messages. "

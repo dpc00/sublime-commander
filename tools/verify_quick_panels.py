@@ -1,6 +1,6 @@
 """Live check of get_quick_panel / pick_quick_panel against a running Sublime Text.
 
-Covers both recorders: the one sublime-mcp installs in its own plugin host, and the helper a package
+Covers both recorders: the one sublime-commander installs in its own plugin host, and the helper a package
 in the Python 3.3 host runs (py33/mcp_commander_py33.py, installed when "install_py33_helper" is
 true). For each case it opens a real panel, lists it, picks or cancels it, and reads back the index
 the panel's own callback received.
@@ -159,7 +159,7 @@ def open_until_recorded(port, command, attempts=25):
 
 
 def run_own_host(p, cache):
-    """Panels opened in sublime-mcp's own plugin host: eval_python runs there."""
+    """Panels opened in sublime-commander's own plugin host: eval_python runs there."""
     code = ("import sublime\n"
             "p = r'%s'\n"
             "def cb(i):\n"
@@ -202,10 +202,10 @@ def run_3_3_host(p, cache, info):
     if info["helper_wrapper"]:
         p.check("3.3 host: helper stays out of this host", False,
                 "show_quick_panel in the bridge host carries the helper's wrapper: it would hide "
-                "sublime-mcp's own recorder, so unhooking that one would silently stop working")
+                "sublime-commander's own recorder, so unhooking that one would silently stop working")
         return False
     p.check("3.3 host: helper stays out of this host", True,
-            "bridge host %s has sublime-mcp's wrapper only" % info["host"])
+            "bridge host %s has sublime-commander's wrapper only" % info["host"])
 
     listed = open_until_recorded(p.port, "probe_open_panel")
     p.check("3.3 host: list", listed.get("items") == ["alpha-one", "alpha-two", "alpha-three"],
@@ -283,7 +283,7 @@ def main():
     except Exception as e:
         print("cannot reach the bridge on port %d: %s" % (args.port, e))
         return 2
-    print("sublime-mcp %s in the Python %s host; packages %s"
+    print("sublime-commander %s in the Python %s host; packages %s"
           % (info["version"], info["host"], info["packages"]))
 
     probe = Probe(args.port)

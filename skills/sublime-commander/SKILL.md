@@ -1,11 +1,11 @@
 ---
-name: sublime-mcp
-description: Use a running Sublime Text instance as the primary way to inspect, search, edit, navigate, and save project code through the sublime-mcp server.
+name: sublime-commander
+description: Use a running Sublime Text instance as the primary way to inspect, search, edit, navigate, and save project code through the sublime-commander server.
 ---
 
 # Sublime Text coding workflow
 
-Use sublime-mcp for editor and project operations when its tools are available. The full
+Use sublime-commander for editor and project operations when its tools are available. The full
 how-to is `get_help` (the same text as `AGENT_GUIDE.md`); this skill is the short version
 plus the traps that cost the most time.
 
@@ -27,14 +27,14 @@ batch(calls=[{"tool": "get_bookmarks", "args": {}}])
 
 ## Tool choice: the editor, because it is faster
 
-Sublime Text is the fast path: a sublime-mcp call runs inside the editor process that already holds
+Sublime Text is the fast path: a sublime-commander call runs inside the editor process that already holds
 the buffers, while a shell command or a script pays start-up and re-reads the same bytes. Measured
 unbatched 2026-11-06, five edits in two identical 102 KB files: 2.99 s as five `str_replace` plus 0.64 s
 `save_file`, against 3.18 s as five `edit` calls that persist inline. Per call both are ~0.6 s; the round
 trip and the approval dominate, so the editor is no faster per change and 14% slower per saved change.
 Call count is the lever: twenty edits in one `batch` took 0.75 s. Batch about five at a time, never twenty.
 
-So for anything Sublime can do, the sublime-mcp tool is the tool — `project_search` (always pass
+So for anything Sublime can do, the sublime-commander tool is the tool — `project_search` (always pass
 `where`) or Find in Files to search, `str_replace_based_edit_tool` to read and change, `save_file`
 to keep, `get_active_file` / `get_selection` / `get_cursor_context` for the buffer. One `batch` for
 several small steps. Everything else in the 379-tool catalog is one `discover_tools(query=...)` away.
@@ -137,8 +137,8 @@ Details: `get_help(section="console")`. The short rules (tested 2026-10-11 on po
 - `get_console_full`, `get_console_win` and `get_output_panel(name="console")` all accept
   `force_focus` too (added and tested 2026-10-11): `complete: true` with it.
 - `mode="captured"` and `get_console_log` never need focus, but are always `complete: false`:
-  they miss what Sublime printed before sublime-mcp loaded (startup lines, plugin load errors).
-- Each successful visible read adds one `[sublime-mcp] console capture marker` line.
+  they miss what Sublime printed before sublime-commander loaded (startup lines, plugin load errors).
+- Each successful visible read adds one `[sublime-commander] console capture marker` line.
 - Do not open the console panel with `show_panel` and read the screen.
 
 ## Typing into a terminal tab (GhostShell ai_terminal)
@@ -155,7 +155,7 @@ GhostShell has no command that sends text into a tab. Do it as a person does, an
    `focus_sheet` back to your own tab.
 4. `get_sheet_content` on the target, and quote the echoed line. `ok` from a tool never proves it.
 
-## When sublime-mcp is not enough
+## When sublime-commander is not enough
 
-Fall back to ordinary filesystem or shell tools when sublime-mcp is unavailable, returns an
+Fall back to ordinary filesystem or shell tools when sublime-commander is unavailable, returns an
 explicit limitation, or the operation is outside Sublime's scope.

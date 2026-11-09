@@ -9,7 +9,7 @@ Model Context Protocol.  The plugin runs two local HTTP servers on load:
     directly — no external process required.
 
     Claude Code config (~/.claude/settings.json):
-      "sublime-mcp": { "type": "sse", "url": "http://127.0.0.1:9502/sse" }
+      "sublime-commander": { "type": "sse", "url": "http://127.0.0.1:9502/sse" }
 
   HTTP bridge     127.0.0.1:9500 (Windows) / 9501 (Mac/Linux)
     Internal REST API used by the MCP SSE dispatcher above.
@@ -75,9 +75,8 @@ from .lib import native_windows
 from .lib.search_results import parse_find_results, search_is_complete
 
 # Single source of truth for the version this plugin advertises over MCP.
-# Keep in step with packages/node-proxy/package.json,
-# packages/python-proxy/pyproject.toml, and server.json (no automated
-# test enforces this; check by hand on release).
+# Keep in step with server.json (no automated test enforces this; check by
+# hand on release).
 __version__ = "0.0.0"
 
 from .lib.mcp_http_policy import is_oauth_discovery_path, send_no_authorization
@@ -241,7 +240,7 @@ def _active_view():
 # mutate the same singleton out from under the first agent.
 #
 # A lock can't fix this on its own, because the thing that opens the input
-# panel is not necessarily a sublime-mcp tool call at all -- it can be any
+# panel is not necessarily a sublime-commander tool call at all -- it can be any
 # ST command, from any agent, or a person. There is no reliable hook to
 # acquire a lock "when the panel opens". What *is* reliable: agents can
 # announce intent before starting a multi-step sequence, and check for a
@@ -276,12 +275,12 @@ def _claim_resource(body):
 
     This is advisory, not an OS lock: nothing stops a tool call that never
     checks claims. It exists so agents sharing one Sublime Text instance
-    through sublime-mcp can coordinate instead of racing silently.
+    through sublime-commander can coordinate instead of racing silently.
 
     Body params:
       resource (required): a short name identifying what's being claimed,
         e.g. "input_panel" or "control_panel". Free-form, but agents must
-        agree on the name to coordinate -- these two are used by sublime-mcp
+        agree on the name to coordinate -- these two are used by sublime-commander
         itself (drive_input_panel's docstring says to claim "input_panel"
         first) and are good defaults for ST's two native singleton widgets.
       holder (required): a short, stable label for who is claiming it (e.g.
@@ -811,7 +810,7 @@ def _get_sheets(params):
             # Any package can tag a view with its own settings (GhostShell's
             # ai_terminal_* keys, for example) -- surface all of it rather
             # than a hand-picked subset, so a caller can always tell what a
-            # tab actually is without sublime-mcp needing to know about
+            # tab actually is without sublime-commander needing to know about
             # that package by name.
             if v is not None:
                 if with_settings:
@@ -936,7 +935,7 @@ def _sheet_summary(w, s, settings=True):
     # Any package can tag a view with its own settings (GhostShell's
     # ai_terminal_* keys, for example) -- surface all of it rather than a
     # hand-picked subset, so a caller can always tell what a tab actually
-    # is without sublime-mcp needing to know about that package by name.
+    # is without sublime-commander needing to know about that package by name.
     if v is not None:
         if settings:
             try:
@@ -1422,10 +1421,10 @@ def _capture_console_win(params):
         }
 
     snapshot = _on_main(snapshot_ui)
-    sentinel = "sublime-mcp-console-copy-{}-{}".format(
+    sentinel = "sublime-commander-console-copy-{}-{}".format(
         threading.get_ident(), id(snapshot)
     )
-    marker = "[sublime-mcp] console capture marker {}".format(int(time.time() * 1000))
+    marker = "[sublime-commander] console capture marker {}".format(int(time.time() * 1000))
 
     result = {"text": None, "error": None}
     cleanup = {"cancelled": False, "restore_started": False, "tries": 0}
@@ -3067,7 +3066,7 @@ def _quick_panel_first_line(item):
 
 
 _NO_QUICK_PANEL = ("no recorded quick panel: none is open, or it was opened by Sublime "
-                   "itself (a package's panel is recorded in sublime-mcp's own plugin host, and in "
+                   "itself (a package's panel is recorded in sublime-commander's own plugin host, and in "
                    "the Python 3.3 host when install_py33_helper is on)")
 
 _PY33_PACKAGE = "MCP Commander Py33"
@@ -3112,11 +3111,11 @@ def _ensure_py33_companion():
         wrote = _write_if_changed(os.path.join(dest_dir, ".python-version"), _PY33_MARKER) or wrote
     except Exception as e:  # e.g. this package is a zip: the 3.3 host's panels stay invisible
         _PY33_INSTALLED = False
-        print("[sublime-mcp] could not install the Python 3.3 quick panel recorder: %s" % e)
+        print("[sublime-commander] could not install the Python 3.3 quick panel recorder: %s" % e)
         return
     _PY33_INSTALLED = True
     if wrote:
-        print("[sublime-mcp] install_py33_helper is on: the package \"%s\" is in Packages (delete that "
+        print("[sublime-commander] install_py33_helper is on: the package \"%s\" is in Packages (delete that "
               "folder to remove it); it answers after Sublime restarts" % _PY33_PACKAGE)
 
 
@@ -3254,7 +3253,7 @@ def _no_quick_panel_error(waited):
     if not _PY33_HELPER_ENABLED:
         err["note"] = ("panels opened by packages in Sublime's Python 3.3 host (older packages, "
                        "without a .python-version) cannot be seen: set \"install_py33_helper\": true "
-                       "in MCP Commander.sublime-settings to let sublime-mcp add a small helper "
+                       "in MCP Commander.sublime-settings to let sublime-commander add a small helper "
                        "package, \"%s\", to Packages, then restart Sublime so it loads" % _PY33_PACKAGE)
     elif not _PY33_SEEN:
         err["note"] = ("nothing in Sublime's Python 3.3 host answered: %s. Sublime loads a new "
@@ -3513,7 +3512,7 @@ def _sort_lines(body):
 
 # ── Claude MCP Control Panel ──────────────────────────────────────────────────
 _CP_VIEW_NAME = "Claude Control Panel"
-_CP_SERVERS = ("filesystem", "postgres", "github", "sublime-mcp")
+_CP_SERVERS = ("filesystem", "postgres", "github", "sublime-commander")
 
 
 def _cp_find_panel():
@@ -3549,7 +3548,7 @@ def _cp_render(panel):
             '</style>'
             '<h3>&#129302; Claude MCP Control Panel</h3>'
             + rows +
-            '<div class="hint">Rendered live by Claude via sublime-mcp '
+            '<div class="hint">Rendered live by Claude via sublime-commander '
             '&middot; click a link to toggle</div>'
             '</body>')
     panel.erase_phantoms("claude_cp")
@@ -4114,7 +4113,7 @@ def _health(params):
         total = len(_MCP_TOOLS)
     return {
         "ok": True,
-        "server": "sublime-mcp",
+        "server": "sublime-commander",
         "version": __version__,
         "http_port": _PORT,
         "mcp_port": _MCP_PORT,
@@ -4720,7 +4719,7 @@ def _show_consent_code(codes):
     return True
 
 
-_CONSENT_GATE = consent.ConsentGate(log=lambda text: print("sublime-mcp: " + text),
+_CONSENT_GATE = consent.ConsentGate(log=lambda text: print("sublime-commander: " + text),
                                     show_code=_show_consent_code)
 
 
@@ -5321,10 +5320,10 @@ def _get_package_mcp_info(body):
 
     this_host = ".".join(str(n) for n in sys.version_info[:3])
     if st["loaded_here"]:
-        host_note = ("Its commands or listeners are loaded in the same Python host as sublime-mcp "
+        host_note = ("Its commands or listeners are loaded in the same Python host as sublime-commander "
                      "(Python {}).".format(this_host))
     else:
-        host_note = ("None of its commands or listeners are loaded in the Python host sublime-mcp runs in "
+        host_note = ("None of its commands or listeners are loaded in the Python host sublime-commander runs in "
                      "(Python {}). It runs in another plugin host (see python_version_file), has no Python "
                      "plugins, or has not finished loading, so its commands may be missing from this list; "
                      "look for 'reloading python <version> plugin {}' in the console."
@@ -5520,7 +5519,7 @@ def _ui_screenshot(body):
         info["path"] = saved
         return info
     import tempfile
-    folder = os.path.join(tempfile.gettempdir(), "sublime-mcp-ui")
+    folder = os.path.join(tempfile.gettempdir(), "sublime-commander-ui")
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, "window_{}_{}.png".format(int(hwnd), int(time.time() * 1000)))
     with open(path, "wb") as f:
@@ -5628,7 +5627,7 @@ def _ui_hover(body):
                     {"type": "text", "text": json.dumps(res)}]
         else:
             import tempfile
-            folder = os.path.join(tempfile.gettempdir(), "sublime-mcp-ui")
+            folder = os.path.join(tempfile.gettempdir(), "sublime-commander-ui")
             os.makedirs(folder, exist_ok=True)
             path = os.path.join(folder, "hover_{}_{}.png".format(int(hwnd), int(time.time() * 1000)))
             with open(path, "wb") as f:
@@ -5644,7 +5643,7 @@ _POST["/ui_hover"] = _ui_hover
 _MCP_TOOLS = [
     # ── batch execution ───────────────────────────────────────────────────────
     ("batch",
-     "Run multiple sublime-mcp tool calls in a single request instead of paying a\n"
+     "Run multiple sublime-commander tool calls in a single request instead of paying a\n"
      "separate HTTP round trip per call. Each call still does its own main-thread\n"
      "work independently: the batch is not wrapped in one shared main-thread\n"
      "dispatch, so a slow or polling call cannot freeze the UI for the rest of\n"
@@ -6222,7 +6221,7 @@ _MCP_TOOLS = [
      "thousands of items, so the result is a page: pass text to keep only items whose first line "
      "contains it, limit (default 100, at most 1000) and offset; the result gives total, matched "
      "and the original indexes of the items returned. Only sees panels opened by packages in "
-     "sublime-mcp's own plugin host (Python 3.8, 3.14 on builds 4213+); panels opened by packages "
+     "sublime-commander's own plugin host (Python 3.8, 3.14 on builds 4213+); panels opened by packages "
      "in the Python 3.3 host need \"install_py33_helper\": true in MCP Commander.sublime-settings "
      "and a restart (the helper package loads at startup), and builds 4213+ also need "
      "\"disable_plugin_host_3.3\": false. The command palette, Goto Anything and panels from a "
@@ -6337,7 +6336,7 @@ _MCP_TOOLS = [
      "Returns: path, commands (with captions and args), settings_keys, python_files,\n"
      "python_version_file (the package's .python-version, or null), loaded_in_this_host and\n"
      "this_host_python (whether its commands/listeners are loaded in the same Python host as\n"
-     "sublime-mcp; false means another plugin host, no Python plugins, or still loading) and\n"
+     "sublime-commander; false means another plugin host, no Python plugins, or still loading) and\n"
      "host_note, plus\n"
      "output_file/extension_template for the rare theoretical case where a standing,\n"
      "independently-reachable MCP server is needed (e.g. a client with no eval_python-\n"
@@ -6348,7 +6347,7 @@ _MCP_TOOLS = [
      {"type": "object", "properties": {"package": {"type": "string"}}, "required": ["package"]},
      _get_package_mcp_info),
     ("get_help",
-     "Return the Agent Guide (AGENT_GUIDE.md) with detailed instructions on how to use sublime-mcp tools correctly. "
+     "Return the Agent Guide (AGENT_GUIDE.md) with detailed instructions on how to use sublime-commander tools correctly. "
      "Call this first if you are unsure how to save files, close tabs, or use eval_python. "
      "The full guide is about 12 KB; section=<words from a heading> returns only the matching "
      "section(s), and every result lists the section headings.",
@@ -7646,10 +7645,10 @@ def register_mcp_tools(tools):
         for entry in tools:
             name = entry[0]
             if name in _mcp_tools_builtin_names:
-                print("sublime-mcp: register_mcp_tools: '{}' is a built-in tool — skipped".format(name))
+                print("sublime-commander: register_mcp_tools: '{}' is a built-in tool — skipped".format(name))
                 continue
             if name in existing:
-                print("sublime-mcp: register_mcp_tools: '{}' already registered — skipped".format(name))
+                print("sublime-commander: register_mcp_tools: '{}' already registered — skipped".format(name))
                 continue
             _MCP_TOOLS.append(entry)
             existing.add(name)
@@ -7909,7 +7908,7 @@ def _mcp_ask(session_id, message):
     session is gone or nobody answered in time."""
     if session_id not in _mcp_sessions:
         return None
-    ask_id = "sublime-mcp-ask-" + str(_uuid.uuid4())
+    ask_id = "sublime-commander-ask-" + str(_uuid.uuid4())
     slot = [threading.Event(), None]
     _mcp_pending_asks[ask_id] = slot
     try:
@@ -7952,7 +7951,7 @@ def _bridge_consent_denial(tool_name, body):
     items = [i for i in consent.destructive_items(tool_name, body) if not i.startswith("eval_python")]
     if not items:
         return None
-    print("sublime-mcp: consent: denied on the HTTP bridge, it cannot ask: " + "; ".join(items))
+    print("sublime-commander: consent: denied on the HTTP bridge, it cannot ask: " + "; ".join(items))
     return ("Denied, nothing was changed: the HTTP bridge cannot ask the person for approval. "
             "Use the MCP connection of a client that can, or set require_consent_for_destructive to "
             "false. Held back: " + "; ".join(items))
@@ -8048,7 +8047,7 @@ def _note_client_declaration(method, params):
         if text in _client_decl_seen:
             return
         _client_decl_seen.add(text)
-        print("sublime-mcp: client declares ({}): {}".format(method, text[:700]))
+        print("sublime-commander: client declares ({}): {}".format(method, text[:700]))
     except Exception:
         pass
 
@@ -8104,7 +8103,7 @@ def _mcp_dispatch_modern(msg_id, method, params, version, headers):
     except Exception as e:
         return 200, _mcp_error(msg_id, -32603, str(e))
     result.setdefault("resultType", "complete")
-    result["_meta"] = {_MCP_META_SERVER_INFO: {"name": "sublime-mcp", "version": __version__}}
+    result["_meta"] = {_MCP_META_SERVER_INFO: {"name": "sublime-commander", "version": __version__}}
     return 200, {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
 
@@ -8121,7 +8120,7 @@ def _mcp_dispatch_legacy(msg, session_id=None):
                 "protocolVersion": requested if requested in _MCP_LEGACY_VERSIONS
                                    else _MCP_LEGACY_VERSIONS[0],
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "sublime-mcp", "version": __version__},
+                "serverInfo": {"name": "sublime-commander", "version": __version__},
                 "instructions": _MCP_INSTRUCTIONS,
             }
         elif method in ("notifications/initialized", "notifications/cancelled"):
@@ -8161,16 +8160,16 @@ def _start_servers():
             _server = _ThreadingHTTPServer((_BIND_HOST, _PORT), _Handler)
             threading.Thread(target=_server.serve_forever, daemon=True).start()
         except OSError as e:
-            print("sublime-mcp: could not bind HTTP bridge on port {}: {}".format(_PORT, e))
+            print("sublime-commander: could not bind HTTP bridge on port {}: {}".format(_PORT, e))
             _server = None
     if not _mcp_server:
         try:
             _mcp_server = _ThreadingHTTPServer((_BIND_HOST, _MCP_PORT), _MCPHandler)
             threading.Thread(target=_mcp_server.serve_forever, daemon=True).start()
         except OSError as e:
-            print("sublime-mcp: could not bind MCP SSE on port {}: {}".format(_MCP_PORT, e))
+            print("sublime-commander: could not bind MCP SSE on port {}: {}".format(_MCP_PORT, e))
             _mcp_server = None
-    print("sublime-mcp: MCP SSE on {0}:{1}, HTTP bridge on {0}:{2}".format(_BIND_HOST, _MCP_PORT, _PORT))
+    print("sublime-commander: MCP SSE on {0}:{1}, HTTP bridge on {0}:{2}".format(_BIND_HOST, _MCP_PORT, _PORT))
 
 
 def _stop_servers():
@@ -8189,7 +8188,7 @@ def _stop_servers():
     for q in list(_mcp_sessions.values()):
         q.put(None)
     _mcp_sessions.clear()
-    print("sublime-mcp: stopped")
+    print("sublime-commander: stopped")
 
 
 def plugin_loaded():
@@ -8324,7 +8323,7 @@ class McpConnectionDoctorCommand(sublime_plugin.WindowCommand):
         report["streamable_http_url"] = "http://127.0.0.1:{}/mcp".format(_MCP_PORT)
         report["legacy_sse_url"] = "http://127.0.0.1:{}/sse".format(_MCP_PORT)
         view = self.window.new_file()
-        view.set_name("sublime-mcp doctor")
+        view.set_name("sublime-commander doctor")
         view.set_scratch(True)
         view.run_command("append", {"characters": json.dumps(report, indent=2) + "\n"})
 
@@ -8353,6 +8352,6 @@ class _McpServerStatusInputHandler(sublime_plugin.ListInputHandler):
             )]
 
 
-# 2026-09-06: test edit made via the edit-sublime-mcp procedure -- a
-# direct disk write (Bash/Edit tool), not through sublime-mcp's own
+# 2026-09-06: test edit made via the edit-sublime-commander procedure -- a
+# direct disk write (Bash/Edit tool), not through sublime-commander's own
 # live-edit tools, to verify a comment-only change to this file.

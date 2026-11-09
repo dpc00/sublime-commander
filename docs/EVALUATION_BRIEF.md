@@ -1,4 +1,4 @@
-# sublime-mcp: brief for an outside evaluator
+# sublime-commander: brief for an outside evaluator
 
 Written 2026-09-26. Everything below is a record of what was done and seen; it
 contains no recommendations. **Numbers in this brief are as of 2026-09-26** (version
@@ -7,11 +7,11 @@ for the repository owner, who asked for an independent expert to evaluate it.
 
 ## What it is
 
-`sublime-mcp` (Sublime Text package name "MCP Commander") is a Sublime Text 4
+`sublime-commander` (Sublime Text package name "MCP Commander") is a Sublime Text 4
 plugin that runs an HTTP bridge (ports 9500/9501) and an MCP endpoint
-(SSE/streamable, ports 9502/9503) inside Sublime's plugin host, plus two
-optional proxies (`packages/node-proxy` on npm, `packages/python-proxy` on
-PyPI). Current version 1.10.0. Source: `sublime_mcp.py` (single large module),
+(SSE/streamable, ports 9502/9503) inside Sublime's plugin host. (The two optional
+proxies it then bundled, `packages/node-proxy` and `packages/python-proxy`, were
+removed on 2026-11-09.) Current version 1.10.0. Source: `sublime_mcp.py` (single large module),
 `lib/native_windows.py`.
 
 The catalog is 401 tools: 7 advertised by default, the rest reachable through

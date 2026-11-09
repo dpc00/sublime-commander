@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tell the maintainer when sublime-mcp's MCP implementation needs an upgrade.
+"""Tell the maintainer when sublime-commander's MCP implementation needs an upgrade.
 
 Checks, none of which need Sublime except the last:
   1. Spec: a revision in modelcontextprotocol/modelcontextprotocol docs/specification newer than
@@ -29,7 +29,7 @@ MCP_WORDS = re.compile(r"\bMCP\b|/mcp\b|notifications/", re.I)
 
 
 def fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "sublime-mcp-compat-check"})
+    req = urllib.request.Request(url, headers={"User-Agent": "sublime-commander-compat-check"})
     with urllib.request.urlopen(req, timeout=20) as r:
         return r.read().decode("utf-8")
 

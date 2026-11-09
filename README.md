@@ -1,10 +1,10 @@
-# sublime-mcp
+# sublime-commander
 
 MCP server for Sublime Text 4 — lets AI agents read and control a running editor.
 
 ## What it is
 
-sublime-mcp is a Sublime Text plugin that speaks the [Model Context Protocol](https://modelcontextprotocol.io). An agent connects to it over HTTP and works with the editor you already have open: it reads files, edits text, runs commands, and — on Windows — sees the screen and answers dialogs.
+sublime-commander is a Sublime Text plugin that speaks the [Model Context Protocol](https://modelcontextprotocol.io). An agent connects to it over HTTP and works with the editor you already have open: it reads files, edits text, runs commands, and — on Windows — sees the screen and answers dialogs.
 
 It runs inside Sublime's own plugin host, so there is no automation layer in between and no helper process to keep alive. Everything an agent does goes through Sublime's API, which means it sees the same tabs, selections, panels and menus you do.
 
@@ -23,19 +23,19 @@ It runs inside Sublime's own plugin host, so there is no automation layer in bet
 
 ### 1. Install the plugin
 
-The repository root *is* the Sublime package. Clone it and link it into Sublime's `Packages` directory as `sublime-mcp`, then restart Sublime so the plugin loads.
+The repository root *is* the Sublime package. Clone it and link it into Sublime's `Packages` directory as `sublime-commander`, then restart Sublime so the plugin loads.
 
 ```cmd
 :: Windows
-mklink /J "%APPDATA%\Sublime Text\Packages\sublime-mcp" "C:\path\to\sublime-mcp"
+mklink /J "%APPDATA%\Sublime Text\Packages\sublime-commander" "C:\path\to\sublime-commander"
 ```
 
 ```bash
 # macOS
-ln -s "$(pwd)" "$HOME/Library/Application Support/Sublime Text/Packages/sublime-mcp"
+ln -s "$(pwd)" "$HOME/Library/Application Support/Sublime Text/Packages/sublime-commander"
 
 # Linux
-ln -s "$(pwd)" "$HOME/.config/sublime-text/Packages/sublime-mcp"
+ln -s "$(pwd)" "$HOME/.config/sublime-text/Packages/sublime-commander"
 ```
 
 The server starts with Sublime. `MCP Commander: Server Status` in the Command Palette starts, stops and reports it.
@@ -43,25 +43,14 @@ The server starts with Sublime. `MCP Commander: Server Status` in the Command Pa
 ### 2. Point your agent at it
 
 ```json
-{ "mcpServers": { "sublime-mcp": { "type": "http", "url": "http://127.0.0.1:9502/mcp" } } }
+{ "mcpServers": { "sublime-commander": { "type": "http", "url": "http://127.0.0.1:9502/mcp" } } }
 ```
 
 On macOS and Linux the port is `9503`. Clients that predate streamable HTTP can use `"type": "sse"` with `http://127.0.0.1:9502/sse`.
 
-A client that can only launch a command needs one of the bundled proxies:
-
-```bash
-cd packages/node-proxy && npm install . && npx sublime-mcp    # Node
-cd packages/python-proxy && pip install . && sublime-mcp      # Python
-```
-
 ### 3. Check the connection
 
-```bash
-npx sublime-mcp doctor
-```
-
-It reports the HTTP bridge, the MCP handshake and the tool catalog. `MCP Commander: Connection Doctor` shows the server's side of the same picture.
+`MCP Commander: Connection Doctor` in the Command Palette reports the HTTP bridge, the MCP handshake and the tool catalog.
 
 ## Usage
 
@@ -72,7 +61,7 @@ discover_tools(query="screenshot")
 batch(calls=[{tool: "get_sheets", args: {}}, {tool: "get_console", args: {lines: 20}}])
 ```
 
-If you are writing the agent side, read [AGENT_GUIDE.md](AGENT_GUIDE.md) first: it is the order the tools should be used in, including the traps. The same guidance ships as a skill in `skills/sublime-mcp`; `skills/package-skill-generator` turns a one-off investigation of any other Sublime package — a debugger, a language server — into a small reusable skill instead of another MCP server.
+If you are writing the agent side, read [AGENT_GUIDE.md](AGENT_GUIDE.md) first: it is the order the tools should be used in, including the traps. The same guidance ships as a skill in `skills/sublime-commander`; `skills/package-skill-generator` turns a one-off investigation of any other Sublime package — a debugger, a language server — into a small reusable skill instead of another MCP server.
 
 ## Configuration
 
@@ -81,9 +70,7 @@ Settings live in `MCP Commander.sublime-settings` (Preferences › Package Setti
 | what | Windows | macOS / Linux | key |
 |---|---|---|---|
 | MCP streamable HTTP `/mcp` and legacy SSE `/sse` | 9502 | 9503 | `mcp_port` |
-| HTTP bridge, used by the bundled proxies | 9500 | 9501 | `http_port` |
-
-The proxies read `SUBLIME_MCP_BASE` (for example `http://127.0.0.1:9500`) and `SUBLIME_MCP_TOKEN` when those differ from the defaults.
+| HTTP bridge (REST routes) | 9500 | 9501 | `http_port` |
 
 ## Security
 
@@ -91,7 +78,7 @@ Both servers listen on **`127.0.0.1` and do not authenticate by default**. One t
 
 These settings change that posture:
 
-- **`auth_token`** — require `Authorization: Bearer <token>` on every request. This is the only control that helps against another process, or another user, on the same machine. Use a long random value; for a proxy, set the same value as `SUBLIME_MCP_TOKEN`.
+- **`auth_token`** — require `Authorization: Bearer <token>` on every request. This is the only control that helps against another process, or another user, on the same machine. Use a long random value and give the same value to every client.
 - **`allow_lan_access`** — bind `0.0.0.0` so other devices can connect. Still unauthenticated unless `auth_token` is set. Use it only for a specific client that cannot reach `127.0.0.1`, such as WSL without localhost forwarding.
 - **`disabled_tools`** — refuse and hide named tools, for example `["eval_python", "run_command"]`.
 

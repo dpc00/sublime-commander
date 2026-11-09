@@ -1,11 +1,11 @@
-# Agent Guide for sublime-mcp (MCP Commander)
+# Agent Guide for sublime-commander (MCP Commander)
 
-How to use sublime-mcp tools. Call `get_help` if you are unsure how to
+How to use sublime-commander tools. Call `get_help` if you are unsure how to
 save, close tabs, or run ST Python.
 
 ## Tool choice: the editor, because it is faster
 
-Sublime Text is not a convenience wrapper. A sublime-mcp call runs inside the editor process that
+Sublime Text is not a convenience wrapper. A sublime-commander call runs inside the editor process that
 already holds the buffers; a shell command or a script pays process start-up and re-reads the same
 bytes. Measured on this machine 2026-11-06, unbatched, five edits at scattered positions in two identical
 102 KB files: 2.99 s as five `str_replace` calls plus 0.64 s to `save_file`, against 3.18 s as five `edit`
@@ -15,7 +15,7 @@ saved change. What changes the number is the call count: twenty edits inside one
 in small groups, about five and never twenty at once, because each call is the tax. Do not claim the editor
 is faster per call; it is faster per turn, when one turn carries more operations.
 
-For anything Sublime can do, the sublime-mcp tool is the tool:
+For anything Sublime can do, the sublime-commander tool is the tool:
 
 | job | use this | not this |
 |---|---|---|
@@ -445,7 +445,7 @@ Observed on build 4200 (2026-10-07).
   misses Sublime's own error output (tracebacks printed after an install, `ImportError`).
   `get_output_panel` for the console is the same as `get_console` in the default mode, so it
   also misses those errors when the window is not in front. A visible capture that succeeds
-  prints one "[sublime-mcp] console capture marker" line into the console; one that fails for
+  prints one "[sublime-commander] console capture marker" line into the console; one that fails for
   lack of focus leaves nothing behind.
 
 ## Silent failures and timeouts
@@ -535,7 +535,7 @@ Observed on build 4200 (2026-10-07).
 - **After `run_command exit` and a new start,** three things happen. A package manager dialog
   "Sublime Text needs to be restarted for installed or updated libraries" can open (answer OK);
   an "Update Available" window can open and disable the main window (close it; its buttons are
-  not accessible elements, use its Close button); and the sublime-mcp server may or may not
+  not accessible elements, use its Close button); and the sublime-commander server may or may not
   reconnect by itself (the first restart did, the second did not and needed `/mcp`). A key press
   sent right after a restart is refused until the window has been focused with a click on its
   title bar. Replacing a package between Python hosts (release on 3.3, master on 3.8) in the
@@ -543,9 +543,9 @@ Observed on build 4200 (2026-10-07).
 - **Quick panels:** several packages ask for a decision in a quick panel (FileManager's delete asks
   "Confirm - Send item to trash"; the package manager's pickers). `get_quick_panel` lists the items of
   the panel and `pick_quick_panel` picks one (by index or text) or cancels it with index -1.
-  They see panels opened by packages in sublime-mcp's own plugin host (Python 3.8, and 3.14 on
+  They see panels opened by packages in sublime-commander's own plugin host (Python 3.8, and 3.14 on
   builds 4213+). Panels from the Python 3.3 host are visible only when the user has set
-  `"install_py33_helper": true` in `MCP Commander.sublime-settings` (off by default): sublime-mcp
+  `"install_py33_helper": true` in `MCP Commander.sublime-settings` (off by default): sublime-commander
   then writes a small package, "MCP Commander Py33", into Packages with a `.python-version` file
   holding `3.3`, which is what puts it in that host. **Sublime loads a new package at startup**, so
   a helper written while Sublime runs answers nothing until it is restarted, and builds 4213+ ship
@@ -556,7 +556,7 @@ Observed on build 4200 (2026-10-07).
   Goto Anything give an error, and then the keyboard is the only way. Picking runs the package's own callback, so pick only items you mean to run (some
   pickers open files, folders or browser tabs). If the callback raises a modal dialog (Jekyll's remove
   commands: "Confirm Delete"), `pick_quick_panel` answers `{ok: true, pending: true, note: ...}`: after
-  1 s when the panel came from sublime-mcp's own host, after 2 s when it came from the 3.3 host. The
+  1 s when the panel came from sublime-commander's own host, after 2 s when it came from the 3.3 host. The
   pick went through, the dialog is open and blocks Sublime: answer it with `list_native_windows` and
   `dismiss_native_window` (or Return on its hwnd), then check the result. Nothing is reported as
   `pending` on a guess: a fast callback returns its real result, and in the 3.3 host `pending` is only
@@ -643,7 +643,7 @@ the editor. Know these before calling a tool you have not used (checked on 1.14.
   every modified file first; `next_modification`, `prev_modification`, `revert_hunk` and `revert_modification`
   need a saved file with unsaved edits; `close_deleted_files` closes a tab only after Sublime has noticed the
   file is gone.
-- **They install packages:** sublime-mcp has no tool for it, because installing is Package Control's job (and
+- **They install packages:** sublime-commander has no tool for it, because installing is Package Control's job (and
   Package Control may not be installed). Open its picker with `run_command show_overlay`
   (`{"overlay": "command_palette", "text": "Package Control: Install Package"}`) and answer with
   `pick_quick_panel` (`wait_ms` for the list that is still loading). The libraries a package depends on come

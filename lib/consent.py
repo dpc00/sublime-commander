@@ -2,7 +2,7 @@
 
 computer-use-mcp asks its user through the MCP protocol itself (elicitation), so Claude Code
 draws the prompt in the terminal whatever the client's allow list says. This does the same for
-sublime-mcp. On a 2026-07-28 connection a destructive tools/call is answered with
+sublime-commander. On a 2026-07-28 connection a destructive tools/call is answered with
 resultType "input_required" and an elicitation/create question; the client repeats the call with
 the answer, and the action runs only on "accept". A client that cannot be asked, an answer that is
 not "accept", a stale or reused token, or a changed call all mean "denied, nothing was changed".
@@ -180,7 +180,7 @@ class ConsentGate:
                 self._log("consent: could not show the code panel: {}".format(error))
         if shown:
             items = destructive_items(name, args, prompt=True)
-        return "sublime-mcp wants to do this in Sublime Text. Accept to allow it:\n- " + "\n- ".join(items)
+        return "sublime-commander wants to do this in Sublime Text. Accept to allow it:\n- " + "\n- ".join(items)
 
     def check_legacy(self, name, args, ask):
         """check() for a 2025-11-25 connection, where the client cannot repeat the call with an

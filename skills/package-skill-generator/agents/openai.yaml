@@ -5,7 +5,7 @@ interface:
 dependencies:
   tools:
     - type: "mcp"
-      value: "sublime-mcp"
+      value: "sublime-commander"
       description: "Sublime Text MCP server (used for get_package_mcp_info, source reading, and verifying the generated skill)"
       transport: "streamable_http"
       url: "http://127.0.0.1:9502/mcp"

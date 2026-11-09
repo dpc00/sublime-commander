@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+The project is renamed **sublime-commander** (repository `dpc00/sublime-commander`); the Sublime
+package keeps its display name "MCP Commander" and the module stays `sublime_mcp.py`. Guides, skills,
+settings comments and code strings now say sublime-commander.
+
+The two proxy packages are removed: `packages/node-proxy` and `packages/python-proxy`, their version
+entries in `server.json`, `tools/generate_fallback_catalog.py`, `requirements.txt` and `.npmignore`.
+Clients connect to the streamable HTTP endpoint directly; the HTTP bridge keeps its REST routes.
+
 `get_sheets` and `get_open_files` said nothing was open while a tab was on screen.
 
 A new window's untouched untitled buffer is a view the window shows but that `window.sheets()` and

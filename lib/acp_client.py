@@ -211,7 +211,7 @@ class AcpProcessClient:
             "protocolVersion": protocol_version,
             "capabilities": {},
             "clientInfo": {
-                "name": "sublime-mcp",
+                "name": "sublime-commander",
                 "title": "Sublime Text ACP Client",
                 "version": "0.1.0",
             },

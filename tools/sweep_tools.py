@@ -1,7 +1,7 @@
-"""Run every sublime-mcp tool once against a PORTABLE Sublime and record what happens.
+"""Run every sublime-commander tool once against a PORTABLE Sublime and record what happens.
 
 Usage: python sweep.py --port 9510 --root D:/st_portable_4215 --exe D:/st_portable_4215/sublime_text.exe
-Needs the portable running with sublime-mcp loaded (HTTP bridge on --port). Never point it at the main
+Needs the portable running with sublime-commander loaded (HTTP bridge on --port). Never point it at the main
 Sublime. Ask the owner before running it; read AGENT_GUIDE.md "Tools with side effects" first.
 
 For each tool: call it with the minimum arguments (required ones, empty values), clear any native dialog

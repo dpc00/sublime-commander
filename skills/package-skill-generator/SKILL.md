@@ -1,13 +1,13 @@
 ---
 name: package-skill-generator
-description: Generate a small skill file that teaches an agent how to directly control an installed Sublime Text package (its real commands, dispatch tables, and any async/API gotchas) via sublime-mcp's existing generic tools -- instead of generating a standalone MCP server for it. Use when asked to "make an MCP for <package>", "let Claude control <package>", or to document a package's real capability surface for reuse.
+description: Generate a small skill file that teaches an agent how to directly control an installed Sublime Text package (its real commands, dispatch tables, and any async/API gotchas) via sublime-commander's existing generic tools -- instead of generating a standalone MCP server for it. Use when asked to "make an MCP for <package>", "let Claude control <package>", or to document a package's real capability surface for reuse.
 ---
 
 # Package Skill Generator
 
 Produces a **skill file** (`SKILL.md`, standard Agent Skills format --
 folder + frontmatter, no code) documenting exactly how to control one
-target Sublime package directly through sublime-mcp's own generic tools
+target Sublime package directly through sublime-commander's own generic tools
 (`get_package_mcp_info`, `run_command`, `eval_python`) -- not a standalone
 MCP server.
 
@@ -89,8 +89,8 @@ Standard Agent Skills format: a folder named for the package (e.g.
 `<package>-control/`) containing `SKILL.md` with `name`/`description`
 frontmatter. Put it in the user's own skills location (for Claude Code,
 `~/.claude/skills/`). Do not add a generated skill to this repository: users
-generate their own for the packages they use, and only `skills/sublime-mcp`
-and this generator ship with sublime-mcp (see `get_package_mcp_info`'s own
+generate their own for the packages they use, and only `skills/sublime-commander`
+and this generator ship with sublime-commander (see `get_package_mcp_info`'s own
 tool description for the same distinction).
 
 Body content, concretely:

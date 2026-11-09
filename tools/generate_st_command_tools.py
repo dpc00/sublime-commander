@@ -10,8 +10,7 @@ generated blocks into sublime_mcp.py:
 A command is skipped when a tool already exposes it: either a tool with the same
 name exists, or a tool is routed to a hand-written `_vc/_wc/_ac("<command>")`
 wrapper. Generated blocks are stripped before that check, so the script is
-idempotent. Run `python tools/generate_fallback_catalog.py` afterwards so the
-proxy fallback catalogs pick up the new tools.
+idempotent.
 """
 
 import ast

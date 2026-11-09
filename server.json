@@ -5,18 +5,7 @@
   "description": "MCP server for Sublime Text 4. Lets AI coding agents read and control a running ST instance.",
   "repository": {
     "url": "https://github.com/dpc00/sublime-commander",
-    "source": "github",
-    "subfolder": "packages/python-proxy"
+    "source": "github"
   },
-  "version": "0.0.0",
-  "packages": [
-    {
-      "registryType": "pypi",
-      "identifier": "sublime-mcp",
-      "version": "0.0.0",
-      "transport": {
-        "type": "stdio"
-      }
-    }
-  ]
+  "version": "0.0.0"
 }

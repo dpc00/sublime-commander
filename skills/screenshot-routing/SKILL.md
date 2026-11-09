@@ -1,12 +1,12 @@
 ---
 name: screenshot-routing
-description: Take a screenshot of the Sublime Text instance that hosts this MCP server, detect pickers and dialogs a package leaves open, and diagnose "no window" errors. Covers sublime-mcp's own tools only.
+description: Take a screenshot of the Sublime Text instance that hosts this MCP server, detect pickers and dialogs a package leaves open, and diagnose "no window" errors. Covers sublime-commander's own tools only.
 ---
 
-# Screenshots, prompts and window state (sublime-mcp tools)
+# Screenshots, prompts and window state (sublime-commander tools)
 
-Scope: the Sublime that hosts this MCP server, reached through sublime-mcp's own tools. Capturing any
-other process is not sublime-mcp's job and is not covered here.
+Scope: the Sublime that hosts this MCP server, reached through sublime-commander's own tools. Capturing any
+other process is not sublime-commander's job and is not covered here.
 
 ## Which call to use
 

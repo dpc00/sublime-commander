@@ -1,4 +1,4 @@
-# sublime-mcp — Agent Context
+# sublime-commander — Agent Context
 
 MCP server that exposes a running Sublime Text 4 instance to AI agents.
 
@@ -10,11 +10,11 @@ and as of 2026-09-08 is symlinked at the repo root, not a subfolder).
 If something isn't working, check that the plugin loaded before debugging
 the code.
 
-## sublime-mcp itself
+## sublime-commander itself
 
 | MCP            | Plugin dir | MCP SSE                         | HTTP bridge                     | Tools                          |
 | -------------- | ---------- | -------------------------------- | -------------------------------- | ------------------------------ |
-| **sublime-mcp**  | repo root | 9502 (Win) / 9503 (macOS/Linux) | 9500 (Win) / 9501 (macOS/Linux) | 7 default, 406 discoverable    |
+| **sublime-commander**  | repo root | 9502 (Win) / 9503 (macOS/Linux) | 9500 (Win) / 9501 (macOS/Linux) | 7 default, 406 discoverable    |
 
 Ports are configured via `MCP Commander.sublime-settings` (`"mcp_port"` /
 `"http_port"`), overridable in `Packages/User/`. The proxy → HTTP bridge URL
@@ -26,35 +26,23 @@ Since 1.9.0, 160 tools are generated wrappers for Sublime Text commands
 (`tools/generate_st_command_tools.py`); since 1.10.0, `list_native_windows` and
 `dismiss_native_window` (Windows) work while a native dialog blocks the main thread.
 
-**Coordinates:** sublime-mcp tools are **1-based**.
+**Coordinates:** sublime-commander tools are **1-based**.
 
 ## Connecting
 
-### Option A — bundled proxy (sublime-mcp HTTP bridge)
-
-```bash
-cd packages/python-proxy && pip install . && sublime-mcp
-# or
-cd packages/node-proxy && npm install . && npx sublime-mcp
-```
-
-Defaults to `http://127.0.0.1:9500` on Windows, `:9501` on macOS/Linux. If
-the proxy runs in WSL against Windows ST, set
-`SUBLIME_MCP_BASE=http://127.0.0.1:9500` (or the Windows host IP).
-
-### Option B — MCP streamable HTTP directly
+Point an MCP client at the streamable HTTP endpoint.
 
 ```json
 {
   "mcpServers": {
-    "sublime-mcp":  { "type": "http", "url": "http://127.0.0.1:9502/mcp" }
+    "sublime-commander":  { "type": "http", "url": "http://127.0.0.1:9502/mcp" }
   }
 }
 ```
 
 Use `:9503` on macOS/Linux. A client without streamable HTTP can use the
 deprecated SSE form, `{ "type": "sse", "url": "http://127.0.0.1:9502/sse" }`.
-HTTP bridge also serves `GET /mcp_tools`.
+The HTTP bridge (9500/9501) also serves `GET /mcp_tools`.
 
 ## Workflow
 
@@ -62,15 +50,15 @@ Orient → navigate → edit → verify.
 
 | You want…                                      | Use               | Tool |
 | ---------------------------------------------- | ----------------- | ---- |
-| What the user is looking at                    | sublime-mcp       | `get_active_file` / `get_cursor_context` (live buffer, not disk) |
-| Edit a file ST has open                        | sublime-mcp       | `str_replace_based_edit_tool` then `save_file` |
-| Edit a file ST does not have open              | sublime-mcp       | `open_file` then edit the buffer |
+| What the user is looking at                    | sublime-commander       | `get_active_file` / `get_cursor_context` (live buffer, not disk) |
+| Edit a file ST has open                        | sublime-commander       | `str_replace_based_edit_tool` then `save_file` |
+| Edit a file ST does not have open              | sublime-commander       | `open_file` then edit the buffer |
 | Run a build / test                             | **your shell**    | never ST `exec` / `run_build` |
 
-### Default to sublime-mcp
+### Default to sublime-commander
 
 Read, edit, save, close, find, navigate, and open paths (inside or outside
-the workspace) through sublime-mcp. Fall back to host filesystem tools only
+the workspace) through sublime-commander. Fall back to host filesystem tools only
 when ST or the HTTP/SSE bridge is down (frozen, crashed, plugin failed to
 load, connection refused). Outside-workspace is not a fallback trigger —
 `open_file` opens any path.
@@ -117,7 +105,7 @@ POSTing a route **runs** it on the user's ST. For UI-interactive commands,
 registry-only checks (`TOOLS` / `_MCP_TOOLS` / `_POST`) are enough. Do not
 live-invoke:
 
-- sublime-mcp: `prompt_goto_line`, `quick_panel`, `select_color_scheme`,
+- sublime-commander: `prompt_goto_line`, `quick_panel`, `select_color_scheme`,
   `select_theme`, `open_in_browser`, `html_print`, `customize_*`,
   `convert_*`, `edit_syntax_settings`
 
@@ -130,4 +118,4 @@ Silent buffer tools: prefer a scratch tab.
 - `eval_python`: `print()`, not `return`. `sublime` / `window` / `view` in
   scope. Main-thread timeout 5s.
 - Never ST `exec` for shell. Use the agent's own terminal.
-- `batch` for 2+ independent sublime-mcp calls (max 50).
+- `batch` for 2+ independent sublime-commander calls (max 50).

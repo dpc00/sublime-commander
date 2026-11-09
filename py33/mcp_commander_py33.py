@@ -1,7 +1,7 @@
 """Quick panel recorder for the Python 3.3 plugin host.
 
-sublime-mcp runs in the default host (3.8, and 3.14 on recent builds), so it cannot see quick panels
-that packages in the 3.3 host open with window.show_quick_panel. sublime-mcp copies this file into
+sublime-commander runs in the default host (3.8, and 3.14 on recent builds), so it cannot see quick panels
+that packages in the 3.3 host open with window.show_quick_panel. sublime-commander copies this file into
 the companion package "MCP Commander Py33" next to a .python-version file holding "3.3", which is
 what puts it in the 3.3 host: Sublime 4213+ runs a package without that marker in the default host
 and disables the 3.3 host itself ("disable_plugin_host_3.3": false turns it back on). It records the
@@ -168,7 +168,7 @@ def plugin_loaded():
     # second time on top of the host's own recorder: every panel recorded twice, and the wrapper on
     # top hides the one underneath, so unhooking that one silently stops working. Do nothing.
     if sys.version_info[:2] != (3, 3):
-        print("[sublime-mcp] the 3.3 quick panel recorder is in the %d.%d host, which records "
+        print("[sublime-commander] the 3.3 quick panel recorder is in the %d.%d host, which records "
               "panels itself; set \"disable_plugin_host_3.3\": false to let the 3.3 host run it"
               % sys.version_info[:2])
         return

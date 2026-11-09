@@ -79,7 +79,7 @@ The 44 other tools (reads, meta tools, MCP-only tools) were run through the MCP 
   want to do instead?" even though nothing was actually interrupted — no
   permission prompt appears, and the call has already completed by the
   time the message shows up. This is a bug in Claude Code's own bundled
-  code (filed as anthropics/claude-code#93529), not in sublime-mcp; it has
+  code (filed as anthropics/claude-code#93529), not in sublime-commander; it has
   been confirmed not to be caused by any individual mechanism the Windows
   console reader uses (focus changes, clipboard access, `set_timeout`
   hops).

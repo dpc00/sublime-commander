@@ -1,0 +1,66 @@
+{
+    // Port for the MCP SSE endpoint (point your MCP client's "url" here, e.g. http://127.0.0.1:9502/sse).
+    // Defaults to 9502 on Windows, 9503 on Mac/Linux, if unset.
+    // "mcp_port": 9502,
+
+    // Port for the internal HTTP bridge used by the MCP SSE dispatcher above.
+    // Defaults to 9500 on Windows, 9501 on Mac/Linux, if unset.
+    // "http_port": 9500
+
+    // Both servers above are loopback-only (127.0.0.1) by default and have
+    // NO authentication at all -- one of the tools they expose
+    // (eval_python) is arbitrary code execution in Sublime's own process.
+    // Setting this to true binds 0.0.0.0 instead, making both reachable
+    // from every other device on your network, still with no auth. Only
+    // turn this on if you have a specific reason a client can't reach
+    // 127.0.0.1 directly -- e.g. a WSL client when WSL's networking mode
+    // doesn't forward localhost to the Windows host and switching WSL to
+    // mirrored networking mode isn't an option.
+    // "allow_lan_access": false
+
+    // Require a matching `Authorization: Bearer <token>` header on every
+    // request to either server. Empty/unset (default) = no auth required,
+    // same as every prior release. This is the one control that works
+    // regardless of bind address -- loopback-only does not protect against
+    // another process, or another user on a shared/multi-user machine,
+    // reaching 127.0.0.1 on the same host. Generate a real random value
+    // yourself (e.g. `python -c "import secrets; print(secrets.token_hex(32))"`)
+    // -- do not use a short or guessable string. Your MCP client config
+    // then needs a matching `Authorization: Bearer <token>` header, which
+    // not every MCP client UI exposes; check yours supports custom headers
+    // before relying on this.
+    // "auth_token": ""
+
+    // Tool names listed here are refused at every call path (tools/call,
+    // batch, and the direct POST /<tool_name> routes) and hidden from
+    // tools/list -- a client cannot see or call them at all. Use this to
+    // remove specific high-risk tools (eval_python and run_command are the
+    // two with the broadest reach) while keeping the rest of the server
+    // usable, e.g. for a shared or less-trusted deployment.
+    // "disabled_tools": ["eval_python", "run_command"]
+
+    // Destructive tool calls (delete_file, delete_folder, revert, revert_file,
+    // close_window, close_workspace, remove_folder, exit, eval_python, a
+    // close_file with discard, and run_command of the same commands, also inside
+    // a batch) are not run until the person says yes. On a 2026-07-28 connection
+    // the client shows the question (Claude Code: an Accept / Decline prompt in
+    // the terminal); a client that cannot be asked is denied. Default true. Set
+    // false to run them without asking (a test instance, for example).
+    // The direct HTTP bridge cannot ask, so it refuses those routes (eval_python
+    // stays open there). The setting is read on every call, so a change
+    // takes effect at once.
+    // "require_consent_for_destructive": true
+
+    // get_quick_panel and pick_quick_panel can only see quick panels opened by
+    // packages that run in sublime-mcp's own Python (3.8, and 3.14 on builds
+    // 4213+). Setting this to true makes sublime-mcp write a small package,
+    // "MCP Commander Py33", into your Packages folder, with a .python-version
+    // file that puts it in the Python 3.3 host, where it records those panels so
+    // they can be read and picked. Default false: nothing is written. A change
+    // applies to reading at once, but Sublime only loads a new package at
+    // startup, so the first install needs a restart. Builds 4213+ ship with the
+    // 3.3 host off: set "disable_plugin_host_3.3": false in Preferences as well,
+    // or the helper is not loaded. To undo it, set this back to
+    // false and delete Packages/MCP Commander Py33.
+    // "install_py33_helper": false
+}

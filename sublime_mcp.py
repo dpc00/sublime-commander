@@ -1,0 +1,8358 @@
+"""sublime_mcp.py — MCP Commander: Sublime Text plugin with built-in MCP server.
+# test-marker: verifying large-file diff rendering fix, safe to remove (v5).
+
+Exposes the Sublime Text API to AI assistants (Claude Code, etc.) via the
+Model Context Protocol.  The plugin runs two local HTTP servers on load:
+
+  MCP SSE server  127.0.0.1:9502 (Windows) / 9503 (Mac/Linux)
+    Implements MCP 2024-11-05 SSE transport.  Point your MCP client here
+    directly — no external process required.
+
+    Claude Code config (~/.claude/settings.json):
+      "sublime-mcp": { "type": "sse", "url": "http://127.0.0.1:9502/sse" }
+
+  HTTP bridge     127.0.0.1:9500 (Windows) / 9501 (Mac/Linux)
+    Internal REST API used by the MCP SSE dispatcher above.
+
+Ports are configured via "MCP Commander.sublime-settings" (Preferences: MCP Commander Settings).
+Use "MCP Commander: Server Status" in the Command Palette to stop or start.
+
+Thread model
+------------
+ST's Python API is NOT thread-safe — every call must be on the main thread.
+_on_main(fn) is the bridge:
+  1. Wraps fn() in a closure that captures exceptions and signals threading.Event.
+  2. Schedules the closure on the main thread via sublime.set_timeout(..., 0).
+  3. Blocks the HTTP thread on done.wait(5.0) until the main thread runs it.
+
+Routing (HTTP bridge)
+---------------------
+GET  /endpoint  → handler(params)   where params = parse_qs(query_string)
+POST /endpoint  → handler(body)     where body   = json.loads(request_body)
+
+MCP SSE transport
+-----------------
+GET  /sse       → opens an SSE stream; sends event:endpoint with POST URL
+POST /messages  → accepts JSON-RPC 2.0; responses arrive over the SSE stream
+
+Console capture
+---------------
+_install_console_capture() monkey-patches sublime_api.log_message and
+sys.stdout.write so all ST console output is captured into _console_buf.
+get_console_log / get_console_full expose this to MCP clients.
+
+str_replace_based_edit_tool
+---------------------------
+_edit_file implements the same four-command interface as Claude Code's tool:
+  view       → return numbered file content
+  str_replace→ find unique old_str, replace with new_str, highlight green
+  insert     → insert text after a given line, highlight blue
+  create     → create a new file with initial content
+Edits appear live in ST with full undo history and gutter diff markers.
+
+Install: copy this file to Packages/User/.
+"""
+
+import contextlib
+import html
+import io
+import json
+import os
+import re
+import sys
+import threading
+import time
+import traceback
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from urllib.parse import parse_qs, unquote, urlparse
+
+import sublime
+import sublime_plugin
+
+from .lib import consent
+from .lib import native_windows
+from .lib.search_results import parse_find_results, search_is_complete
+
+# Single source of truth for the version this plugin advertises over MCP.
+# Keep in step with packages/node-proxy/package.json,
+# packages/python-proxy/pyproject.toml, and server.json (no automated
+# test enforces this; check by hand on release).
+__version__ = "0.0.0"
+
+from .lib.mcp_http_policy import is_oauth_discovery_path, send_no_authorization
+
+_PORT = 9500 if sys.platform == "win32" else 9501
+
+
+# ── main-thread dispatch ──────────────────────────────────────────────────────
+
+_in_flight_dispatch = {"label": None, "started": None}
+
+
+def _dispatch_label(fn):
+    code = getattr(fn, "__code__", None)
+    if not code:
+        return getattr(fn, "__name__", repr(fn))
+    return "{}:{}".format(os.path.basename(code.co_filename), code.co_firstlineno)
+
+
+_BLOCKING_WINDOW_KINDS = ("dialog", "menu", "other")
+
+
+def _main_thread_where(depth=4):
+    """Where the plugin host's main thread is right now, innermost frame first.
+
+    Called from the HTTP thread while the main thread is stuck. A plugin that
+    loops or blocks inside Python (an endless os.path.dirname walk, a read that
+    never returns) shows up here with its file, line and source text; a stall
+    inside Sublime's own code shows the plugin frame that called into it.
+    Returns None when the frames cannot be read.
+    """
+    try:
+        frame = sys._current_frames().get(threading.main_thread().ident)
+        if frame is None:
+            return None
+        parts = []
+        for fs in reversed(traceback.extract_stack(frame)[-depth:]):
+            path = fs.filename.replace("\\", "/").split("/")
+            where = "/".join(path[-2:]) if len(path) > 1 else fs.filename
+            text = (fs.line or "").strip()
+            parts.append("{}:{} in {}{}".format(where, fs.lineno, fs.name, " ({})".format(text) if text else ""))
+        return " <- ".join(parts) or None
+    except Exception:
+        return None
+
+
+def _timeout_message(label, windows, where=None):
+    """Say why the main thread did not answer, from the native windows that exist.
+
+    ``windows`` is the list from native_windows.list_windows, or None when the
+    windows cannot be listed (not Windows, or the listing failed). A timeout does
+    not always mean a dialog: a package that is loading or installing keeps the
+    main thread busy for many seconds with no dialog open, and blaming a dialog
+    then sends the caller looking for something that is not there.
+    """
+    head = "main-thread timeout after 5s."
+    if windows is None and not native_windows.SUPPORTED:
+        return (head + " A native dialog may be waiting for an answer (a Save Changes, Unable to save or "
+                "package error dialog is the usual cause), or a package is busy loading. On this platform "
+                "no tool can list or dismiss dialogs: look at the screen and answer it there. Under WSL "
+                "(WSLg) a computer-use client can read and click it: its windows are titled ' (Ubuntu)'. "
+                "Tools that do not need the main thread (get_console, get_help) still answer.")
+    if windows is None:
+        return (head + " A native dialog or menu may be blocking Sublime's main thread until it is "
+                "dismissed; list_native_windows (Windows only) shows it and dismiss_native_window "
+                "answers it.")
+    blocking = [w for w in windows if w.get("kind") in _BLOCKING_WINDOW_KINDS]
+    # A plain Sublime window (Switch Project, Indexing Status, About, a settings editor) blocks the
+    # main thread only when it is modal: it then disables the editor window that owns it. Without
+    # this test every such window, even one that is only open, was named as the blocker, and the real
+    # one (the Windows file-operation progress window, kind "other") was left out.
+    if any(w.get("kind") == "editor_window" and not w.get("enabled", True) for w in windows):
+        blocking += [w for w in windows if w.get("kind") == "window" and w.get("enabled", True)]
+    if blocking:
+        names = ", ".join('"{}" ({})'.format(w.get("title") or w.get("class") or "untitled", w.get("kind"))
+                          for w in blocking)
+        return (head + " A native window blocks Sublime's main thread until it is dismissed: " + names +
+                ". list_native_windows shows it and dismiss_native_window answers it; both work while "
+                "Sublime is blocked.")
+    if where:
+        return (head + " No native dialog or menu is open, so the main thread is busy, not blocked by a "
+                "dialog. Right now it is inside: {}. A package that is only loading or installing moves "
+                "on by itself; if the same place shows up on a second call, that code is stuck "
+                "(an endless loop or a call that never returns) and the plugin host has to be restarted. "
+                "list_native_windows shows how long it has been busy.".format(where))
+    return (head + " No native dialog or menu is open, so the main thread is busy, not blocked by a "
+            "dialog (for example a package is loading or installing). The call that timed out was {}. "
+            "Call again in a few seconds; list_native_windows shows how long it has been busy.".format(label))
+
+
+def _main_thread_timeout_message(label):
+    windows = None
+    if native_windows.SUPPORTED:
+        try:
+            windows = native_windows.list_windows(_native_window_pids())
+        except Exception:
+            windows = None
+    return _timeout_message(label, windows, _main_thread_where())
+
+
+def _on_main(fn):
+    """Run fn() on ST's main thread and return its result (or re-raise its exception).
+
+    ST's Python API is not thread-safe; this is the only correct way to call
+    it from the HTTP handler thread.  Uses a threading.Event as a one-shot
+    barrier: the HTTP thread blocks on done.wait() while the main thread
+    executes fn() via sublime.set_timeout(..., 0).  Times out after 5 s so
+    a deadlock doesn't hang the HTTP thread forever.
+
+    If already on the main thread (e.g. called from plugin_loaded or eval_python),
+    fn() is invoked directly to avoid deadlock.
+    """
+    label = _dispatch_label(fn)
+
+    def _dispatch():
+        _in_flight_dispatch["label"] = label
+        _in_flight_dispatch["started"] = time.time()
+        try:
+            return fn()
+        finally:
+            _in_flight_dispatch["label"] = None
+            _in_flight_dispatch["started"] = None
+
+    if threading.current_thread() is threading.main_thread():
+        return _dispatch()
+    result = [None]
+    exc = [None]
+    done = threading.Event()
+
+    def _run():
+        try:
+            result[0] = _dispatch()
+        except Exception as e:
+            exc[0] = e
+        finally:
+            done.set()
+
+    sublime.set_timeout(_run, 0)
+    if not done.wait(5.0):
+        raise TimeoutError(_main_thread_timeout_message(label))
+    if exc[0]:
+        raise exc[0]
+    return result[0]
+
+
+def _active_view():
+    return sublime.active_window().active_view()
+
+
+# ── resource claims (multi-agent coordination) ───────────────────────────────
+#
+# Problem: a handful of tools touch a single global, singleton piece of ST UI
+# state across *more than one* HTTP request -- the native input panel
+# (open via some command, then filled/submitted later by drive_input_panel)
+# and the Control Panel view/phantom. Each individual request is already
+# atomic on ST's main thread (sublime.set_timeout callbacks run one at a
+# time, strictly FIFO -- two requests cannot interleave *inside* one
+# dispatch), so most tools need nothing extra. But the *gap* between two
+# separate requests belonging to one logical multi-step task is not atomic:
+# a second, unrelated agent can run an unrelated tool call in that gap and
+# mutate the same singleton out from under the first agent.
+#
+# A lock can't fix this on its own, because the thing that opens the input
+# panel is not necessarily a sublime-mcp tool call at all -- it can be any
+# ST command, from any agent, or a person. There is no reliable hook to
+# acquire a lock "when the panel opens". What *is* reliable: agents can
+# announce intent before starting a multi-step sequence, and check for a
+# live announcement before starting their own. This is a cooperative lease,
+# not an OS-level lock: nothing enforces it except every caller checking it,
+# the same trust model MCP tool calls already have (an agent could call
+# eval_python and do anything anyway). Claims expire on their own after
+# `ttl_seconds` so a crashed or forgetful agent can't wedge the resource
+# forever.
+_CLAIM_DEFAULT_TTL_SECONDS = 60.0
+_CLAIM_MAX_TTL_SECONDS = 600.0
+_claims_lock = threading.Lock()
+_claims = {}  # resource (str) -> {"holder": str, "note": str, "expires": float}
+
+
+def _claims_prune_locked():
+    """Drop expired claims. Caller must hold _claims_lock."""
+    now = time.time()
+    expired = [name for name, claim in _claims.items() if claim["expires"] <= now]
+    for name in expired:
+        del _claims[name]
+
+
+def _claim_resource(body):
+    """Announce that `holder` is about to do a multi-step sequence touching a
+    shared singleton (the input panel, the Control Panel, or any other
+    resource name agents agree on by convention). Other agents should check
+    `list_claims` or expect a `busy` error from `claim_resource` before
+    starting their own sequence on the same resource, and should call
+    `release_resource` as soon as their sequence finishes rather than
+    waiting for the TTL.
+
+    This is advisory, not an OS lock: nothing stops a tool call that never
+    checks claims. It exists so agents sharing one Sublime Text instance
+    through sublime-mcp can coordinate instead of racing silently.
+
+    Body params:
+      resource (required): a short name identifying what's being claimed,
+        e.g. "input_panel" or "control_panel". Free-form, but agents must
+        agree on the name to coordinate -- these two are used by sublime-mcp
+        itself (drive_input_panel's docstring says to claim "input_panel"
+        first) and are good defaults for ST's two native singleton widgets.
+      holder (required): a short, stable label for who is claiming it (e.g.
+        a session or agent id) -- shown to whoever hits the busy error.
+      note (optional): a short human-readable description of what the holder
+        is doing, e.g. "filling Goto Line".
+      ttl_seconds (optional, default 60, max 600): auto-expiry. Keep this
+        close to how long the real sequence actually takes; a long TTL on a
+        claim nobody releases blocks everyone else for that long.
+      force (optional, default false): take the claim even if another
+        holder has it. Only for recovering from a holder that crashed
+        without releasing -- prefer waiting out the TTL when possible.
+    """
+    resource = (body.get("resource") or "").strip()
+    holder = (body.get("holder") or "").strip()
+    if not resource:
+        return {"error": "resource required"}
+    if not holder:
+        return {"error": "holder required"}
+    note = body.get("note") or ""
+    try:
+        ttl = float(body.get("ttl_seconds", _CLAIM_DEFAULT_TTL_SECONDS))
+    except (TypeError, ValueError):
+        return {"error": "ttl_seconds must be a number"}
+    ttl = max(1.0, min(ttl, _CLAIM_MAX_TTL_SECONDS))
+    force = bool(body.get("force", False))
+
+    with _claims_lock:
+        _claims_prune_locked()
+        existing = _claims.get(resource)
+        if existing and not force:
+            return {
+                "error": "busy",
+                "resource": resource,
+                "holder": existing["holder"],
+                "note": existing.get("note", ""),
+                "expires_in": round(existing["expires"] - time.time(), 1),
+            }
+        _claims[resource] = {
+            "holder": holder, "note": note, "expires": time.time() + ttl,
+        }
+    return {"ok": True, "resource": resource, "holder": holder, "ttl_seconds": ttl}
+
+
+def _release_resource(body):
+    """Release a claim taken with claim_resource, before its TTL expires.
+    Only the current holder can release (pass the same `holder` value); a
+    mismatched holder returns an error rather than silently releasing
+    someone else's claim. Releasing an already-expired or unclaimed resource
+    is not an error -- it just confirms nothing is held."""
+    resource = (body.get("resource") or "").strip()
+    holder = (body.get("holder") or "").strip()
+    if not resource:
+        return {"error": "resource required"}
+    if not holder:
+        return {"error": "holder required"}
+    with _claims_lock:
+        _claims_prune_locked()
+        existing = _claims.get(resource)
+        if existing is None:
+            return {"ok": True, "resource": resource, "was_claimed": False}
+        if existing["holder"] != holder:
+            return {
+                "error": "held by a different holder",
+                "resource": resource,
+                "holder": existing["holder"],
+            }
+        del _claims[resource]
+    return {"ok": True, "resource": resource, "was_claimed": True}
+
+
+def _list_claims(body):
+    """List every currently live (non-expired) resource claim. Call this
+    before starting a multi-step sequence on a shared singleton to see
+    whether another agent already has it, as an alternative to just calling
+    claim_resource and handling the busy error."""
+    with _claims_lock:
+        _claims_prune_locked()
+        now = time.time()
+        return {
+            "claims": [
+                {
+                    "resource": resource, "holder": claim["holder"],
+                    "note": claim.get("note", ""),
+                    "expires_in": round(claim["expires"] - now, 1),
+                }
+                for resource, claim in _claims.items()
+            ]
+        }
+
+
+def _command_name_from_class(cls):
+    """Convert a Command class name to ST's snake_case command string.
+
+    ST strips the 'Command' suffix and lowercases the CamelCase remainder.
+    Example: OpenClaudeTerminusHereCommand -> 'open_claude_terminus_here'
+    """
+    name = cls.__name__
+    if name.endswith("Command"):
+        name = name[:-7]
+    parts = re.findall(r"[A-Z]+(?=[A-Z][a-z]|$)|[A-Z]?[a-z]+|\d+", name)
+    return "_".join(part.lower() for part in parts if part)
+
+
+def _package_name_from_resource(resource_path):
+    parts = resource_path.split("/", 2)
+    if len(parts) >= 2 and parts[0] == "Packages":
+        return parts[1]
+    return None
+
+
+def _walk_menu_items(items, resource, path, caption_filter, command_filter, out):
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        caption = item.get("caption", "")
+        command = item.get("command", "")
+        next_path = path + ([caption] if caption else [])
+        matches = True
+        if caption_filter and caption_filter not in caption.lower():
+            matches = False
+        if command_filter and command_filter not in command.lower():
+            matches = False
+        if matches and (caption or command):
+            out.append(
+                {
+                    "caption": caption,
+                    "command": command,
+                    "args": item.get("args", {}),
+                    "resource": resource,
+                    "path": next_path,
+                    "id": item.get("id"),
+                    "mnemonic": item.get("mnemonic"),
+                    "checkbox": item.get("checkbox"),
+                }
+            )
+        children = item.get("children")
+        if isinstance(children, list):
+            _walk_menu_items(
+                children, resource, next_path, caption_filter, command_filter, out
+            )
+
+
+def _active_output_panel_view(window):
+    panel_name = window.active_panel()
+    if not panel_name or not panel_name.startswith("output."):
+        return None, None
+    short_name = panel_name.split(".", 1)[1]
+    return short_name, window.find_output_panel(short_name)
+
+
+def _view_display_name(v):
+    n = v.name()
+    if n:
+        return n
+    fp = v.file_name()
+    return os.path.basename(fp) if fp else ""
+
+
+def _preview_views(window):
+    """The views a package opened as a preview, which window.views() leaves out.
+
+    Measured on build 4215: open_file(path, sublime.TRANSIENT) returns a view that is valid,
+    active and holds the file's text, yet neither window.views() nor window.sheets() lists it --
+    so get_sheets, get_open_files and name/index resolution all missed a file that is open in
+    front of the person (found with Jekyll 4.0.0's edit-_config.yml, and it applies to Goto
+    Anything and any package's preview). The selected sheet in each group still reports it, and
+    find_open_file(path) still returns it; close_file by path was therefore never affected.
+    """
+    listed = set()
+    try:
+        listed = {s.id() for s in window.sheets()}
+    except (AttributeError, RuntimeError):
+        pass
+    extra = []
+    try:
+        groups = range(window.num_groups())
+    except (AttributeError, RuntimeError):
+        return extra
+    for group in groups:
+        try:
+            chosen = window.selected_sheets_in_group(group)
+        except (AttributeError, RuntimeError, IndexError):
+            continue
+        for sheet in chosen or []:
+            if sheet.id() in listed:
+                continue
+            listed.add(sheet.id())
+            try:
+                view = sheet.view()
+            except (AttributeError, RuntimeError):
+                view = None
+            if view is not None and view.is_valid():
+                # The window's own empty preview slot answers here too; it has no file, no name
+                # and no text, and listing it would show a nameless tab nobody can see.
+                if view.file_name() or view.name() or view.size():
+                    extra.append(view)
+    return extra
+
+
+def _find_view_by_name(window, name):
+    views = list(window.views()) + _preview_views(window)
+    if name:
+        match = next(
+            (v for v in views if name.lower() in _view_display_name(v).lower()), None
+        )
+        if not match:
+            return None, [_view_display_name(v) for v in views]
+        return match, None
+    return window.active_view(), None
+
+
+def _clean_phantom_text(text):
+    """Strip HTML from phantom content and return readable plain text.
+
+    Phantoms store their content as raw HTML including inline CSS.  This
+    function removes <style> and <script> blocks entirely, converts block
+    elements (div, p, a closing tags, br) to newlines, strips remaining tags,
+    unescapes HTML entities, and collapses blank lines.
+    """
+    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(
+        r"<script[^>]*>.*?</script>", "", text, flags=re.IGNORECASE | re.DOTALL
+    )
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</a>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</(div|p|h\d|li|tr)>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    lines = [line.rstrip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line.strip()).strip()
+
+
+# ── console log capture ───────────────────────────────────────────────────────
+
+_CONSOLE_CAPTURE_STATE_KEY = "_sublime_mcp_console_capture_state"
+_CONSOLE_CAPTURE_LIMIT = 10000
+_console_state = None
+_visible_console_capture_lock = threading.Lock()
+
+
+def _closure_value(fn, name):
+    """Return a named closure value, used to unwind pre-fix reload wrappers."""
+    closure = getattr(fn, "__closure__", None) or ()
+    freevars = getattr(getattr(fn, "__code__", None), "co_freevars", ())
+    for key, cell in zip(freevars, closure):
+        if key == name:
+            try:
+                return cell.cell_contents
+            except ValueError:
+                return None
+    return None
+
+
+def _unwrap_legacy_console_hook(fn, closure_name):
+    """Remove wrappers installed by older reload-unsafe plugin versions."""
+    seen = set()
+    while (callable(fn) and id(fn) not in seen and
+           getattr(fn, "__name__", "") in ("_capture_log", "_capture_write")):
+        seen.add(id(fn))
+        original = _closure_value(fn, closure_name)
+        if not callable(original):
+            break
+        fn = original
+    return fn
+
+def _install_console_capture():
+    """Install one process-wide, reload-safe capture of ST console messages."""
+    global _console_state
+    import sublime_api as _sapi
+
+    state = getattr(sys, _CONSOLE_CAPTURE_STATE_KEY, None)
+    if state and getattr(_sapi.log_message, "_sublime_mcp_console_capture", False):
+        _console_state = state
+        return
+
+    # Package reload resets module globals but not sys.stdout or sublime_api.
+    # Unwind wrappers from the old implementation before installing one stable
+    # hook. Capturing log_message alone avoids recording the same print through
+    # both sys.stdout.write and Sublime's logging bridge.
+    if getattr(sys.stdout.write, "__name__", "") == "_capture_write":
+        sys.stdout.write = _unwrap_legacy_console_hook(sys.stdout.write, "orig_write")
+    original_log = _unwrap_legacy_console_hook(_sapi.log_message, "_orig_log")
+    state = {"entries": [], "dropped": 0, "original_log": original_log}
+
+    def _capture_log(msg):
+        entries = state["entries"]
+        entries.append(str(msg))
+        if len(entries) > _CONSOLE_CAPTURE_LIMIT:
+            overflow = len(entries) - _CONSOLE_CAPTURE_LIMIT
+            del entries[:overflow]
+            state["dropped"] += overflow
+        original_log(msg)
+
+    _capture_log._sublime_mcp_console_capture = True
+    _sapi.log_message = _capture_log
+    setattr(sys, _CONSOLE_CAPTURE_STATE_KEY, state)
+    _console_state = state
+
+
+# ── GET handlers ──────────────────────────────────────────────────────────────
+
+
+def _syntax_label(syn):
+    """Display name of a sublime.Syntax. A syntax file without a `name:` key (Bicep, for one) has
+    syn.name == "" in the API while Sublime's status bar shows the file stem; do the same."""
+    if not syn:
+        return None
+    name = getattr(syn, "name", "") or ""
+    if name:
+        return name
+    path = getattr(syn, "path", "") or ""
+    return os.path.splitext(os.path.basename(path))[0] or None
+
+
+def _view_syntax(v):
+    """(label, path) of a view's syntax. view.syntax() is None for a view whose syntax was set
+    through a legacy path that no longer resolves ('Packages/CSS/CSS.tmLanguage', which old
+    Python 3.3 packages still use) although the status bar shows the syntax; in that case fall
+    back to the view's `syntax` setting, the same text Sublime shows."""
+    try:
+        syn = v.syntax()
+    except Exception:
+        syn = None
+    if syn:
+        return _syntax_label(syn), syn.path
+    try:
+        setting = v.settings().get("syntax")
+    except Exception:
+        setting = None
+    if setting:
+        return os.path.splitext(os.path.basename(setting))[0] or None, setting
+    return None, None
+
+
+# get_active_file returns at most this many characters unless max_chars says otherwise. A whole
+# tab can be tens of kilobytes (the agent's own terminal tab was 28 KB), and every byte stays in
+# the conversation for the rest of the session.
+_ACTIVE_FILE_MAX_CHARS = 20000
+
+
+def _get_active_file(params):
+    max_chars = int(params.get("max_chars", [_ACTIVE_FILE_MAX_CHARS])[0])
+
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        sel = v.sel()
+        pt = sel[0].begin() if sel else 0
+        row, col = v.rowcol(pt)
+        syntax_label, syntax_path = _view_syntax(v)
+        size = v.size()
+        limit = size if max_chars <= 0 else min(size, max_chars)
+        out = {
+            "path": v.file_name(),
+            "name": v.name(),
+            "content": v.substr(sublime.Region(0, limit)),
+            "size": size,
+            "line": row + 1,
+            "col": col + 1,
+            "is_dirty": v.is_dirty(),
+            "syntax": syntax_label,
+            "syntax_path": syntax_path,
+        }
+        if limit < size:
+            out["truncated"] = True
+            out["returned_chars"] = limit
+            out["note"] = ("content is cut at {} of {} characters; read the rest with get_view_chars "
+                           "(begin, end), or pass max_chars=0 for everything".format(limit, size))
+        return out
+
+    return _on_main(fn)
+
+
+def _get_selection(params):
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        out = []
+        for r in v.sel():
+            ar, ac = v.rowcol(r.begin())
+            br, bc = v.rowcol(r.end())
+            out.append(
+                {
+                    "text": v.substr(r),
+                    "begin_line": ar + 1,
+                    "begin_col": ac + 1,
+                    "end_line": br + 1,
+                    "end_col": bc + 1,
+                }
+            )
+        return {"selections": out}
+
+    return _on_main(fn)
+
+
+def _get_cursor_context(params):
+    n = int(params.get("lines", ["10"])[0])
+
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        sel = v.sel()
+        pt = sel[0].begin() if sel else 0
+        row, col = v.rowcol(pt)
+        start_row = max(0, row - n)
+        end_row = row + n
+        start_pt = v.text_point(start_row, 0)
+        end_line = v.text_point(min(end_row, v.rowcol(v.size())[0]), 0)
+        end_pt = v.full_line(end_line).end()
+        text = v.substr(sublime.Region(start_pt, end_pt))
+        lines = text.split("\n")
+        numbered = "\n".join("{:4}: {}".format(start_row + i + 1, l) for i, l in enumerate(lines))
+        return {
+            "path": v.file_name(),
+            "cursor_line": row + 1,
+            "cursor_col": col + 1,
+            "start_line": start_row + 1,
+            "context": numbered,
+        }
+
+    return _on_main(fn)
+
+
+def _disk_differs(v):
+    """True when a tab that reads as clean holds an EMPTY buffer for a file that has content on disk.
+
+    Seen 2026-10-28: a package opened a tab for a file that did not exist yet, a script then wrote the
+    file. get_sheets said is_dirty false, but Sublime still counted the buffer as modified (modified dot in
+    the title) and every close raised a "Save changes?" dialog. The Sublime API has no flag for this, so
+    flag the case we can see cheaply: not dirty, empty buffer, non-empty file.
+    """
+    try:
+        path = v.file_name()
+        if not path or v.is_dirty() or v.is_loading() or v.size() != 0:
+            return False
+        return os.path.getsize(path) > 0
+    except Exception:
+        return False
+
+
+def _get_open_files(params):
+    def fn():
+        w = sublime.active_window()
+        normal = list(w.views())
+        previews = _preview_views(w)
+        files = []
+        for v in normal + previews:
+            item = {"path": v.file_name(), "name": _view_display_name(v), "is_dirty": v.is_dirty()}
+            if v not in normal:
+                item["preview"] = True   # a TRANSIENT view that window.views() leaves out
+            if _disk_differs(v):
+                item["disk_differs"] = True
+            files.append(item)
+        # The untouched untitled buffer of a new window is in neither list, so this answered
+        # `files: []` with a tab on screen (same measurement as get_sheets, 2026-11-08).
+        covered = set(normal) | set(previews)
+        for group in range(w.num_groups()):
+            for s in w.selected_sheets_in_group(group):
+                v = s.view()
+                if v is None or v in covered:
+                    continue
+                covered.add(v)
+                files.append({
+                    "path": v.file_name(),
+                    "name": _view_display_name(v),
+                    "is_dirty": v.is_dirty(),
+                    "placeholder": True,
+                })
+        return {"files": files}
+
+    return _on_main(fn)
+
+
+def _get_sheets(params):
+    # `settings=false` leaves out the per-tab settings dump (over 100 keys per tab).
+    with_settings = str(params.get("settings", ["true"])[0]).strip().lower() not in ("false", "0", "no")
+    # `window` picks a window by id (or "active", the default). A command that opens a new window
+    # -- open_folder, prompt_open_project_or_workspace, PackageDev's Create Package -- leaves it
+    # active and empty, so every listing done afterwards described the wrong window and read as
+    # "nothing happened" (measured 2026-11-08 while debugging PackageDev).
+    try:
+        want_window = int(params.get("window", [None])[0])
+    except (TypeError, ValueError):
+        want_window = None
+
+    def fn():
+        windows = sublime.windows()
+        active = sublime.active_window()
+        w = next((x for x in windows if x.id() == want_window), active)
+        selected_sheets = [
+            s
+            for group in range(w.num_groups())
+            for s in w.selected_sheets_in_group(group)
+        ]
+        selected_ids = {s.id() for s in selected_sheets}
+        active_sheet = w.active_sheet()
+        active_sheet_id = active_sheet.id() if active_sheet else None
+        active_group = w.active_group()
+        out = []
+        for i, s in enumerate(w.sheets()):
+            kind = type(s).__name__
+            path = None
+            try:
+                path = s.file_name()
+            except Exception:
+                pass
+            v = s.view()
+            item = {
+                "index": i,
+                "id": s.id(),
+                "type": kind,
+                "path": path,
+                "name": v.name() if v else None,
+                "is_dirty": v.is_dirty() if v else False,
+                "group": s.group(),
+                "index_in_group": w.get_sheet_index(s)[1],
+                "is_selected": s.id() in selected_ids,
+                "is_focused": s.id() == active_sheet_id,
+                "is_active_group": s.group() == active_group,
+            }
+            if v is not None and _disk_differs(v):
+                item["disk_differs"] = True
+            # Any package can tag a view with its own settings (GhostShell's
+            # ai_terminal_* keys, for example) -- surface all of it rather
+            # than a hand-picked subset, so a caller can always tell what a
+            # tab actually is without sublime-mcp needing to know about
+            # that package by name.
+            if v is not None:
+                if with_settings:
+                    try:
+                        item["settings"] = v.settings().to_dict()
+                    except Exception:
+                        item["settings"] = {}
+                item["is_scratch"] = v.is_scratch()
+                item["is_read_only"] = v.is_read_only()
+                try:
+                    item["size"] = v.size()
+                except Exception:
+                    item["size"] = None
+                item["syntax"] = _view_syntax(v)[0]
+            out.append(item)
+        # An untouched untitled buffer is a view the window shows but window.sheets() leaves out,
+        # while selected_sheets_in_group() does return it -- so the reply carried
+        # selected_sheet_ids [16] and active_sheet_id 16 while `sheets` had no 16 in it, and a
+        # caller read "nothing is open" with a tab on screen (measured 2026-11-08: a new window,
+        # then the same window after one character was typed, which made it appear). List those
+        # too, marked placeholder, the way the preview block below does.
+        covered = {item["id"] for item in out}
+        for s in selected_sheets:
+            if s.id() in covered:
+                continue
+            v = s.view()
+            if v is None:
+                continue
+            item = {
+                "index": len(out),
+                "id": s.id(),
+                "type": type(s).__name__,
+                "path": v.file_name(),
+                "name": _view_display_name(v),
+                "placeholder": True,
+                "is_dirty": v.is_dirty(),
+                "group": s.group(),
+                "index_in_group": w.get_sheet_index(s)[1],
+                "is_selected": True,
+                "is_focused": s.id() == active_sheet_id,
+                "is_active_group": s.group() == active_group,
+                "is_scratch": v.is_scratch(),
+                "is_read_only": v.is_read_only(),
+                "size": v.size(),
+                "syntax": _view_syntax(v)[0],
+            }
+            out.append(item)
+        # A preview a package opened is in neither sheet list, yet it is the tab on screen
+        # (see _preview_views): without this, get_sheets said nothing was open while a file
+        # was in front of the person.
+        for offset, v in enumerate(_preview_views(w), len(out)):
+            item = {
+                "index": offset,
+                "id": v.id(),
+                "type": "PreviewSheet",
+                "path": v.file_name(),
+                "name": _view_display_name(v),
+                "is_dirty": v.is_dirty(),
+                "preview": True,
+                "is_selected": True,
+                "is_focused": v.id() == active_sheet_id,
+                "is_active_group": True,
+            }
+            if _disk_differs(v):
+                item["disk_differs"] = True
+            if with_settings:
+                try:
+                    item["settings"] = v.settings().to_dict()
+                except Exception:
+                    item["settings"] = {}
+            item["is_scratch"] = v.is_scratch()
+            item["is_read_only"] = v.is_read_only()
+            try:
+                item["size"] = v.size()
+            except Exception:
+                item["size"] = None
+            item["syntax"] = _view_syntax(v)[0]
+            out.append(item)
+        return {
+            "sheets": out,
+            "selected_sheet_ids": [s.id() for s in selected_sheets],
+            "active_sheet_id": active_sheet_id,
+            "active_group": active_group,
+            "window_id": w.id(),
+            # Every window, so a command that opened one is visible instead of silent: pass its
+            # id back as `window` to list its tabs.
+            "windows": [
+                {
+                    "id": x.id(),
+                    "active": x.id() == active.id(),
+                    "folders": x.folders(),
+                    "project": x.project_file_name(),
+                    # len(x.views()) leaves out the untouched untitled buffer and any preview, so
+                    # the described window reports what `sheets` actually holds for it.
+                    "sheets": len(out) if x.id() == w.id() else len(x.views()),
+                    "name": _view_display_name(x.active_view()) if x.active_view() else None,
+                }
+                for x in windows
+            ],
+        }
+
+    return _on_main(fn)
+
+
+def _sheet_summary(w, s, settings=True):
+    v = s.view()
+    path = None
+    try:
+        path = s.file_name()
+    except Exception:
+        pass
+    group, index_in_group = w.get_sheet_index(s)
+    summary = {
+        "id": s.id(),
+        "type": type(s).__name__,
+        "path": path,
+        "name": v.name() if v else None,
+        "is_dirty": v.is_dirty() if v else False,
+        "group": group,
+        "index_in_group": index_in_group,
+    }
+    # Any package can tag a view with its own settings (GhostShell's
+    # ai_terminal_* keys, for example) -- surface all of it rather than a
+    # hand-picked subset, so a caller can always tell what a tab actually
+    # is without sublime-mcp needing to know about that package by name.
+    if v is not None:
+        if settings:
+            try:
+                summary["settings"] = v.settings().to_dict()
+            except Exception:
+                summary["settings"] = {}
+        summary["is_scratch"] = v.is_scratch()
+        summary["is_read_only"] = v.is_read_only()
+        try:
+            summary["size"] = v.size()
+        except Exception:
+            summary["size"] = None
+        summary["syntax"] = _view_syntax(v)[0]
+    return summary
+
+
+def _get_selected_sheets(params):
+    group_value = params.get("group", [None])[0]
+    group = int(group_value) if group_value is not None else None
+
+    def fn():
+        w = sublime.active_window()
+        if group is not None:
+            if group < 0 or group >= w.num_groups():
+                return {"error": "group {} out of range (have {})".format(group, w.num_groups())}
+            sheets = w.selected_sheets_in_group(group)
+        else:
+            sheets = [
+                s
+                for group_index in range(w.num_groups())
+                for s in w.selected_sheets_in_group(group_index)
+            ]
+        active_sheet = w.active_sheet()
+        return {
+            "sheets": [_sheet_summary(w, s) for s in sheets],
+            "active_sheet_id": active_sheet.id() if active_sheet else None,
+            "active_group": w.active_group(),
+        }
+
+    return _on_main(fn)
+
+
+def _resolve_sheet_refs(w, body, require_one=False):
+    indices = body.get("indices")
+    ids = body.get("ids")
+    if indices is None and body.get("index") is not None:
+        indices = [body.get("index")]
+    if ids is None and body.get("id") is not None:
+        ids = [body.get("id")]
+    if indices is None and ids is None:
+        return None, "provide index/indices or id/ids"
+
+    all_sheets = w.sheets()
+    by_id = {s.id(): s for s in all_sheets}
+    resolved = []
+    seen = set()
+    for raw_index in indices or []:
+        index = int(raw_index)
+        if index < 0 or index >= len(all_sheets):
+            return None, "index {} out of range (have {} sheets)".format(index, len(all_sheets))
+        sheet = all_sheets[index]
+        if sheet.id() not in seen:
+            resolved.append(sheet)
+            seen.add(sheet.id())
+    for raw_id in ids or []:
+        sheet_id = int(raw_id)
+        sheet = by_id.get(sheet_id)
+        if sheet is None:
+            return None, "sheet id {} not found".format(sheet_id)
+        if sheet.id() not in seen:
+            resolved.append(sheet)
+            seen.add(sheet.id())
+    if require_one and len(resolved) != 1:
+        return None, "exactly one sheet must be specified"
+    return resolved, None
+
+
+def _select_sheets(body):
+    def fn():
+        w = sublime.active_window()
+        sheets, error = _resolve_sheet_refs(w, body)
+        if error:
+            return {"error": error}
+        if not sheets:
+            return {"error": "at least one sheet must be specified"}
+        w.select_sheets(sheets)
+        focus_id = body.get("focus_id")
+        focus_index = body.get("focus_index")
+        if focus_id is not None or focus_index is not None:
+            focus_body = {"id": focus_id} if focus_id is not None else {"index": focus_index}
+            focused, focus_error = _resolve_sheet_refs(w, focus_body, require_one=True)
+            if focus_error:
+                return {"error": focus_error}
+            if focused[0].id() not in {s.id() for s in sheets}:
+                return {"error": "focused sheet must be included in the selection"}
+            w.focus_sheet(focused[0])
+        selected = [
+            s
+            for group in range(w.num_groups())
+            for s in w.selected_sheets_in_group(group)
+        ]
+        return {"ok": True, "sheets": [_sheet_summary(w, s) for s in selected]}
+
+    return _on_main(fn)
+
+
+def _focus_sheet(body):
+    def fn():
+        w = sublime.active_window()
+        sheets, error = _resolve_sheet_refs(w, body, require_one=True)
+        if error:
+            return {"error": error}
+        w.focus_sheet(sheets[0])
+        # The echo used to carry all 100+ view settings (about 7 KB) on every focus; they are
+        # only returned when asked for (settings: true), as get_sheets does.
+        return {"ok": True, "sheet": _sheet_summary(w, sheets[0], bool(body.get("settings", False)))}
+
+    return _on_main(fn)
+
+
+def _get_sheet_index(params):
+    body = {k: values[0] for k, values in params.items()}
+
+    def fn():
+        w = sublime.active_window()
+        sheets, error = _resolve_sheet_refs(w, body, require_one=True)
+        if error:
+            return {"error": error}
+        return {"sheet": _sheet_summary(w, sheets[0])}
+
+    return _on_main(fn)
+
+
+def _set_sheet_index(body):
+    group = body.get("group")
+    sheet_index = body.get("sheet_index")
+    if group is None or sheet_index is None:
+        return {"error": "group and sheet_index are required"}
+
+    def fn():
+        w = sublime.active_window()
+        sheets, error = _resolve_sheet_refs(w, body, require_one=True)
+        if error:
+            return {"error": error}
+        group_value = int(group)
+        sheet_index_value = int(sheet_index)
+        if group_value < 0 or group_value >= w.num_groups():
+            return {"error": "group {} out of range (have {})".format(group_value, w.num_groups())}
+        if sheet_index_value < 0 or sheet_index_value > len(w.sheets_in_group(group_value)):
+            return {"error": "sheet_index {} out of range for group {}".format(sheet_index_value, group_value)}
+        w.set_sheet_index(sheets[0], group_value, sheet_index_value)
+        return {"ok": True, "sheet": _sheet_summary(w, sheets[0])}
+
+    return _on_main(fn)
+
+
+def _move_sheets_to_group(body):
+    group = body.get("group")
+    if group is None:
+        return {"error": "group required"}
+    insertion_index = int(body.get("insertion_index", -1))
+    select = body.get("select", True)
+
+    def fn():
+        w = sublime.active_window()
+        sheets, error = _resolve_sheet_refs(w, body)
+        if error:
+            return {"error": error}
+        if not sheets:
+            return {"error": "at least one sheet must be specified"}
+        group_value = int(group)
+        if group_value < 0 or group_value >= w.num_groups():
+            return {"error": "group {} out of range (have {})".format(group_value, w.num_groups())}
+        if insertion_index < -1 or insertion_index > len(w.sheets_in_group(group_value)):
+            return {"error": "insertion_index {} out of range for group {}".format(insertion_index, group_value)}
+        w.move_sheets_to_group(sheets, group_value, insertion_index, bool(select))
+        return {"ok": True, "sheets": [_sheet_summary(w, s) for s in sheets]}
+
+    return _on_main(fn)
+
+
+def _sniff_image_mime(raw, path=None):
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    if raw[:2] == b"BM":
+        return "image/bmp"
+    # Magic bytes are the source of truth; extension is only a last resort
+    # for formats not sniffed above.
+    if path:
+        ext = path.lower().rsplit(".", 1)[-1] if "." in path else ""
+        return {
+            "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+        }.get(ext, "image/png")
+    return "image/png"
+
+
+def _get_sheet_content(params):
+    index = int(params.get("index", [0])[0])
+
+    def fn():
+        w = sublime.active_window()
+        sheets = w.sheets()
+        if index >= len(sheets):
+            return {"error": "index {} out of range (have {} sheets)".format(index, len(sheets))}
+        s = sheets[index]
+        kind = type(s).__name__
+        path = None
+        try:
+            path = s.file_name()
+        except Exception:
+            pass
+        if kind == "ImageSheet":
+            import base64
+            if path:
+                try:
+                    with open(path, "rb") as f:
+                        raw = f.read()
+                    b64 = base64.b64encode(raw).decode("ascii")
+                    mime = _sniff_image_mime(raw, path)
+                    return [{"type": "image", "data": b64, "mimeType": mime}]
+                except Exception:
+                    pass
+            return {"index": index, "type": kind, "path": path}
+        v = s.view()
+        if not v:
+            return {"error": "sheet {} has no text view".format(index)}
+        return {
+            "index": index,
+            "type": kind,
+            "path": path,
+            "name": v.name(),
+            "content": v.substr(sublime.Region(0, v.size())),
+        }
+
+    return _on_main(fn)
+
+
+def _get_project_folders(params):
+    def fn():
+        return {"folders": sublime.active_window().folders()}
+
+    return _on_main(fn)
+
+
+def _get_file_content(params):
+    path = params.get("path", [None])[0]
+    if not path:
+        return {"error": "path required"}
+
+    def fn():
+        v = sublime.active_window().find_open_file(path)
+        if not v:
+            return {"error": "not open: {}".format(path)}
+        return {"path": path, "content": v.substr(sublime.Region(0, v.size()))}
+
+    return _on_main(fn)
+
+
+def _resolve_view(w, name, index, unique=False):
+    """The tab for a partial name or a 0-based index, or (None, error).
+
+    With unique=True (tools that close or revert a tab) a name that fits several tabs is refused
+    instead of taking the first, unless exactly one tab has exactly that name; the error lists
+    the candidates with their indexes."""
+    views = list(w.views()) + _preview_views(w)  # a preview is on screen but not in views()
+    if name:
+        low = name.lower()
+        matches = [v for v in views if low in _view_display_name(v).lower()]
+        if not matches:
+            names = [_view_display_name(v) for v in views]
+            return None, {"error": "no view matching {!r}".format(name), "open_views": names}
+        if unique and len(matches) > 1:
+            exact = [v for v in matches if _view_display_name(v).lower() == low]
+            if len(exact) == 1:
+                return exact[0], None
+            return None, {
+                "error": "{!r} fits {} tabs; nothing was done. Use index or a longer name.".format(
+                    name, len(matches)),
+                "matches": [{"index": views.index(v), "name": _view_display_name(v)} for v in matches],
+            }
+        return matches[0], None
+    if index >= 0:
+        if index >= len(views):
+            return None, {
+                "error": "index {} out of range (have {} views)".format(index, len(views))
+            }
+        return views[index], None
+    return w.active_view(), None
+
+
+def _get_view_content(params):
+    name = params.get("name", [None])[0] or ""
+    index = int(params.get("index", [-1])[0])
+
+    def fn():
+        w = sublime.active_window()
+        v, err = _resolve_view(w, name, index)
+        if err:
+            return err
+        if not v:
+            return {"error": "no view found"}
+        return {
+            "name": v.name(),
+            "path": v.file_name(),
+            "content": v.substr(sublime.Region(0, v.size())),
+        }
+
+    return _on_main(fn)
+
+
+def _send_to_view(body):
+    name = body.get("name", "")
+    index = int(body.get("index", -1))
+    text = body.get("text", "")
+    if not text:
+        return {"error": "text required"}
+
+    def fn():
+        w = sublime.active_window()
+        v, err = _resolve_view(w, name, index)
+        if err:
+            return err
+        if not v:
+            return {"error": "no view found"}
+        if v.is_read_only():
+            return {"error": "view is read-only", "name": v.name()}
+        w.focus_view(v)
+        v.run_command("insert", {"characters": text})
+        return {"ok": True, "name": v.name()}
+
+    return _on_main(fn)
+
+
+def _get_output_panel(params):
+    name = params.get("name", [""])[0]
+
+    if name and name.lower() == "console":
+        console_params = {"mode": ["auto"]}
+        if params.get("force_focus"):
+            console_params["force_focus"] = params["force_focus"]
+        return _get_console(console_params)
+
+    def fn():
+        w = sublime.active_window()
+        panel_name = name
+        if panel_name:
+            v = w.find_output_panel(panel_name)
+        else:
+            panel_name, v = _active_output_panel_view(w)
+            if not panel_name:
+                return {"error": "no active output panel"}
+        if not v:
+            return {"error": "panel not found: {}".format(panel_name)}
+        return {"name": panel_name, "content": v.substr(sublime.Region(0, v.size()))}
+
+    return _on_main(fn)
+
+
+def _get_console_log(params):
+    _install_console_capture()
+    tail = int(params.get("tail", ["200"])[0])
+    all_entries = list(_console_state["entries"])
+    entries = all_entries[-tail:] if tail > 0 else all_entries
+    return {
+        "entries": entries,
+        "text": "".join(entries),
+        "length": sum(len(entry) for entry in entries),
+        "total": len(all_entries),
+        "dropped": _console_state["dropped"],
+        "source": "captured",
+        "complete": False,
+    }
+
+def _get_console_full(params):
+    """Backward-compatible alias for a complete visible-console capture."""
+    if sys.platform != "win32":
+        return {
+            "error": "complete console capture is currently supported only on Windows",
+            "fallback": _get_console_log({"tail": ["0"]}),
+        }
+    return _get_console_win(params)
+
+# Milliseconds the visible console capture waits between steps. "focus_timeout" and
+# "copy_timeout" are upper limits: the capture goes on as soon as Windows reports that the
+# window is in front (GetForegroundWindow) and that the copy reached the clipboard
+# (GetClipboardSequenceNumber changed). The other values are small fixed gaps.
+# Measured on portable 4215 (20 reads per setting): all gaps 0 failed, 5-20 ms succeeded
+# every time (about 100 ms per read), the old 150-400 ms gaps took about 2 s per read.
+# The /console request accepts waits=click=0,... to override them for one call (tuning).
+_CAPTURE_WAITS_MS = {"show": 0, "after_focus": 20, "click": 5, "ctrl_a": 5, "restore": 20,
+                     "focus_timeout": 400, "copy_timeout": 400}
+
+
+def _capture_waits(params):
+    waits = dict(_CAPTURE_WAITS_MS)
+    for part in str((params.get("waits") or [""])[0]).split(","):
+        name, _, value = part.partition("=")
+        if name.strip() in waits and value.strip().isdigit():
+            waits[name.strip()] = int(value)
+    return waits
+
+
+def _get_console_win(params):
+    # This capture temporarily changes the visible panel, editor focus, and
+    # clipboard. Serialize requests so concurrent captures cannot snapshot
+    # another capture's temporary console panel as the user's prior state.
+    if not _visible_console_capture_lock.acquire(timeout=10.0):
+        return {"error": "another visible-console capture is still in progress"}
+    try:
+        return _capture_console_win(params)
+    finally:
+        _visible_console_capture_lock.release()
+
+
+def _capture_console_win(params):
+    """Capture the visible console on Windows and restore user UI state."""
+    if sys.platform != "win32":
+        return {"error": "get_console_win is Windows-only"}
+    import ctypes
+    import ctypes.wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+
+    foreground = user32.GetForegroundWindow()
+    # Plugins run in a plugin_host child process; the windows belong to its
+    # parent, sublime_text.exe.
+    own_pids = {os.getpid(), os.getppid()}
+    force_focus_requested = str((params.get("force_focus") or ["0"])[0]).lower() in ("1", "true", "yes")
+    waits = _capture_waits(params)
+    _hwnd = [None]
+    def _enum(h, _):
+        # Only windows of this Sublime process: another Sublime instance (or any
+        # window titled "Sublime Text") must never receive the synthetic click,
+        # Ctrl+A and Ctrl+C below.
+        pid = ctypes.wintypes.DWORD()
+        user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+        if pid.value not in own_pids or not user32.IsWindowVisible(h):
+            return True
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(h, buf, 256)
+        if "Sublime Text" in buf.value:
+            if h == foreground:
+                _hwnd[0] = h
+                return False
+            if _hwnd[0] is None:
+                _hwnd[0] = h
+        return True
+    user32.EnumWindows(ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_size_t, ctypes.c_size_t)(_enum), 0)
+    hwnd = _hwnd[0]
+    if not hwnd:
+        return {"error": "ST window not found"}
+
+    rect = ctypes.wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    cx = (rect.left + rect.right) // 2
+    cy = rect.bottom - 80  # console output area, above the input field
+
+    cursor = ctypes.wintypes.POINT()
+    user32.GetCursorPos(ctypes.byref(cursor))
+
+    def snapshot_ui():
+        window = sublime.active_window()
+        view = window.active_view()
+        return {
+            "window": window,
+            "panel": window.active_panel(),
+            "view": view,
+            "selection": [(r.a, r.b) for r in view.sel()] if view else None,
+            "clipboard": sublime.get_clipboard(),
+            "foreground": foreground,
+        }
+
+    snapshot = _on_main(snapshot_ui)
+    sentinel = "sublime-mcp-console-copy-{}-{}".format(
+        threading.get_ident(), id(snapshot)
+    )
+    marker = "[sublime-mcp] console capture marker {}".format(int(time.time() * 1000))
+
+    result = {"text": None, "error": None}
+    cleanup = {"cancelled": False, "restore_started": False, "tries": 0}
+    done = threading.Event()
+    trace_path = os.environ.get("SUBLIME_MCP_CAPTURE_TRACE")
+
+    def tr(step):
+        """Debug aid: log each step to the file named in SUBLIME_MCP_CAPTURE_TRACE."""
+        if trace_path:
+            try:
+                with open(trace_path, "a") as f:
+                    f.write("{:.3f} {}\n".format(time.time(), step))
+            except Exception:
+                pass
+
+    def poll_until(condition, then, timeout_ms, step_ms=5):
+        """Call then() on the main thread as soon as condition() is true, or after timeout_ms."""
+        deadline = time.time() + timeout_ms / 1000.0
+
+        def check():
+            if condition() or time.time() >= deadline:
+                then()
+            else:
+                sublime.set_timeout(check, step_ms)
+        sublime.set_timeout(check, 0)
+
+    def _INP():
+        class MI(ctypes.Structure):
+            _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", ctypes.c_ulong),
+                        ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.c_uint64)]
+        class KI(ctypes.Structure):
+            _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort), ("dwFlags", ctypes.c_ulong),
+                        ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.c_uint64)]
+        class _U(ctypes.Union):
+            _fields_ = [("mi", MI), ("ki", KI)]
+        class INP(ctypes.Structure):
+            _fields_ = [("type", ctypes.c_ulong), ("_u", _U)]
+        return INP
+
+    def do_show():
+        if cleanup["cancelled"]:
+            restore_ui()
+            return
+        # A line only the console can contain: the copied text must include it,
+        # otherwise the copy came from somewhere else (e.g. the editor).
+        print(marker)
+        tr("do_show: set sentinel clipboard")
+        sublime.set_clipboard(sentinel)
+        tr("do_show: show console panel")
+        snapshot["window"].run_command("show_panel", {"panel": "console"})
+        sublime.set_timeout(do_click, waits["show"])
+
+    def own_window_has_focus():
+        """True only if this Sublime's window has the keyboard focus.
+
+        Every synthetic click or key below is global input, so it must never be
+        sent unless our own window is the foreground window; otherwise it would
+        land in whatever window the user is working in (for example a terminal,
+        where Ctrl+C cancels the running command).
+        """
+        if user32.GetForegroundWindow() != hwnd:
+            return False
+        # The front window must also be the Sublime window being read, not just
+        # another window of this process (e.g. one holding a terminal tab).
+        # Sublime titles a window "<tab name or file> - Sublime Text".
+        buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, buf, 512)
+        view = snapshot["view"]
+        name = (view.name() or os.path.basename(view.file_name() or "")) if view else ""
+        name = re.sub(r"^\W+", "", name)  # status glyphs such as a spinner change while we run
+        if not name:
+            # An unsaved tab is titled "untitled" when empty, otherwise by its first line.
+            first_line = view.substr(view.line(0)).strip() if view else ""
+            first_line = re.sub(r"^\W+", "", first_line)[:20]
+            return ("untitled" in buf.value.lower()
+                    or buf.value.strip().lower().startswith("sublime text")
+                    or bool(first_line and first_line in buf.value))
+        return name in buf.value
+
+    def force_focus():
+        # Runs on a worker thread, never on the plugin host's main thread:
+        # ShowWindow/SetForegroundWindow on our own window send a message to
+        # Sublime's UI thread, which can be waiting on that main thread.
+        #
+        # Only used with force_focus=true, because a raise takes the keyboard focus from
+        # whatever the user is doing.
+        #
+        # Crash evidence. 2026-10-04: a loop on portable 4200 that killed and relaunched it
+        # for each capture (12 per variant) saw the method used here (minimize, restore,
+        # SetForegroundWindow) crash it 2 times in 12 (CoreMessaging.dll); the AttachThreadInput
+        # variants crashed 5 to 8 times in 12; variants without a real raise never crashed
+        # and never got the focus. The script and logs were not kept. 2026-10-19: about
+        # 1,000 raises of this method on portables 4200 and 4215 (long-running and freshly
+        # relaunched) gave no crash and no new dump file, so that rate does not hold on
+        # those setups (the portables now hold few packages); the cause of the 10-04 crashes
+        # is unknown.
+        #
+        # Windows lets a process take the foreground only if it received the last input
+        # event, started the foreground process, or the foreground lock timeout has expired
+        # (SetForegroundWindow documentation). A freshly started Sublime has had no input,
+        # so its first raise usually fails; later raises work because the click and keys of
+        # the previous capture count as input. A raise also fails while the user types. The
+        # capture then sends no input and reports it.
+        tr("force_focus: minimize + restore")
+        user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+
+    def abort_no_focus(hint=""):
+        result["error"] = ("could not give the Sublime Text window the keyboard focus; "
+                           "no input was sent" + hint + _dialog_hint())
+        restore_ui()
+
+    def do_click():
+        if cleanup["cancelled"]:
+            restore_ui()
+            return
+        if own_window_has_focus():
+            # Already in front (e.g. the user's own Sublime): no focus calls at all.
+            tr("do_click: window already has focus")
+            sublime.set_timeout(do_click_focused, 0)
+            return
+        if not force_focus_requested:
+            # Not in front. Raising a window takes the focus from the user, so that only
+            # happens when the caller explicitly asks for it.
+            tr("do_click: window not in front and force_focus not requested")
+            abort_no_focus("; this Sublime window is not in front. Bring it to the front "
+                           "yourself, or pass force_focus=true to raise it")
+            return
+        tr("do_click: start focus thread")
+        threading.Thread(target=force_focus, daemon=True).start()
+        # GetForegroundWindow is true the moment Windows switches; Sublime handles its own
+        # activation a little later, so give it after_focus ms before the click.
+        poll_until(lambda: user32.GetForegroundWindow() == hwnd,
+                   lambda: sublime.set_timeout(do_click_focused, waits["after_focus"]),
+                   waits["focus_timeout"])
+
+    def do_click_focused():
+        if cleanup["cancelled"]:
+            restore_ui()
+            return
+        if not own_window_has_focus():
+            tr("do_click_focused: window does not have focus; no input sent")
+            abort_no_focus()
+            return
+        if snapshot["window"].active_panel() != "console":
+            # The click below goes to a fixed spot near the bottom of the window. If the
+            # console panel is not open there, it lands in the editor view instead (in a
+            # terminal tab it selects a line of the prompt), so never click without it.
+            tr("do_click_focused: console panel not open; no input sent")
+            abort_no_focus("; the console panel did not open")
+            return
+        INP = _INP()
+        tr("do_click_focused: cursor + click")
+        user32.SetCursorPos(cx, cy)
+        dn = INP(type=0); dn._u.mi.dwFlags = 0x0002
+        up = INP(type=0); up._u.mi.dwFlags = 0x0004
+        user32.SendInput(1, ctypes.byref(dn), ctypes.sizeof(INP))
+        user32.SendInput(1, ctypes.byref(up), ctypes.sizeof(INP))
+        tr("do_click_focused: click sent")
+        sublime.set_timeout(do_ctrl_a, slower("click"))
+
+    def slower(name):
+        """A gap that grows on each retry: the 5 ms gaps suit a quick redraw, but a heavier
+        theme (seen with Numix on 4200, 2026-10-20) failed two reads in a row, because the
+        click had not been handled when Ctrl+A arrived."""
+        return max(waits[name], 1) * (1, 6, 20)[min(cleanup["tries"], 2)]
+
+    def do_ctrl_a():
+        if cleanup["cancelled"]:
+            restore_ui()
+            return
+        if not own_window_has_focus():
+            abort_no_focus()
+            return
+        INP = _INP()
+        def kd(vk): k = INP(type=1); k._u.ki.wVk = vk; k._u.ki.dwFlags = 0; user32.SendInput(1, ctypes.byref(k), ctypes.sizeof(INP))
+        def ku(vk): k = INP(type=1); k._u.ki.wVk = vk; k._u.ki.dwFlags = 2; user32.SendInput(1, ctypes.byref(k), ctypes.sizeof(INP))
+        tr("do_ctrl_a: keys")
+        kd(0x11); kd(0x41); ku(0x41); ku(0x11)
+        tr("do_ctrl_a: keys sent")
+        sublime.set_timeout(do_ctrl_c, slower("ctrl_a"))
+
+    def do_ctrl_c():
+        if cleanup["cancelled"]:
+            restore_ui()
+            return
+        if not own_window_has_focus():
+            abort_no_focus()
+            return
+        INP = _INP()
+        def kd(vk): k = INP(type=1); k._u.ki.wVk = vk; k._u.ki.dwFlags = 0; user32.SendInput(1, ctypes.byref(k), ctypes.sizeof(INP))
+        def ku(vk): k = INP(type=1); k._u.ki.wVk = vk; k._u.ki.dwFlags = 2; user32.SendInput(1, ctypes.byref(k), ctypes.sizeof(INP))
+        tr("do_ctrl_c: keys")
+        clip_seq = user32.GetClipboardSequenceNumber()
+        kd(0x11); kd(0x43); ku(0x43); ku(0x11)
+        tr("do_ctrl_c: keys sent")
+        # Read as soon as the copy has finished. Watch the clipboard sequence number, which
+        # needs no clipboard access: a copy bumps it twice (clear, then data), so wait for
+        # a change and then for 10 ms without another one. Opening the clipboard to look at
+        # it while Sublime copies makes Sublime's own copy fail. read_clip checks the
+        # content, so a timeout here only leads to its own error.
+        seen = {"seq": None, "since": 0.0}
+
+        def copy_settled():
+            seq = user32.GetClipboardSequenceNumber()
+            if seq == clip_seq:
+                return False
+            now = time.time()
+            if seq != seen["seq"]:
+                seen["seq"], seen["since"] = seq, now
+                return False
+            return now - seen["since"] >= 0.010
+        poll_until(copy_settled, read_clip, waits["copy_timeout"])
+
+    def read_clip():
+        if cleanup["cancelled"]:
+            restore_ui()
+            return
+        CF_UNICODETEXT = 13
+        tr("read_clip: open clipboard")
+        if user32.OpenClipboard(0):
+            h = user32.GetClipboardData(CF_UNICODETEXT)
+            if h:
+                ptr = kernel32.GlobalLock(h)
+                if ptr:
+                    text = ctypes.wstring_at(ptr)
+                    if text == sentinel:
+                        result["error"] = "console copy did not update the clipboard"
+                    elif marker not in text and cleanup["tries"] < 2:
+                        # Observed on build 4200 (2026-10-20): every second read copied only an
+                        # empty line, the console output had not taken the click. Click and copy
+                        # once more before giving up.
+                        cleanup["tries"] += 1
+                        kernel32.GlobalUnlock(h)
+                        user32.CloseClipboard()
+                        tr("read_clip: marker missing, retry")
+                        sublime.set_clipboard(sentinel)
+                        sublime.set_timeout(do_click_focused, waits["click"])
+                        return
+                    elif marker not in text:
+                        result["error"] = ("the copied text is not the console (it lacks the "
+                                           "capture marker); the console did not have the focus"
+                                           " [copied {} chars: {!r}; panel {!r}; clicked ({}, {}) in "
+                                           "window {}x{}; {} reads]".format(
+                                               len(text), text[:60], snapshot["window"].active_panel(),
+                                               cx, cy, rect.right - rect.left, rect.bottom - rect.top,
+                                               cleanup["tries"] + 1)
+                                           + _dialog_hint())
+                    else:
+                        result["text"] = text
+                    kernel32.GlobalUnlock(h)
+                else:
+                    result["error"] = "GlobalLock failed"
+            else:
+                result["error"] = "no text on clipboard"
+            user32.CloseClipboard()
+        else:
+            result["error"] = "OpenClipboard failed"
+        tr("read_clip: done")
+        restore_ui()
+
+    def restore_ui():
+        if cleanup["restore_started"]:
+            return
+        cleanup["restore_started"] = True
+        tr("restore_ui: start")
+        # Restore the visible panel before focusing the prior view; panel
+        # transitions can otherwise steal focus back from the editor.
+        previous_panel = snapshot["panel"]
+        if previous_panel:
+            snapshot["window"].run_command("show_panel", {"panel": previous_panel})
+        else:
+            snapshot["window"].run_command("hide_panel")
+        tr("restore_ui: panel restored")
+        sublime.set_clipboard(snapshot["clipboard"])
+        user32.SetCursorPos(cursor.x, cursor.y)
+        tr("restore_ui: clipboard + cursor restored")
+        sublime.set_timeout(restore_focus, waits["restore"])
+
+    def restore_focus():
+        tr("restore_focus: start")
+        previous_view = snapshot["view"]
+        if previous_view and previous_view.is_valid():
+            snapshot["window"].focus_view(previous_view)
+            saved = snapshot.get("selection")
+            if saved is not None and [(r.a, r.b) for r in previous_view.sel()] != saved:
+                # A stray click or key must not leave a different selection behind.
+                previous_view.sel().clear()
+                previous_view.sel().add_all([sublime.Region(a, b) for a, b in saved])
+        previous_foreground = snapshot["foreground"]
+        if previous_foreground and previous_foreground != hwnd:
+            tr("restore_focus: SetForegroundWindow(previous)")
+            user32.SetForegroundWindow(previous_foreground)
+            # Observed on build 4200 (2026-10-19): after the window is sent to the back, the
+            # first overlay opened by a command (show_overlay, or a package's quick panel) is
+            # closed again at once and the second one stays. Open and close one here, once
+            # the window is no longer in front, so the caller's first overlay is not the one lost.
+            def burn_first_overlay():
+                snapshot["window"].run_command("show_overlay", {"overlay": "goto"})
+                snapshot["window"].run_command("hide_overlay")
+                tr("restore_focus: done")
+                done.set()
+            poll_until(lambda: user32.GetForegroundWindow() != hwnd,
+                       lambda: sublime.set_timeout(burn_first_overlay, 50), 400)
+            return
+        tr("restore_focus: done")
+        done.set()
+
+    if not force_focus_requested and not own_window_has_focus():
+        # Decide before changing anything. do_show prints a marker line into the console,
+        # replaces the clipboard and switches the visible panel; a capture that is bound to
+        # fail for lack of focus must not leave those behind (each failed attempt used to
+        # add a "console capture marker" line to the console).
+        return {"error": "could not give the Sublime Text window the keyboard focus; no input was "
+                         "sent; this Sublime window is not in front. Bring it to the front yourself, "
+                         "or pass force_focus=true to raise it" + _dialog_hint()}
+    sublime.set_timeout(do_show, 0)
+    if not done.wait(timeout=6.0):
+        # Best-effort cleanup even when an earlier UI callback did not run.
+        cleanup["cancelled"] = True
+        sublime.set_timeout(restore_ui, 0)
+        return {"error": "timeout waiting for console capture"}
+    if result["text"] is not None:
+        return {
+            "text": result["text"],
+            "length": len(result["text"]),
+            "source": "visible_windows",
+            "complete": True,
+        }
+    return {"error": result.get("error", "unknown")}
+
+
+def _tail_lines(text, tail):
+    """Keep the last ``tail`` lines of ``text`` (all of it when tail <= 0).
+
+    Returns (text, total_line_count).
+    """
+    lines = text.splitlines(True)
+    if tail <= 0 or len(lines) <= tail:
+        return text, len(lines)
+    return "".join(lines[-tail:]), len(lines)
+
+
+def _apply_visible_tail(visible, tail):
+    """Cut a visible-console result to its last ``tail`` lines and say that it was cut.
+
+    The visible capture copies the whole console (everything since startup, tens of
+    kilobytes), so without this ``tail`` was ignored in visible mode.
+    """
+    if not isinstance(visible, dict) or "text" not in visible or tail <= 0:
+        return visible
+    text, total = _tail_lines(visible["text"], tail)
+    result = dict(visible)
+    result["text"] = text
+    result["length"] = len(text)
+    result["lines_total"] = total
+    result["truncated"] = total > tail
+    return result
+
+
+def _get_console(params):
+    """Unified console reader with explicit completeness and source metadata."""
+    mode = (params.get("mode", ["auto"])[0] or "auto").lower()
+    tail = params.get("tail", ["200"])[0]
+    if mode == "captured":
+        return _get_console_log({"tail": [tail]})
+    if mode not in ("auto", "visible"):
+        return {"error": "mode must be auto, visible, or captured"}
+    try:
+        tail_n = int(tail)
+    except (TypeError, ValueError):
+        return {"error": "tail must be an integer"}
+    if sys.platform == "win32":
+        visible = _get_console_win(params)
+        if "error" not in visible or mode == "visible":
+            return _apply_visible_tail(visible, tail_n)
+        captured = _get_console_log({"tail": [tail]})
+        captured["warning"] = "visible capture failed: {}".format(visible["error"])
+        return captured
+    if mode == "visible":
+        return {"error": "visible console capture is currently supported only on Windows"}
+    captured = _get_console_log({"tail": [tail]})
+    captured["warning"] = "complete visible capture is unavailable on this platform"
+    return captured
+
+
+def _get_symbols(params):
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        out = []
+        for region, name in v.symbols():
+            row, col = v.rowcol(region.begin())
+            out.append({"name": name, "line": row + 1, "col": col + 1})
+        return {"path": v.file_name(), "symbols": out}
+
+    return _on_main(fn)
+
+
+def _lookup_symbol(params):
+    sym = params.get("symbol", [None])[0]
+    if not sym:
+        return {"error": "symbol required"}
+
+    def fn():
+        locs = sublime.active_window().lookup_symbol_in_open_files(sym)
+        out = []
+        for l in locs:
+            if isinstance(l, tuple):
+                # The API returns (path, display_name, (row, col)), row and column already 1-based.
+                out.append({"path": l[0], "name": l[1], "line": l[2][0], "col": l[2][1]})
+            else:
+                out.append({"path": l.path, "name": l.display_name, "line": l.row + 1, "col": l.col + 1})
+        return {"locations": out}
+
+    return _on_main(fn)
+
+
+def _get_project_data(params):
+    def fn():
+        return {"project_data": sublime.active_window().project_data()}
+
+    return _on_main(fn)
+
+
+def _get_variables(params):
+    def fn():
+        return sublime.active_window().extract_variables()
+
+    return _on_main(fn)
+
+
+def _get_bookmarks(params):
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        out = []
+        for r in v.get_regions("bookmarks"):
+            row, col = v.rowcol(r.begin())
+            out.append({"line": row + 1, "col": col + 1})
+        return {"path": v.file_name(), "bookmarks": out}
+
+    return _on_main(fn)
+
+
+def _get_line_count(params):
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        return {"path": v.file_name(), "line_count": v.rowcol(v.size())[0] + 1}
+
+    return _on_main(fn)
+
+
+def _get_syntaxes(params):
+    def fn():
+        return {
+            "syntaxes": [
+                {"name": s.name, "path": s.path} for s in sublime.list_syntaxes()
+            ]
+        }
+
+    return _on_main(fn)
+
+
+def _get_command_palette(params):
+    package_filter = params.get("package", [""])[0].strip().lower()
+    command_filter = params.get("command", [""])[0].strip().lower()
+    caption_filter = params.get("caption", [""])[0].strip().lower()
+
+    def fn():
+        entries = []
+        for resource in sorted(sublime.find_resources("*.sublime-commands")):
+            package = _package_name_from_resource(resource) or ""
+            if package_filter and package_filter not in package.lower():
+                continue
+            try:
+                data = sublime.decode_value(sublime.load_resource(resource))
+            except Exception as e:
+                entries.append(
+                    {
+                        "resource": resource,
+                        "package": package,
+                        "error": str(e),
+                    }
+                )
+                continue
+            if not isinstance(data, list):
+                continue
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                command = item.get("command", "")
+                caption = item.get("caption", "")
+                if command_filter and command_filter not in command.lower():
+                    continue
+                if caption_filter and caption_filter not in caption.lower():
+                    continue
+                entries.append(
+                    {
+                        "caption": caption,
+                        "command": command,
+                        "args": item.get("args", {}),
+                        "resource": resource,
+                        "package": package,
+                    }
+                )
+        return {"entries": entries, "count": len(entries)}
+
+    return _on_main(fn)
+
+
+def _get_commands(params):
+    package_filter = params.get("package", [""])[0].strip().lower()
+    command_filter = params.get("command", [""])[0].strip().lower()
+    include_palette = (
+        params.get("include_palette", ["true"])[0].strip().lower() != "false"
+    )
+
+    def fn():
+        commands = {}
+        for scope, classes in (
+            ("application", getattr(sublime_plugin, "application_command_classes", [])),
+            ("window", getattr(sublime_plugin, "window_command_classes", [])),
+            ("text", getattr(sublime_plugin, "text_command_classes", [])),
+        ):
+            for cls in classes:
+                command = _command_name_from_class(cls)
+                module = getattr(cls, "__module__", "")
+                package = module.split(".", 1)[0] if module else ""
+                if package_filter and package_filter not in package.lower():
+                    continue
+                if command_filter and command_filter not in command.lower():
+                    continue
+                entry = commands.setdefault(
+                    command,
+                    {
+                        "command": command,
+                        "scopes": [],
+                        "class_names": [],
+                        "modules": [],
+                        "packages": [],
+                        "palette_entries": [],
+                    },
+                )
+                if scope not in entry["scopes"]:
+                    entry["scopes"].append(scope)
+                if cls.__name__ not in entry["class_names"]:
+                    entry["class_names"].append(cls.__name__)
+                if module and module not in entry["modules"]:
+                    entry["modules"].append(module)
+                if package and package not in entry["packages"]:
+                    entry["packages"].append(package)
+        if include_palette:
+            for resource in sorted(sublime.find_resources("*.sublime-commands")):
+                package = _package_name_from_resource(resource) or ""
+                if package_filter and package_filter not in package.lower():
+                    continue
+                try:
+                    data = sublime.decode_value(sublime.load_resource(resource))
+                except Exception:
+                    continue
+                if not isinstance(data, list):
+                    continue
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    command = item.get("command", "")
+                    caption = item.get("caption", "")
+                    if not command:
+                        continue
+                    if command_filter and command_filter not in command.lower():
+                        continue
+                    entry = commands.setdefault(
+                        command,
+                        {
+                            "command": command,
+                            "scopes": [],
+                            "class_names": [],
+                            "modules": [],
+                            "packages": [],
+                            "palette_entries": [],
+                        },
+                    )
+                    if package and package not in entry["packages"]:
+                        entry["packages"].append(package)
+                    entry["palette_entries"].append(
+                        {
+                            "caption": caption,
+                            "args": item.get("args", {}),
+                            "resource": resource,
+                            "package": package,
+                        }
+                    )
+        return {
+            "commands": [commands[name] for name in sorted(commands)],
+            "count": len(commands),
+        }
+
+    return _on_main(fn)
+
+
+def _get_menu_items(params):
+    menu_filter = params.get("menu", [""])[0].strip().lower()
+    caption_filter = params.get("caption", [""])[0].strip().lower()
+    command_filter = params.get("command", [""])[0].strip().lower()
+
+    def fn():
+        entries = _collect_menu_entries(menu_filter, caption_filter, command_filter, True)
+        return {"entries": entries, "count": len(entries)}
+
+    return _on_main(fn)
+
+
+def _collect_menu_entries(menu_filter="", caption_filter="", command_filter="", report_errors=False):
+    """Every item of the installed *.sublime-menu resources (see _walk_menu_items)."""
+    entries = []
+    for resource in sorted(sublime.find_resources("*.sublime-menu")):
+        filename = resource.rsplit("/", 1)[-1].lower()
+        if menu_filter and menu_filter not in filename:
+            continue
+        try:
+            data = sublime.decode_value(sublime.load_resource(resource))
+        except Exception as e:
+            if report_errors:
+                entries.append({"resource": resource, "error": str(e)})
+            continue
+        if isinstance(data, list):
+            _walk_menu_items(data, resource, [], caption_filter, command_filter, entries)
+    return entries
+
+
+def _menu_caption_key(caption):
+    """Lower case, '&' mnemonics dropped, the ellipsis character written as three dots."""
+    return str(caption).replace("&", "").replace("…", "...").strip().lower()
+
+
+def _click_menu_item(body):
+    """Run the command of an installed menu item picked by its caption path,
+    e.g. "Tools > Command Palette...". Uses the *.sublime-menu resources, so it
+    never opens the native menu."""
+    wanted = [_menu_caption_key(p) for p in str(body.get("path", "")).split(">") if p.strip()]
+    if not wanted:
+        return {"error": "path required, e.g. 'Tools > Command Palette...'"}
+    scope = body.get("scope")
+    if scope is not None and scope not in ("window", "text", "application"):
+        return {"error": "scope must be window, text or application"}
+
+    def fn():
+        found = []
+        for e in _collect_menu_entries():
+            if not e["command"]:
+                continue
+            have = [_menu_caption_key(c) for c in e["path"]]
+            if e["caption"]:
+                candidates = [have]
+            else:
+                # Sublime writes the text of most built-in items itself (Selection > Select All has
+                # no caption in the menu file): address those by the command name, spaced or not.
+                command = e["command"]
+                candidates = [have + [_menu_caption_key(command.replace("_", " "))],
+                              have + [_menu_caption_key(command)]]
+            if any(c[-len(wanted):] == wanted for c in candidates):
+                if not any(f["path"] == e["path"] and f["command"] == e["command"] and f["args"] == e["args"]
+                           and f["caption"] == e["caption"] for f in found):  # same item in two menu files
+                    found.append(e)
+        if not found:
+            return {"error": "no menu item with a command matches %r; items with no caption of "
+                             "their own match by command name, e.g. 'Selection > select_all'"
+                             % body.get("path")}
+        if len(found) > 1:
+            return {"error": "%d menu items match; give more of the path" % len(found),
+                    "matches": [{"path": " > ".join(e["path"]), "caption": e["caption"],
+                                 "command": e["command"], "resource": e["resource"]} for e in found]}
+        e = found[0]
+        cmd, args = e["command"], e["args"] or {}
+        scope = body.get("scope")
+        guessed = False
+        if not scope:
+            scope, guessed = "window", True
+            for name, classes in (("application", "application_command_classes"),
+                                  ("text", "text_command_classes"),
+                                  ("window", "window_command_classes")):
+                if any(_command_name_from_class(c) == cmd for c in getattr(sublime_plugin, classes, [])):
+                    scope, guessed = name, False
+                    break
+        w = sublime.active_window()
+        try:  # a real click expands ${packages} and the like
+            args = sublime.expand_variables(args, w.extract_variables())
+        except Exception:
+            pass
+        if scope == "text":
+            v = w.active_view()
+            if v is None:
+                return {"error": "no active view for text command %s" % cmd}
+            v.run_command(cmd, args)
+        elif scope == "application":
+            sublime.run_command(cmd, args)
+        else:
+            w.run_command(cmd, args)
+        out = {"ok": True, "clicked": " > ".join(e["path"]) + ("" if e["caption"] else " > " + cmd),
+               "command": cmd, "args": args, "scope": scope}
+        if guessed:
+            out["note"] = ("scope not detected (a built-in command, or one from the other plugin host), "
+                           "so it ran in the window, which also reaches built-in text commands such as "
+                           "select_all; if nothing happened, repeat with scope='text' or 'application'")
+        return out
+
+    return _on_main(fn)
+
+
+def _get_active_panel(params):
+    def fn():
+        w = sublime.active_window()
+        panel_name = w.active_panel()
+        out = {"active_panel": panel_name}
+        if panel_name and panel_name.startswith("output."):
+            short_name, v = _active_output_panel_view(w)
+            out["name"] = short_name
+            out["content"] = v.substr(sublime.Region(0, v.size())) if v else None
+        else:
+            out["name"] = None
+            out["content"] = None
+        return out
+
+    return _on_main(fn)
+
+
+def _get_scope_at_cursor(params):
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        sel = v.sel()
+        pt = sel[0].begin() if sel else 0
+        return {"scope": v.scope_name(pt).strip()}
+
+    return _on_main(fn)
+
+
+def _get_encoding(params):
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        return {"path": v.file_name(), "encoding": v.encoding()}
+
+    return _on_main(fn)
+
+
+def _get_word_at_cursor(params):
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        sel = v.sel()
+        pt = sel[0].begin() if sel else 0
+        word_region = v.word(pt)
+        row, col = v.rowcol(pt)
+        return {
+            "word": v.substr(word_region),
+            "line": row + 1,
+            "col": col + 1,
+        }
+
+    return _on_main(fn)
+
+
+def _get_layout(params):
+    def fn():
+        w = sublime.active_window()
+        layout = w.layout()
+        views_by_group = {}
+        for g in range(w.num_groups()):
+            views_by_group[g] = [
+                {"path": v.file_name(), "name": v.name()} for v in w.views_in_group(g)
+            ]
+        return {
+            "layout": layout,
+            "num_groups": w.num_groups(),
+            "views_by_group": views_by_group,
+        }
+
+    return _on_main(fn)
+
+
+def _get_view_size(params):
+    name = params.get("name", [None])[0] or ""
+    index = int(params.get("index", [-1])[0])
+
+    def fn():
+        w = sublime.active_window()
+        v, err = _resolve_view(w, name, index)
+        if err:
+            return err
+        if not v:
+            return {"error": "no view found"}
+        return {"name": v.name(), "path": v.file_name(), "size": v.size()}
+
+    return _on_main(fn)
+
+
+def _get_view_chars(params):
+    name = params.get("name", [None])[0] or ""
+    index = int(params.get("index", [-1])[0])
+    begin = int(params.get("begin", [0])[0])
+    end_p = params.get("end", [None])[0]
+
+    def fn():
+        w = sublime.active_window()
+        v, err = _resolve_view(w, name, index)
+        if err:
+            return err
+        if not v:
+            return {"error": "no view found"}
+        size = v.size()
+        end_c = int(end_p) if end_p is not None else size
+        begin_c = max(0, begin)
+        end_c = min(size, end_c)
+        return {
+            "name": v.name(),
+            "path": v.file_name(),
+            "size": size,
+            "begin": begin_c,
+            "end": end_c,
+            "content": v.substr(sublime.Region(begin_c, end_c)),
+        }
+
+    return _on_main(fn)
+
+
+def _get_view_regions(params):
+    """Return the regions a plugin stored in a view under one or more region keys
+    (view.add_regions(key, ...)): begin, end and the first 80 characters of each. The API offers no
+    way to list the keys, so the caller names them (several, separated by commas). Lets a test see
+    what a highlighting plugin drew without a screenshot."""
+    name = params.get("name", [None])[0]
+    keys = [k.strip() for k in str(params.get("key", [""])[0]).split(",") if k.strip()]
+    if not keys:
+        return {"error": "key required: a region key such as 'ifdef' (several: separate with commas)"}
+
+    def fn():
+        w = sublime.active_window()
+        v, open_views = _find_view_by_name(w, name)
+        if not v:
+            return {"error": "no view matching {!r}".format(name), "open_views": open_views}
+        out = {}
+        for k in keys:
+            out[k] = [{"begin": r.begin(), "end": r.end(), "text": v.substr(r)[:80]}
+                      for r in v.get_regions(k)[:500]]
+        return {"name": v.name(), "path": v.file_name(), "regions": out}
+
+    return _on_main(fn)
+
+
+def _get_view_phantoms(params):
+    """Return all phantoms attached to a view, with HTML stripped to plain text.
+
+    ST doesn't expose a public API to enumerate phantom sets; instead we walk
+    sys.modules looking for any loaded plugin module that has a _phantom_sets
+    attribute (a dict mapping view ID -> PhantomSet).  The optional 'key' param
+    filters by the PhantomSet's key string.
+
+    Each phantom entry includes both the raw HTML 'content' and a 'text' field
+    with tags stripped, for easier reading.
+    """
+    name = params.get("name", [None])[0]
+    key = params.get("key", [""])[0].strip()
+
+    def _int(k, default):
+        try:
+            return int(params.get(k, [default])[0])
+        except (TypeError, ValueError):
+            return default
+
+    last = _int("last", 0)
+    max_chars = _int("max_chars", 0)
+    offset = max(0, _int("offset", 0))
+    include_html = str(params.get("html", ["true"])[0]).lower() not in ("false", "0", "no")
+
+    def fn():
+        w = sublime.active_window()
+        v, open_views = _find_view_by_name(w, name)
+        if not v:
+            return {"error": "no view matching {!r}".format(name), "open_views": open_views}
+        phantoms = []
+        for mod in list(sys.modules.values()):
+            ps_map = getattr(mod, "_phantom_sets", None)
+            if not isinstance(ps_map, dict):
+                continue
+            phantom_set = ps_map.get(v.id())
+            if not phantom_set:
+                continue
+            phantom_key = getattr(phantom_set, "key", "")
+            if key and phantom_key != key:
+                continue
+            for item in getattr(phantom_set, "phantoms", []):
+                region = getattr(item, "region", sublime.Region(-1, -1))
+                content = getattr(item, "content", "")
+                layout = getattr(item, "layout", None)
+                layout_name = (
+                    getattr(layout, "name", None) if layout is not None else None
+                )
+                text = _clean_phantom_text(content)
+                entry = {
+                    "module": getattr(mod, "__name__", None),
+                    "key": phantom_key,
+                    "region": [region.a, region.b],
+                    "layout": layout_name or str(layout),
+                }
+                if include_html:
+                    entry["content"] = content
+                elif not text.strip():
+                    continue            # html=false is for reading: spacer phantoms with no text are left out
+                text_length = len(text)
+                if offset:
+                    text = text[offset:]    # offset + max_chars read one phantom in slices
+                if max_chars and len(text) > max_chars:
+                    text = text[:max_chars] + " ...[%d more characters]" % (len(text) - max_chars)
+                if offset or max_chars:
+                    entry["text_length"] = text_length
+                entry["text"] = text
+                phantoms.append(entry)
+        total = len(phantoms)
+        if last and last > 0:
+            phantoms = phantoms[-last:]
+        return {
+            "name": v.name(),
+            "path": v.file_name(),
+            "phantoms": phantoms,
+            "count": len(phantoms),
+            "total": total,
+        }
+
+    return _on_main(fn)
+
+
+# ── POST handlers ─────────────────────────────────────────────────────────────
+
+
+def _set_project_data(body):
+    data = body.get("data")
+    if data is None:
+        return {"error": "data required"}
+
+    def fn():
+        sublime.active_window().set_project_data(data)
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+_OPEN_FILE_WAIT_SECONDS = 3
+
+
+def _open_file(body):
+    path = body.get("path")
+    if not path:
+        return {"error": "path required"}
+    line = body.get("line", 0)
+    col = body.get("col", 0)
+
+    def fn():
+        w = sublime.active_window()
+        flags = sublime.ENCODED_POSITION if (line or col) else sublime.NewFileFlags.NONE
+        fname = "{}:{}:{}".format(path, line, col) if (line or col) else path
+        w.open_file(fname, flags)
+        return {"ok": True}
+
+    result = _on_main(fn)
+    if not (isinstance(result, dict) and result.get("ok")):
+        return result
+
+    # Sublime opens the file asynchronously: until it is loaded and active, the PREVIOUS tab is
+    # still the active one, and a keystroke or an "active tab" tool sent next lands there
+    # (ui_type_text typed into the old untitled tab in 1 of 3 runs). Wait, off the main thread, until
+    # the new tab is loaded and active.
+    def check():
+        w = sublime.active_window()
+        v = w.find_open_file(path)
+        if v is None:
+            return None
+        active = w.active_view()
+        return {"loading": v.is_loading(), "active": active is not None and active.id() == v.id()}
+
+    deadline = time.time() + _OPEN_FILE_WAIT_SECONDS
+    while True:
+        state = _on_main(check)
+        if isinstance(state, dict) and not state["loading"] and state["active"]:
+            result["active"] = True
+            return result
+        if time.time() >= deadline:
+            result["pending"] = True
+            result["note"] = ("the file was sent to Sublime but is not yet loaded and active after {} s; "
+                              "check get_sheets (is_focused) before typing or using an active-tab tool"
+                              .format(_OPEN_FILE_WAIT_SECONDS))
+            return result
+        time.sleep(0.05)
+
+
+def _goto_line(body):
+    line = body.get("line")
+    col = body.get("col", 1)
+    if line is None:
+        return {"error": "line required"}
+
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        pt = v.text_point(line - 1, col - 1)
+        v.sel().clear()
+        v.sel().add(sublime.Region(pt))
+        v.show_at_center(pt)
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _show_panel(body):
+    name = body.get("name", "exec")
+
+    def fn():
+        sublime.active_window().run_command("show_panel", {"panel": "output.{}".format(name)})
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _replace_selection(body):
+    text = body.get("text", "")
+
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        v.run_command("insert", {"characters": text})
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _replace_lines(body):
+    begin = body.get("begin")
+    end = body.get("end")
+    text = body.get("text", "")
+    path = body.get("path")
+    index = int(body.get("index", -1))
+    if begin is None or end is None:
+        return {"error": "begin and end required"}
+
+    def fn():
+        w = sublime.active_window()
+        if path:
+            v = w.find_open_file(path)
+            if not v:
+                return {"error": "not open: {}".format(path)}
+        elif index >= 0:
+            v, err = _resolve_view(w, "", index)
+            if err:
+                return err
+        else:
+            v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        start_pt = v.text_point(begin - 1, 0)
+        end_pt = v.full_line(v.text_point(end - 1, 0)).end()
+        v.run_command(
+            "mcp_replace_region",
+            {
+                "begin": start_pt,
+                "end": end_pt,
+                "text": text,
+            },
+        )
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _split_guide(text):
+    """Split the guide into (heading, text) parts at its "## " lines.
+
+    The part before the first heading is called "Overview". A "## " line inside a
+    fenced code block is not a heading.
+    """
+    parts = []
+    heading, lines, in_fence = "Overview", [], False
+    for line in text.splitlines(True):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+        if not in_fence and line.startswith("## "):
+            parts.append((heading, "".join(lines)))
+            heading, lines = line[3:].strip(), [line]
+        else:
+            lines.append(line)
+    parts.append((heading, "".join(lines)))
+    return [(h, t) for h, t in parts if t.strip()]
+
+
+def _help_for(text, section):
+    """The guide, or only the sections whose heading contains ``section`` (any case).
+
+    The full guide is about 12 KB, so an agent that needs one topic can ask for it:
+    get_help(section="console"). Every result lists the section headings.
+    """
+    parts = _split_guide(text)
+    headings = [h for h, _ in parts]
+    section = (section or "").strip().lower()
+    if not section:
+        return {"ok": True, "content": text, "sections": headings}
+    matched = [(h, t) for h, t in parts if section in h.lower()]
+    if not matched:
+        return {"error": "no section of the guide has {!r} in its heading".format(section),
+                "sections": headings}
+    return {"ok": True, "content": "".join(t for _, t in matched),
+            "matched": [h for h, _ in matched], "sections": headings}
+
+
+def _get_help(body):
+    """Return the AGENT_GUIDE.md content to educate AI agents on tool usage."""
+    import os
+    guide_path = os.path.join(os.path.dirname(__file__), "AGENT_GUIDE.md")
+    try:
+        with open(guide_path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return {"error": "AGENT_GUIDE.md not found at {}".format(guide_path)}
+    return _help_for(text, body.get("section"))
+
+
+def _open_dialogs():
+    """Native dialogs this Sublime process has open right now, as list_native_windows
+    reports them (Windows only; an empty list elsewhere or on any failure). Never touches
+    the main thread, so it also works while a modal dialog has blocked it."""
+    if not native_windows.SUPPORTED:
+        return []
+    try:
+        windows = native_windows.list_windows(_native_window_pids())
+    except Exception:
+        return []
+    return [w for w in windows if w.get("kind") == "dialog"]
+
+
+def _dialog_hint():
+    """A sentence naming an open native dialog, for error messages ('' when none is open).
+    A modal dialog takes the keyboard focus, so several tools fail with a focus error that
+    does not say why; this tells the caller what to dismiss."""
+    dialogs = _open_dialogs()
+    if not dialogs:
+        return ""
+    text = " ".join(str(m) for d in dialogs for m in (d.get("messages") or [])).strip()
+    text = " ".join(text.split())
+    if len(text) > 120:
+        text = text[:117] + "..."
+    return ("; a native dialog is open{} -- dismiss it first (list_native_windows, "
+            "dismiss_native_window)".format(" ({!r})".format(text) if text else ""))
+
+
+def _run_command(body):
+    cmd = body.get("command")
+    args = body.get("args") or {}
+    scope = body.get("scope", "window")
+    name = body.get("name", "")
+    index = int(body.get("index", -1))
+    settle_ms = max(0, min(int(body.get("settle_ms", 0) or 0), 5000))
+    if not cmd:
+        return {"error": "command required"}
+
+    def fn():
+        w = sublime.active_window()
+        if scope in ("text", "view"):
+            if name or index >= 0:
+                v, err = _resolve_view(w, name, index)
+                if err:
+                    return err
+            else:
+                v = w.active_view()
+            if v:
+                v.run_command(cmd, args)
+        elif scope == "application":
+            sublime.run_command(cmd, args)
+        else:
+            w.run_command(cmd, args)
+        return {"ok": True}
+
+    if not settle_ms:
+        return _on_main(fn)
+
+    # settle_ms: a command often opens its dialog a moment AFTER run_command has returned
+    # ok (a timer, a worker thread, an error_message posted back to the main thread), so a
+    # list_native_windows in the same batch can miss it. Watch for up to settle_ms and report
+    # any dialog that was not already open before the command, as "dialogs".
+    before = {d.get("hwnd") for d in _open_dialogs()}
+    result = _on_main(fn)
+    new = []
+    deadline = time.time() + settle_ms / 1000.0
+    while True:
+        new = [d for d in _open_dialogs() if d.get("hwnd") not in before]
+        if new or time.time() >= deadline:
+            break
+        time.sleep(0.05)
+    if new and isinstance(result, dict):
+        result["dialogs"] = new
+    return result
+
+
+def _run_build(body):
+    def fn():
+        sublime.active_window().run_command("exec", body or {})
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _set_status(body):
+    key = body.get("key", "sublime_mcp")
+    value = body.get("value", "")
+
+    def fn():
+        v = _active_view()
+        if v:
+            v.set_status(key, value)
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+_SAVE_FILE_WAIT_SECONDS = 1.5
+
+
+def _save_file(body):
+    path = body.get("path")
+
+    def fn():
+        w = sublime.active_window()
+        if path:
+            v = w.find_open_file(path)
+            if not v:
+                return {"error": "not open: {}".format(path)}
+        else:
+            v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        target = v.file_name()
+        if target and not os.path.isdir(os.path.dirname(target)):
+            # Sublime would answer the save with a "Unable to save" dialog and leave the tab modified,
+            # while this call used to say ok. Nothing is created: make the folder first.
+            return {"error": "cannot save: the folder does not exist: {} (nothing was written; create "
+                             "the folder first, there is no tool that makes one for you)"
+                             .format(os.path.dirname(target))}
+        v.run_command("save")
+        return {"ok": True, "_view_id": v.id()}
+
+    result = _on_main(fn)
+    if not (isinstance(result, dict) and result.get("ok")):
+        return result
+    vid = result.pop("_view_id", None)
+
+    # `save` only asks Sublime to save. An untitled tab opens a Save As dialog, and a failed write
+    # (read-only file, full disk) shows an error dialog; both used to come back as plain ok.
+    def is_clean():
+        for win in sublime.windows():
+            for vw in win.views():
+                if vw.id() == vid:
+                    return not vw.is_dirty()
+        return True
+
+    deadline = time.time() + _SAVE_FILE_WAIT_SECONDS
+    while True:
+        if _on_main(is_clean) is True:
+            result["saved"] = True
+            return result
+        if time.time() >= deadline:
+            result["saved"] = False
+            result["pending"] = True
+            result["note"] = ("the save was sent but the tab is still modified after {} s: Sublime is "
+                              "probably showing a Save As or an 'Unable to save' dialog (Windows: "
+                              "list_native_windows and dismiss_native_window; elsewhere answer it on "
+                              "screen), or the file is read-only. Do not repeat the call before you have "
+                              "looked.".format(_SAVE_FILE_WAIT_SECONDS))
+            return result
+        time.sleep(0.05)
+
+
+def _save_all(body):
+    def fn():
+        sublime.active_window().run_command("save_all")
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+_CLOSE_FILE_WAIT_SECONDS = 1.5
+
+
+def _close_file(body):
+    path = body.get("path")
+    name = body.get("name", "") or ""
+    index = int(body.get("index", -1))
+    discard = bool(body.get("discard"))
+
+    def fn():
+        w = sublime.active_window()
+        if path:
+            v = w.find_open_file(path)
+            if not v:
+                return {"error": "not open: {}".format(path)}
+        elif name or index >= 0:
+            # Target a path-less tab (an unsaved buffer, a panel-less scratch view) the same
+            # way run_command does: by partial name or by position. Without this the only
+            # way to close such a tab was the active-tab fallback below, which closes
+            # whatever tab happens to be in front.
+            v, err = _resolve_view(w, name, index, unique=True)
+            if err:
+                return err
+        else:
+            # No path, name or index: refuse. The active tab is whatever the person clicked last,
+            # so acting on it closed the wrong tab (B1, 2026-10-20).
+            return {"error": "close_file needs path, name or index; it no longer closes the active tab",
+                    "open_views": [_view_display_name(x) for x in list(w.views()) + _preview_views(w)]}
+        if not v:
+            return {"error": "no active view"}
+        discarded = False
+        if discard and v.is_dirty():
+            # Mark the tab scratch so Sublime closes it without the "Save Changes?" dialog,
+            # which would otherwise block the main thread until a person answers it. The
+            # unsaved edits are thrown away: only done when the caller asked for discard.
+            v.set_scratch(True)
+            discarded = True
+        # Route through a real window command instead of calling v.close()
+        # directly. Some hosts (GhostShell's ai_terminal package) hook
+        # on_window_command to ask for confirmation before a tab actually
+        # closes; a bare view.close() bypasses that entirely, the same way
+        # a mouse-X tab close bypasses it (sublimehq/sublime_text#1922).
+        # That gap is how a "close the disposable test tab" call ended up
+        # silently closing an unrelated tab instead (2026-09-15) -- going
+        # through the command path gives any such hook a chance to run.
+        vid = v.id()
+        if v is w.active_view():
+            w.run_command("close_file")
+        else:
+            group, pos = w.get_view_index(v)
+            if pos < 0:
+                # A preview is in no sheet list, so get_view_index reports index -1 and
+                # close_by_index would close nothing (it did: the call answered ok and the tab
+                # stayed). Sublime's own close_file closes the active tab, so bring it in front
+                # first -- still through the command path, so host hooks still run.
+                w.focus_view(v)
+            w.run_command("close_file" if pos < 0 else "close_by_index",
+                          {} if pos < 0 else {"group": group, "index": pos})
+        res = {"ok": True, "discarded": True} if discarded else {"ok": True}
+        res["_view_id"] = vid
+        return res
+
+    result = _on_main(fn)
+    if not (isinstance(result, dict) and result.get("ok")):
+        return result
+    vid = result.pop("_view_id", None)
+
+    # The close command only ASKS Sublime to close the tab. It stays open when Sublime shows a
+    # "Save Changes?" dialog (also for a tab that get_sheets reports is_dirty false, for example a
+    # file that was created after its tab was opened: the window title still shows the modified dot)
+    # or when a host hook refuses the close. Before, the call said ok either way. Check, off the
+    # main thread, that the tab is really gone.
+    def still_open():
+        return any(vw.id() == vid
+                   for win in sublime.windows()
+                   for vw in list(win.views()) + _preview_views(win))
+
+    deadline = time.time() + _CLOSE_FILE_WAIT_SECONDS
+    while True:
+        if not _on_main(still_open):
+            result["closed"] = True
+            return result
+        if time.time() >= deadline:
+            result["closed"] = False
+            result["pending"] = True
+            result["note"] = ("the close was sent but the tab is still open after {} s: Sublime is probably "
+                              "asking 'Save changes before closing?' (a dialog that may not block other tools; "
+                              "on Windows list_native_windows and dismiss_native_window answer it, elsewhere "
+                              "answer it on screen), or a host hook refused the close. get_sheets may still say "
+                              "is_dirty false. Retrying the call raises another dialog: answer the first one."
+                              .format(_CLOSE_FILE_WAIT_SECONDS))
+            return result
+        time.sleep(0.05)
+
+
+def _open_folder(body):
+    """Open a folder in a NEW window.
+
+    The old tool called a Sublime command named open_folder, which does not exist, so
+    it reported ok and did nothing. This makes a new window and gives it the folder as
+    its project data (what `subl -n folder` does).
+    """
+    path = (body.get("path") or "").strip()
+    if not path:
+        return {"error": "path required"}
+    if not os.path.isdir(path):
+        return {"error": "not a folder: {}".format(path)}
+
+    def fn():
+        before = set(w.id() for w in sublime.windows())
+        sublime.run_command("new_window")
+        new = [w for w in sublime.windows() if w.id() not in before]
+        if not new:
+            return {"error": "new_window did not create a window"}
+        w = new[0]
+        w.set_project_data({"folders": [{"path": path}]})
+        return {"ok": True, "window_id": w.id(), "folders": w.folders()}
+
+    return _on_main(fn)
+
+
+def _next_result(body):
+    """Jump to the next find-in-files / build result. Visible in the view."""
+    def fn():
+        sublime.active_window().run_command("next_result")
+        return {"ok": True}
+    return _on_main(fn)
+
+
+def _prev_result(body):
+    """Jump to the previous find-in-files / build result. Visible in the view."""
+    def fn():
+        sublime.active_window().run_command("prev_result")
+        return {"ok": True}
+    return _on_main(fn)
+
+
+def _toggle_bookmark(body):
+    """Toggle a bookmark on the current line."""
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        v.run_command("toggle_bookmark")
+        return {"ok": True}
+    return _on_main(fn)
+
+
+def _next_bookmark(body):
+    """Move cursor to next bookmark in the active view."""
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        v.run_command("next_bookmark")
+        return {"ok": True}
+    return _on_main(fn)
+
+
+def _prev_bookmark(body):
+    """Move cursor to previous bookmark in the active view."""
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        v.run_command("prev_bookmark")
+        return {"ok": True}
+    return _on_main(fn)
+
+
+def _clear_bookmarks(body):
+    """Clear all bookmarks in the active view."""
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        v.run_command("clear_bookmarks")
+        return {"ok": True}
+    return _on_main(fn)
+
+
+def _select_all_bookmarks(body):
+    """Select every line containing a bookmark in the active view."""
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        v.run_command("select_all_bookmarks")
+        return {"ok": True}
+    return _on_main(fn)
+
+
+def _find_input_panel_view(window):
+    """Locate the View backing window's currently open show_input_panel, if any.
+
+    Input-panel views are not returned by window.views(), window.active_view(),
+    or any other public lookup -- they live in a separate low-id widget
+    namespace. This scans that namespace directly via sublime.View(id) and
+    filters by is_widget + matching window, which is the only way to reach
+    the view at all (confirmed empirically; ST exposes no direct accessor).
+    """
+    for vid in range(0, 128):
+        v = sublime.View(vid)
+        if not v.is_valid():
+            continue
+        try:
+            if not v.settings().get("is_widget"):
+                continue
+        except Exception:
+            continue
+        vw = v.window()
+        if vw and vw.id() == window.id():
+            return v
+    return None
+
+
+def _drive_input_panel(body):
+    """Fill and/or submit or cancel Sublime's currently open input panel
+    (window.show_input_panel), reliably, regardless of which plugin --
+    or which plugin_host process, including the legacy Python 3.3 host --
+    opened it.
+
+    Two things make this necessary instead of just using run_command/insert:
+    - The input panel's View is not reachable through window.views(),
+      window.active_view(), or any documented accessor; _find_input_panel_view
+      above is the only known way to find it.
+    - Pressing Enter to submit is a native keybinding (bound to the built-in
+      "select" command when context panel_has_focus + panel_type=="input"),
+      not something view.run_command("insert", {"characters": "\\n"}) can
+      trigger -- a literal newline is silently accepted into the buffer
+      without submitting. Cancel is likewise the built-in
+      hide_panel(cancel=True), bound to Escape. Both "select" and
+      "hide_panel" are core ST commands (not Python), so calling them via
+      window.run_command reaches the input panel's on_done/on_cancel
+      callback correctly even when that callback lives in a different
+      plugin_host process than this one -- no monkeypatching, no same-
+      process requirement, and no OS-level keyboard injection needed.
+
+    Body params:
+      text (optional): replace the panel's entire current content with this
+        before acting. Omit to act on whatever text is already there.
+      action ("submit" | "cancel", default "submit"): submit calls the
+        panel's on_done with the current text; cancel calls on_cancel and
+        discards it.
+    """
+    def fn():
+        w = sublime.active_window()
+        if w.active_panel() != "input":
+            return {"error": "no input panel is currently open"}
+        panel_view = _find_input_panel_view(w)
+        if panel_view is None:
+            return {"error": "input panel is open but its view could not be located"}
+
+        text = body.get("text")
+        if text is not None:
+            panel_view.run_command("select_all")
+            panel_view.run_command("right_delete")
+            panel_view.run_command("insert", {"characters": text})
+
+        action = body.get("action", "submit")
+        if action == "submit":
+            w.run_command("select")
+        elif action == "cancel":
+            w.run_command("hide_panel", {"cancel": True})
+        else:
+            return {"error": "action must be 'submit' or 'cancel'"}
+
+        return {"ok": True, "submitted_text": text}
+    return _on_main(fn)
+
+
+_QUICK_PANELS = {}  # window id -> record of the quick panel last opened from this plugin host
+
+
+def _quick_panel_item(item):
+    if isinstance(item, str):
+        return item
+    if isinstance(item, (list, tuple)):
+        return [str(x) for x in item]
+    if hasattr(item, "trigger"):
+        return {"trigger": str(item.trigger), "details": str(getattr(item, "details", "")),
+                "annotation": str(getattr(item, "annotation", ""))}
+    return str(item)
+
+
+def _install_quick_panel_recorder():
+    """Wrap Window.show_quick_panel so get_quick_panel / pick_quick_panel can see
+    panels opened by plugins in this plugin host. Panels opened from the Python 3.3
+    host are recorded by py33/mcp_commander_py33.py; those opened by Sublime itself are not."""
+    cur = sublime.Window.show_quick_panel
+    orig = getattr(cur, "_sublime_mcp_orig", cur)
+
+    def show_quick_panel(self, items, on_select=None, *args, **kwargs):
+        if on_select is None:
+            on_select = kwargs.pop("on_done", None)
+        items = list(items)  # a generator would be used up by the recording below
+        try:
+            # items are converted only when someone asks (_quick_panel_items): big pickers stay cheap
+            rec = {"raw": items, "on_select": on_select,
+                   "flags": args[0] if args else kwargs.get("flags", 0),
+                   "selected_index": args[1] if len(args) > 1 else kwargs.get("selected_index", -1),
+                   "picked": False}
+            wid = self.id()
+        except Exception:
+            return orig(self, items, on_select, *args, **kwargs)  # never break the package
+
+        def done(index):
+            if _QUICK_PANELS.get(wid) is rec:
+                del _QUICK_PANELS[wid]
+            if rec["picked"] and index == -1:
+                return  # the cancel produced by our own hide_overlay
+            if on_select is not None:
+                return on_select(index)
+
+        _QUICK_PANELS[wid] = rec
+        try:
+            return orig(self, items, done, *args, **kwargs)
+        except BaseException:
+            if _QUICK_PANELS.get(wid) is rec:
+                del _QUICK_PANELS[wid]  # the panel never opened
+            raise
+
+    show_quick_panel._sublime_mcp_orig = orig
+    sublime.Window.show_quick_panel = show_quick_panel
+
+
+def _remove_quick_panel_recorder():
+    cur = sublime.Window.show_quick_panel
+    if hasattr(cur, "_sublime_mcp_orig"):  # only if nobody wrapped it after us
+        sublime.Window.show_quick_panel = cur._sublime_mcp_orig
+
+
+def _quick_panel_items(rec):
+    if "items" not in rec:
+        rec["items"] = [_quick_panel_item(i) for i in rec["raw"]]
+    return rec["items"]
+
+
+def _quick_panel_first_line(item):
+    first = item["trigger"] if isinstance(item, dict) else (item[0] if isinstance(item, list) and item else item)
+    return str(first).strip().lower()
+
+
+_NO_QUICK_PANEL = ("no recorded quick panel: none is open, or it was opened by Sublime "
+                   "itself (a package's panel is recorded in sublime-mcp's own plugin host, and in "
+                   "the Python 3.3 host when install_py33_helper is on)")
+
+_PY33_PACKAGE = "MCP Commander Py33"
+_PY33_MARKER = "3.3\n"  # .python-version: without it Sublime 4213+ loads the helper in THIS host
+
+
+def _write_if_changed(path, text):
+    """Write text to path unless it is already there. Returns True when it wrote."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    return True
+
+
+def _ensure_py33_companion():
+    """Copy py33/mcp_commander_py33.py into the package "MCP Commander Py33", with a
+    .python-version file, so Sublime loads it in the 3.3 host and it records the quick panels that
+    packages in that host open (this host cannot see them). It writes into the user's Packages
+    folder, so it only happens when "install_py33_helper" is true in the settings (default false).
+    Called at plugin load and from the settings listener; Sublime only loads a new package at
+    startup, so a helper installed while Sublime is running answers nothing until the next start."""
+    global _PY33_HELPER_ENABLED, _PY33_INSTALLED
+    _PY33_HELPER_ENABLED = bool(
+        sublime.load_settings("MCP Commander.sublime-settings").get("install_py33_helper", False))
+    if not _PY33_HELPER_ENABLED:
+        return
+    try:
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "py33", "mcp_commander_py33.py")
+        with open(src, encoding="utf-8") as f:
+            code = f.read()
+        dest_dir = os.path.join(sublime.packages_path(), _PY33_PACKAGE)
+        os.makedirs(dest_dir, exist_ok=True)
+        wrote = _write_if_changed(os.path.join(dest_dir, "mcp_commander_py33.py"), code)
+        # The marker is what puts the helper in the 3.3 host. Left out, a build that runs
+        # packages without a marker in the default host loads it here, where it records the same
+        # panels a second time and never sees a 3.3 one.
+        wrote = _write_if_changed(os.path.join(dest_dir, ".python-version"), _PY33_MARKER) or wrote
+    except Exception as e:  # e.g. this package is a zip: the 3.3 host's panels stay invisible
+        _PY33_INSTALLED = False
+        print("[sublime-mcp] could not install the Python 3.3 quick panel recorder: %s" % e)
+        return
+    _PY33_INSTALLED = True
+    if wrote:
+        print("[sublime-mcp] install_py33_helper is on: the package \"%s\" is in Packages (delete that "
+              "folder to remove it); it answers after Sublime restarts" % _PY33_PACKAGE)
+
+
+_PY33_HELPER_ENABLED = False
+_PY33_INSTALLED = False  # the files are in Packages (they answer after a restart)
+_PY33_SEEN = 0.0  # when the 3.3 host last answered (0.0 = never in this session)
+_py33_off_until = 0.0  # after a timeout, skip the 3.3 host for a while (its recorder is not loaded)
+
+
+def _window_by_id(wid):
+    for w in sublime.windows():
+        if w.id() == wid:
+            return w
+    return sublime.active_window()
+
+
+def _py33_answer_path(req):
+    return os.path.join(sublime.cache_path(), "MCP Commander", "py33_qp_%s.json" % req)
+
+
+def _sweep_py33_answers(max_age=300):
+    """Delete answer files whose reader gave up: a pick whose callback opens a modal dialog writes
+    its answer long after the 2 s deadline, and nothing read that file. Each call uses its own file
+    name, so an old one is never read again. Runs at plugin load."""
+    folder = os.path.join(sublime.cache_path(), "MCP Commander")
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    cutoff = time.time() - max_age
+    for name in names:
+        if not (name.startswith("py33_qp_") and name.endswith(".json")):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def _py33_call(args, wid=None, timeout=2.0):
+    """Ask the 3.3 host's recorder about the quick panel of window `wid` (default: the active one).
+    Returns its answer ({"open": False} or {"open": True, "result": ...}) or None when it did not
+    answer. A pick is sent without waiting for the command: the callback it runs may raise a modal
+    dialog that blocks the main thread until a person answers it, and _on_main then timed out after
+    5 s with an error although the pick had gone through."""
+    global _py33_off_until, _PY33_SEEN
+    if not _PY33_HELPER_ENABLED or time.time() < _py33_off_until:
+        return None
+    req = _uuid.uuid4().hex
+    path = _py33_answer_path(req)
+    call = dict(args, req=req)
+    picking = args.get("action") == "pick"
+    if picking:
+        sublime.set_timeout(
+            lambda: _window_by_id(wid).run_command("mcp_py33_quick_panel", call), 0)
+    else:
+        _on_main(lambda: _window_by_id(wid).run_command("mcp_py33_quick_panel", call))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                # Windows can refuse the open for a moment right after the helper's os.replace
+                # (seen as "[Errno 13] Permission denied" after a pick that had already run).
+                # Keep the file and read it again instead of losing the answer.
+                time.sleep(0.03)
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            _PY33_SEEN = time.time()
+            return data
+        time.sleep(0.03)
+    if picking and _PY33_SEEN:
+        # The helper answered a list call a moment ago, so this is a slow or blocked callback,
+        # not a missing helper: do not switch the helper off, and say what is going on.
+        return {"open": True, "result": {
+            "ok": True, "pending": True,
+            "note": "the pick was sent, but the package's callback has not finished after %.0f s; "
+                    "a native dialog may be open and blocking Sublime: check list_native_windows and "
+                    "answer it with dismiss_native_window" % timeout}}
+    _py33_off_until = time.time() + 10
+    return None
+
+
+def _quick_panel_request(body, args):
+    """Find the quick panel of the window that is active now, waiting up to `wait_ms`
+    (0..60000, default 0): Package Control builds its Install Package list for up to ~15 s after
+    Enter, so a call made at once finds nothing. Returns ("38", record, waited, wid) for a panel
+    opened in this host, ("33", answer, waited, wid) for one opened in the 3.3 host, or
+    (None, None, waited, wid)."""
+    try:
+        wait = max(0, min(int(body.get("wait_ms") or 0), 60000))
+    except (TypeError, ValueError):
+        wait = 0
+    start = time.time()
+    deadline = start + wait / 1000.0
+    wid = _on_main(lambda: sublime.active_window().id())
+    picking = args.get("action") == "pick"
+    while True:
+        # Prefer the active window, then any window: a picker opened before a command switched or
+        # created a window (Package Control's Install Package list, then PackageDev's New Window)
+        # was invisible here while it was on screen -- the agent was told no panel was recorded
+        # (2026-11-08, reported as "the package picker is just sitting there").
+        rec = _on_main(lambda: _QUICK_PANELS.get(wid))
+        if rec is None:
+            found = _on_main(lambda: sorted(_QUICK_PANELS.items()))
+            if found:
+                wid, rec = found[-1]
+        if rec is not None:
+            return "38", rec, int((time.time() - start) * 1000), wid
+        # Ask the 3.3 host for the panel first, even for a pick: with the helper installed but not
+        # loaded (3.3 host disabled, or installed this session) a pick sent blind is answered by
+        # nothing, and the 2 s timeout then read as "the callback is running" although no command ran.
+        answer = _py33_call({"action": "list"} if picking else args, wid)
+        if answer and answer.get("open"):
+            if not picking:
+                return "33", answer["result"], int((time.time() - start) * 1000), wid
+            picked = _py33_call(args, wid)
+            if picked and picked.get("open"):
+                return "33", picked["result"], int((time.time() - start) * 1000), wid
+            return None, None, int((time.time() - start) * 1000) if wait else 0, wid
+        if time.time() >= deadline:
+            return None, None, int((time.time() - start) * 1000) if wait else 0, wid
+        time.sleep(0.2)
+
+
+def _no_quick_panel_error(waited):
+    err = {"error": _NO_QUICK_PANEL}
+    if not _PY33_HELPER_ENABLED:
+        err["note"] = ("panels opened by packages in Sublime's Python 3.3 host (older packages, "
+                       "without a .python-version) cannot be seen: set \"install_py33_helper\": true "
+                       "in MCP Commander.sublime-settings to let sublime-mcp add a small helper "
+                       "package, \"%s\", to Packages, then restart Sublime so it loads" % _PY33_PACKAGE)
+    elif not _PY33_SEEN:
+        err["note"] = ("nothing in Sublime's Python 3.3 host answered: %s. Sublime loads a new "
+                       "package at startup, so restart it after turning the setting on, and Sublime "
+                       "4213+ disables the 3.3 host by default -- add \"disable_plugin_host_3.3\": "
+                       "false to Preferences.sublime-settings to allow it"
+                       % ("the helper package \"%s\" is in Packages" % _PY33_PACKAGE
+                          if _PY33_INSTALLED else
+                          "the helper package \"%s\" could not be written (see the console)" % _PY33_PACKAGE))
+    if waited:
+        err["waited_ms"] = waited
+        err["error"] += " (waited %d ms)" % waited
+    else:
+        err["hint"] = ("a picker that is still loading (Package Control's Install Package list "
+                       "takes up to ~15 s) is not recorded yet: pass wait_ms, for example 15000")
+    return err
+
+
+def _get_quick_panel(body):
+    """Items of the quick panel last opened by a plugin: at most `limit` (default 100) of those
+    whose first line contains `text`, starting at `offset`. Recorded by this plugin host's own
+    recorder, or by the helper in the Python 3.3 host."""
+    text = str(body.get("text") or "").strip().lower()
+    try:
+        limit = max(1, min(int(body.get("limit", 100)), 1000))
+        offset = max(0, int(body.get("offset", 0)))
+    except (TypeError, ValueError):
+        return {"error": "limit and offset must be integers"}
+    kind, found, waited, wid = _quick_panel_request(
+        body, {"action": "list", "text": text, "limit": limit, "offset": offset})
+    if kind is None:
+        return _no_quick_panel_error(waited)
+    if kind == "33":
+        return found
+
+    def fn():
+        rec = _QUICK_PANELS.get(wid)
+        if rec is None:
+            return _no_quick_panel_error(waited)
+        items = _quick_panel_items(rec)
+        indexes = [n for n, item in enumerate(items) if not text or text in _quick_panel_first_line(item)]
+        page = indexes[offset:offset + limit]
+        return {"items": [items[n] for n in page], "indexes": page, "total": len(items),
+                "matched": len(indexes), "offset": offset, "flags": rec["flags"],
+                "selected_index": rec["selected_index"]}
+    return _on_main(fn)
+
+
+_PICK_CALLBACK_WAIT_SECONDS = 1.0  # how long a pick waits for the package's callback before answering pending
+
+
+def _pick_quick_panel(body):
+    """Pick an item of the recorded quick panel by index or by text, or cancel (index -1).
+
+    The callback runs on the main thread after this returns; a callback that opens a native dialog
+    leaves it blocked, so the answer is `pending: true` after _PICK_CALLBACK_WAIT_SECONDS instead
+    of a request that never completes."""
+    index, text = body.get("index"), body.get("text")
+    kind, found, waited, wid = _quick_panel_request(
+        body, {"action": "pick", "index": index, "text": text})
+    if kind is None:
+        return _no_quick_panel_error(waited)
+    if kind == "33":
+        return found  # picked by the recorder in the 3.3 host
+
+    def fn():
+        """Close the panel and start the callback, then return what the caller needs.
+
+        The callback is NOT run inside this dispatch: a package that opens a native dialog from it
+        (Jekyll's remove commands: "Confirm Delete") blocks the main thread until a person answers,
+        and measured on 2026-11-08 the HTTP request then never got an answer at all -- curl sat
+        through its 12 s limit with status 000, and the 5 s main-thread timeout the guide promises
+        never surfaced, so the caller was left with silence instead of "a dialog is open, dismiss
+        it".  Scheduling it and waiting a moment here gives a fast callback its real result and a
+        dialog one the same pending answer the 3.3-host path already gives.
+        """
+        w = _window_by_id(wid)
+        rec = _QUICK_PANELS.get(wid)
+        if rec is None or w is None:
+            return ("error", _no_quick_panel_error(waited))
+        items = _quick_panel_items(rec)
+        i = index
+        if i is not None and text:
+            return ("error", {"error": "give index or text, not both"})
+        if isinstance(i, bool):
+            return ("error", {"error": "index must be an integer"})
+        if i is None and text:
+            low = str(text).strip().lower()
+            firsts = [_quick_panel_first_line(item) for item in items]
+            hits = [n for n, f in enumerate(firsts) if f == low]  # an exact match wins
+            if len(hits) != 1:
+                hits = [n for n, f in enumerate(firsts) if low in f]
+            if len(hits) != 1:
+                return ("error", {"error": "text matched %d items; give a more exact text or an index"
+                                           % len(hits), "matches": hits})
+            i = hits[0]
+        if i is None:
+            return ("error", {"error": "give index or text"})
+        if not isinstance(i, int) or not -1 <= i < len(items):
+            return ("error", {"error": "index must be -1 (cancel) or 0..%d" % (len(items) - 1)})
+        if i == -1:
+            w.run_command("hide_overlay")
+            return ("done", {"ok": True, "picked": -1})
+        _QUICK_PANELS.pop(wid, None)
+        rec["picked"] = True
+        w.run_command("hide_overlay")
+        box = {}
+
+        def call():
+            try:
+                if rec["on_select"] is not None:
+                    rec["on_select"](i)
+            except Exception as e:  # the package's own code failed; say so instead of "ok"
+                box["error"] = e
+            finally:
+                box["done"] = True
+
+        if rec["on_select"] is None:
+            box["done"] = True
+        else:
+            sublime.set_timeout(call, 0)
+        return ("armed", (i, items[i], box))
+
+    armed = _on_main(fn)
+    if not isinstance(armed, tuple):
+        return armed
+    state, payload = armed
+    if state == "error":
+        return payload
+    if state == "done":
+        return payload
+
+    i, item, box = payload
+    deadline = time.time() + _PICK_CALLBACK_WAIT_SECONDS
+    while not box.get("done") and time.time() < deadline:
+        time.sleep(0.02)
+    if not box.get("done"):
+        return {"ok": True, "picked": i, "item": item, "pending": True,
+                "note": "the panel was closed and the package's callback was started, but it has not "
+                        "finished after %.1f s; a native dialog may be open and blocking Sublime: "
+                        "check list_native_windows and answer it with dismiss_native_window"
+                        % _PICK_CALLBACK_WAIT_SECONDS}
+    if box.get("error") is not None:
+        e = box["error"]
+        return {"error": "the panel was closed and the package's callback raised %s: %s"
+                         % (type(e).__name__, e), "picked": i, "item": item}
+    return {"ok": True, "picked": i, "item": item}
+
+
+def _find_in_file(body):
+    """Find all occurrences of pattern in the active file. Returns list of
+    {line, col, text}. Does not open a panel — for Sublime's Find panel use
+    run_command with show_panel (panel="find").
+
+    Body params: pattern (required), case_sensitive, regex."""
+    pattern = body.get("pattern", "")
+    case = body.get("case_sensitive", False)
+    use_re = body.get("regex", False)
+    if not pattern:
+        return {"error": "pattern required"}
+
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        flags = 0
+        if not case:
+            flags |= sublime.IGNORECASE
+        if not use_re:
+            flags |= sublime.LITERAL
+        out = []
+        for r in v.find_all(pattern, flags):
+            row, col = v.rowcol(r.begin())
+            out.append({"line": row + 1, "col": col + 1, "text": v.substr(r)})
+        return {"path": v.file_name(), "matches": out}
+
+    return _on_main(fn)
+
+
+def _set_syntax(body):
+    name = body.get("name", "")
+    if not name:
+        return {"error": "name required"}
+
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        syns = sublime.list_syntaxes()
+        match = next((s for s in syns if (_syntax_label(s) or "").lower() == name.lower()), None)
+        if not match:
+            match = next((s for s in syns if name.lower() in (_syntax_label(s) or "").lower()), None)
+        if not match:
+            return {"error": "syntax not found: {}".format(name)}
+        v.assign_syntax(match.path)
+        return {"ok": True, "syntax": _syntax_label(match)}
+
+    return _on_main(fn)
+
+
+def _toggle_comment(body):
+    block = bool(body.get("block", False))
+
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        v.run_command("toggle_comment", {"block": block})
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _toggle_sidebar(body):
+    def fn():
+        sublime.active_window().run_command("toggle_side_bar")
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _select_lines(body):
+    begin = body.get("begin")
+    end = body.get("end")
+    if begin is None:
+        return {"error": "begin required"}
+    if end is None:
+        end = begin
+
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        start_pt = v.text_point(begin - 1, 0)
+        end_pt = v.full_line(v.text_point(end - 1, 0)).end()
+        v.sel().clear()
+        v.sel().add(sublime.Region(start_pt, end_pt))
+        v.show_at_center(start_pt)
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _sort_lines(body):
+    case = bool(body.get("case_sensitive", False))
+
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        v.run_command("sort_lines", {"case_sensitive": case})
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+# ── Claude MCP Control Panel ──────────────────────────────────────────────────
+_CP_VIEW_NAME = "Claude Control Panel"
+_CP_SERVERS = ("filesystem", "postgres", "github", "sublime-mcp")
+
+
+def _cp_find_panel():
+    """Return the Control Panel view across all windows, or None."""
+    for w in sublime.windows():
+        for v in w.views():
+            if v.name() == _CP_VIEW_NAME:
+                return v
+    return None
+
+
+def _cp_render(panel):
+    """(Re)draw the dashboard phantom from the view's persisted mcp_state."""
+    st = panel.settings().get("mcp_state") or {}
+    rows = ""
+    for name in _CP_SERVERS:
+        on = st.get(name, False)
+        dot = "#a6e22e" if on else "#75715e"
+        label = "Enabled" if on else "Disabled"
+        action = "Disable" if on else "Enable"
+        cls = "btn-danger" if on else "btn"
+        rows += ('<div class="row"><span style="color:%s;">&#9679;</span> '
+                 '<b>%s</b> &mdash; %s '
+                 '<a class="%s" href="toggle:%s">[%s]</a></div>'
+                 % (dot, name, label, cls, name, action))
+    html = ('<body style="background-color:#1e1e1e; padding:14px;">'
+            '<style>'
+            'h3{margin:0 0 10px 0;color:#66d9ef;}'
+            '.row{margin-bottom:7px;font-size:13px;color:#f8f8f2;}'
+            '.btn{color:#a6e22e;text-decoration:none;font-weight:bold;}'
+            '.btn-danger{color:#f92672;text-decoration:none;font-weight:bold;}'
+            '.hint{color:#75715e;font-size:11px;margin-top:12px;}'
+            '</style>'
+            '<h3>&#129302; Claude MCP Control Panel</h3>'
+            + rows +
+            '<div class="hint">Rendered live by Claude via sublime-mcp '
+            '&middot; click a link to toggle</div>'
+            '</body>')
+    panel.erase_phantoms("claude_cp")
+    panel.add_phantom("claude_cp", sublime.Region(0, 0), html,
+                      sublime.LAYOUT_BLOCK, on_navigate=_cp_nav)
+
+
+def _cp_nav(href):
+    """on_navigate handler: flip a server's state and re-render."""
+    if not href.startswith("toggle:"):
+        return
+    panel = _cp_find_panel()
+    if panel is None:
+        return
+    name = href.split(":", 1)[1]
+    st = panel.settings().get("mcp_state") or {}
+    st[name] = not st.get(name, False)
+    panel.settings().set("mcp_state", st)
+    sublime.active_window().status_message(
+        "MCP toggled: %s -> %s" % (name, "ON" if st[name] else "OFF"))
+    _cp_render(panel)
+
+
+def _open_control_panel(body):
+    """Open or focus the Claude MCP Control Panel and render its dashboard."""
+    def fn():
+        w = sublime.active_window()
+        panel = _cp_find_panel()
+        if panel is None:
+            panel = w.new_file()
+            panel.set_name(_CP_VIEW_NAME)
+            panel.set_scratch(True)
+            panel.settings().set("gutter", False)
+            panel.settings().set("line_numbers", False)
+            panel.settings().set("draw_white_space", "none")
+        if not panel.settings().get("mcp_state"):
+            panel.settings().set(
+                "mcp_state", {s: (s != "postgres") for s in _CP_SERVERS})
+        w.focus_view(panel)
+        _cp_render(panel)
+        return {"ok": True, "view": _CP_VIEW_NAME,
+                "servers": list(panel.settings().get("mcp_state").keys())}
+    return _on_main(fn)
+
+
+def _eval_python(body):
+    code = body.get("code", "")
+    if not code:
+        return {"error": "code required"}
+    buf = io.StringIO()
+
+    def fn():
+        env = {
+            "sublime": sublime,
+            "window": sublime.active_window(),
+            "view": sublime.active_window().active_view(),
+            "print": lambda *a, **kw: print(*a, **kw, file=buf),
+        }
+        try:
+            exec(code, env)  # noqa: S102
+        except (SystemExit, KeyboardInterrupt, GeneratorExit) as e:
+            # sys.exit() / exit() in the code must not take the plugin host down with it
+            raise RuntimeError("the code called {}({}); that would end the plugin host, so it was stopped".format(
+                type(e).__name__, ", ".join(repr(a) for a in e.args)))
+        return buf.getvalue()
+
+    try:
+        output = _on_main(fn)
+        return {"ok": True, "output": output}
+    except Exception as e:
+        # only the frames of the evaluated code (file name "<string>"): the plugin's own frames are noise
+        code_lines = code.splitlines()
+        steps = []
+        for frame in traceback.extract_tb(e.__traceback__):
+            if frame.filename == "<string>":
+                text = code_lines[frame.lineno - 1].strip() if 0 < frame.lineno <= len(code_lines) else ""
+                steps.append("line {}: {}".format(frame.lineno, text))
+        steps.append("{}: {}".format(type(e).__name__, e))
+        return {"ok": False, "error": str(e), "output": buf.getvalue(), "traceback": "\n".join(steps)}
+
+
+def _eval_python_latest(body):
+    """Run code via the system Python interpreter (python) outside ST's embedded sandbox."""
+    import os
+    import subprocess
+    import tempfile
+    import shutil
+
+    code = body.get("code", "")
+    if not code:
+        return {"error": "code required"}
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
+        f.write(code)
+        fname = f.name
+    try:
+        # python.exe in WindowsApps is the Microsoft Store stub (exit code 9009 "Python was not found"):
+        # skip it and take the next real interpreter on PATH, or the py launcher.
+        _python = "python"
+        for _name in ("python3", "python", "py"):
+            _found = shutil.which(_name)
+            if _found and "\\windowsapps\\" not in _found.lower():
+                _python = _found
+                break
+        _startupinfo = None
+        if sys.platform == "win32":
+            _startupinfo = subprocess.STARTUPINFO()
+            _startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            _startupinfo.wShowWindow = subprocess.SW_HIDE
+        r = subprocess.run([_python, fname], capture_output=True, text=True, timeout=30,
+                            startupinfo=_startupinfo)
+        return {"ok": True, "stdout": r.stdout, "stderr": r.stderr, "returncode": r.returncode}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "timeout after 30s"}
+    except FileNotFoundError:
+        return {"ok": False, "error": "python not found on PATH"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        os.unlink(fname)
+
+
+def _fold_lines(body):
+    begin = body.get("begin")
+    end = body.get("end")
+    if begin is None or end is None:
+        return {"error": "begin and end required"}
+
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        start_pt = v.text_point(begin - 1, 0)
+        end_pt = v.full_line(v.text_point(end - 1, 0)).end()
+        v.fold(sublime.Region(start_pt, end_pt))
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _set_encoding(body):
+    encoding = body.get("encoding", "")
+    if not encoding:
+        return {"error": "encoding required"}
+
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        v.set_encoding(encoding)
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _revert_file(body):
+    name = body.get("name", "") or ""
+    index = int(body.get("index", -1))
+
+    def fn():
+        if name or index >= 0:
+            v, err = _resolve_view(sublime.active_window(), name, index, unique=True)
+            if err:
+                return err
+        else:
+            v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        v.run_command("revert")
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _undo(body):
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        v.run_command("undo")
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _redo(body):
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        v.run_command("redo")
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _duplicate_line(body):
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        v.run_command("duplicate_line")
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+# ── Phase B: typed wrappers for ST commands ─────────────────────────────────
+#
+# `_vc(cmd)` / `_wc(cmd)` / `_ac(cmd)` return POST handlers that run the named
+# ST TextCommand / WindowCommand / ApplicationCommand on the main thread.
+# The handler accepts a `body` dict and forwards every key as command args
+# (after stripping a few meta keys). Use these for simple command wrappers so
+# the tool schema in _MCP_TOOLS stays the source of truth for documentation.
+
+def _vc(cmd):
+    def handler(body):
+        args = {k: v for k, v in body.items() if v is not None}
+
+        def fn():
+            v = _active_view()
+            if not v:
+                return {"error": "no active view"}
+            v.run_command(cmd, args)
+            return {"ok": True}
+
+        return _on_main(fn)
+
+    return handler
+
+
+def _wc(cmd):
+    def handler(body):
+        args = {k: v for k, v in body.items() if v is not None}
+
+        def fn():
+            w = sublime.active_window()
+            if not w:
+                return {"error": "no active window"}
+            w.run_command(cmd, args)
+            return {"ok": True}
+
+        return _on_main(fn)
+
+    return handler
+
+
+def _ac(cmd):
+    def handler(body):
+        args = {k: v for k, v in body.items() if v is not None}
+
+        def fn():
+            sublime.run_command(cmd, args)
+            return {"ok": True}
+
+        return _on_main(fn)
+
+    return handler
+
+
+def _exit_app(body):
+    """Quit Sublime. Replies first and runs `exit` 300 ms later: running it inside the request
+    made the reply fail with "API is not available" although Sublime did close."""
+    args = {k: v for k, v in body.items() if v is not None}
+    sublime.set_timeout(lambda: sublime.run_command("exit", args), 300)
+    return {"ok": True, "note": "Sublime is closing; this connection will drop"}
+
+
+def _insert_snippet(body):
+    contents = body.get("contents", "")
+    if not contents:
+        return {"error": "contents required"}
+
+    def fn():
+        v = _active_view()
+        if not v:
+            return {"error": "no active view"}
+        v.run_command("insert_snippet", {"contents": contents})
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _get_setting(body):
+    key = body.get("key", "")
+    if not key:
+        return {"error": "key required"}
+    scope = body.get("scope", "view")
+
+    def fn():
+        w = sublime.active_window()
+        if scope == "view":
+            v = w.active_view()
+            if not v:
+                return {"error": "no active view"}
+            return {"key": key, "value": v.settings().get(key), "scope": "view"}
+        else:
+            return {"key": key, "value": w.settings().get(key), "scope": "window"}
+
+    return _on_main(fn)
+
+
+def _set_setting(body):
+    key = body.get("key", "")
+    value = body.get("value")
+    scope = body.get("scope", "view")
+    name = body.get("name", "") or ""
+    index = int(body.get("index", -1))
+    if not key:
+        return {"error": "key required"}
+    if value is None:
+        return {"error": "value required"}
+
+    def fn():
+        w = sublime.active_window()
+        if scope == "view":
+            if name or index >= 0:
+                v, err = _resolve_view(w, name, index, unique=True)
+                if err:
+                    return err
+            else:
+                v = w.active_view()
+            if not v:
+                return {"error": "no active view"}
+            v.settings().set(key, value)
+        else:
+            w.settings().set(key, value)
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _focus_group(body):
+    group = body.get("group")
+    if group is None:
+        return {"error": "group required"}
+
+    def fn():
+        w = sublime.active_window()
+        if group >= w.num_groups():
+            return {"error": "group {} out of range (have {})".format(group, w.num_groups())}
+        w.focus_group(group)
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+def _set_layout(body):
+    layout = body.get("layout")
+    if not layout:
+        return {"error": "layout required"}
+
+    def fn():
+        sublime.active_window().run_command("set_layout", layout)
+        return {"ok": True}
+
+    return _on_main(fn)
+
+
+# ── str_replace_based_edit ────────────────────────────────────────────────────
+
+_EDIT_HIGHLIGHT_MS = 30000  # how long green underline stays visible
+
+
+def _ensure_view(path):
+    """Open *path* in ST if not already open, then wait for the async load to complete.
+
+    ST's window.open_file() returns immediately with a loading view; the file
+    content is not available until view.is_loading() returns False.  We poll
+    from the HTTP thread (50 × 100 ms = 5 s max) so the ST main thread stays
+    free to process the load callback.  Each _on_main call is brief.
+
+    Returns (view, None) on success or (None, {"error": ...}) on failure.
+    """
+    import time
+
+    def _open():
+        w = sublime.active_window()
+        v = w.find_open_file(path)
+        if v:
+            return v, None
+        if not os.path.isfile(path):
+            return None, {"error": "file not found: {}".format(path)}
+        return w.open_file(path), None
+
+    v, err = _on_main(_open)
+    if err:
+        return None, err
+
+    # Poll until loaded (each _on_main is brief; main thread free between sleeps)
+    for _ in range(50):
+        if not _on_main(lambda: v.is_loading()):
+            return v, None
+        time.sleep(0.1)
+
+    return None, {"error": "timeout waiting for file to load: {}".format(path)}
+
+
+def _edit_file(body):
+    command = body.get("command", "").strip()
+    path = body.get("path", "").strip()
+
+    if command == "create":
+        file_text = body.get("file_text", "")
+        if not path:
+            return {"error": "path required"}
+
+        def create_fn():
+            w = sublime.active_window()
+            if os.path.exists(path):
+                return {"error": "file already exists: {}".format(path)}
+            v = w.new_file()
+            v.retarget(path)
+            syn = sublime.find_syntax_for_file(path)
+            if syn:
+                v.assign_syntax(syn)
+            v.run_command("mcp_create_file", {"file_text": file_text})
+            return {"ok": True, "path": path}
+
+        return _on_main(create_fn)
+
+    # view / str_replace / insert all need an open view
+    if not path:
+        return {"error": "path required"}
+
+    v, err = _ensure_view(path)
+    if err:
+        return err
+
+    if command == "view":
+        view_range = body.get("view_range")
+
+        def view_fn():
+            content = v.substr(sublime.Region(0, v.size()))
+            lines = content.split("\n")
+            total = len(lines)
+            if view_range and len(view_range) >= 2:
+                start = max(1, int(view_range[0]))
+                end = min(total, int(view_range[1]) if view_range[1] != -1 else total)
+                if start > end:
+                    return {"error": "invalid view_range"}
+                slice_lines = lines[start - 1 : end]
+                numbered = "\n".join(
+                    "{}: {}".format(start + i, l) for i, l in enumerate(slice_lines)
+                )
+                return {
+                    "content": numbered,
+                    "total_lines": total,
+                    "start_line": start,
+                    "end_line": end,
+                }
+            else:
+                numbered = "\n".join("{}: {}".format(i + 1, l) for i, l in enumerate(lines))
+                return {"content": numbered, "total_lines": total}
+
+        return _on_main(view_fn)
+
+    if command == "str_replace":
+        old_str = body.get("old_str", "")
+        new_str = body.get("new_str", "")
+        if not old_str:
+            return {"error": "old_str required"}
+        # Normalize line endings to match ST's internal \n representation
+        old_str = old_str.replace("\r\n", "\n").replace("\r", "\n")
+        new_str = new_str.replace("\r\n", "\n").replace("\r", "\n")
+
+        def str_replace_fn():
+            regions = v.find_all(old_str, sublime.LITERAL)
+            if len(regions) == 0:
+                return {
+                    "error": "No match found for old_str. Check whitespace and indentation."
+                }
+            if len(regions) > 1:
+                lns = [v.rowcol(r.begin())[0] + 1 for r in regions]
+                return {
+                    "error": "Found {} matches at lines {}. Add more surrounding context to old_str to make it unique.".format(len(regions), lns)
+                }
+            region = regions[0]
+            row, _ = v.rowcol(region.begin())
+            # Save current state as reference so gutter shows the diff
+            original = v.substr(sublime.Region(0, v.size()))
+            v.set_reference_document(original)
+            v.run_command(
+                "mcp_str_replace",
+                {
+                    "begin": region.begin(),
+                    "end": region.end(),
+                    "new_str": new_str,
+                },
+            )
+            return {"ok": True, "line": row + 1}
+
+        return _on_main(str_replace_fn)
+
+    if command == "insert":
+        insert_line = body.get("insert_line")
+        insert_text = body.get("insert_text", "")
+        if insert_line is None:
+            return {"error": "insert_line required"}
+        insert_line = int(insert_line)
+
+        def insert_fn():
+            total_lines = v.rowcol(v.size())[0] + 1
+            if insert_line == 0:
+                pt = 0
+            else:
+                clamped = min(insert_line, total_lines)
+                line_region = v.full_line(v.text_point(clamped - 1, 0))
+                pt = line_region.end()
+            # Normalize line endings
+            text = insert_text.replace("\r\n", "\n").replace("\r", "\n")
+            if not text.endswith("\n"):
+                text += "\n"
+            original = v.substr(sublime.Region(0, v.size()))
+            v.set_reference_document(original)
+            v.run_command(
+                "mcp_insert_text",
+                {
+                    "insert_pt": pt,
+                    "insert_text": text,
+                },
+            )
+            row, _ = v.rowcol(pt)
+            return {
+                "ok": True,
+                "after_line": insert_line,
+                "inserted_at_pt": pt,
+                "visible_line": row + 1,
+            }
+
+        return _on_main(insert_fn)
+
+    return {
+        "error": "unknown command: {!r}. Use: str_replace, insert, create, view".format(command)
+    }
+
+
+# ── routing ───────────────────────────────────────────────────────────────────
+
+
+def _get_mcp_tools(params):
+    """Return the focused tool surface, or the full catalog on request."""
+    with _mcp_tools_lock:
+        snapshot = [tool for tool in _MCP_TOOLS if tool[0] not in _DISABLED_TOOLS]
+    surface = (params.get("surface", ["default"])[0] if isinstance(params, dict)
+               else "default")
+    if surface != "all":
+        snapshot = [tool for tool in snapshot if tool[0] in _MCP_DEFAULT_TOOL_NAMES]
+    tools = []
+    for name, desc, schema, _ in snapshot:
+        input_schema = dict(schema) if schema else {}
+        if "type" not in input_schema:
+            input_schema["type"] = "object"
+        if "properties" not in input_schema:
+            input_schema["properties"] = {}
+        tools.append({"name": name, "description": desc, "inputSchema": input_schema})
+    return {"tools": tools}
+
+
+def _health(params):
+    """Dependency-free connection probe used by the CLI doctor."""
+    with _mcp_tools_lock:
+        total = len(_MCP_TOOLS)
+    return {
+        "ok": True,
+        "server": "sublime-mcp",
+        "version": __version__,
+        "http_port": _PORT,
+        "mcp_port": _MCP_PORT,
+        "default_tool_count": len(_MCP_DEFAULT_TOOL_NAMES),
+        "advanced_tool_count": max(0, total - len(_MCP_DEFAULT_TOOL_NAMES)),
+        "total_tool_count": total,
+    }
+
+
+_GET = {
+    "/active_file": _get_active_file,
+    "/selection": _get_selection,
+    "/cursor_context": _get_cursor_context,
+    "/open_files": _get_open_files,
+    "/sheets": _get_sheets,
+    "/selected_sheets": _get_selected_sheets,
+    "/sheet_index": _get_sheet_index,
+    "/sheet_content": _get_sheet_content,
+    "/project_folders": _get_project_folders,
+    "/file_content": _get_file_content,
+    "/view_content": _get_view_content,
+    "/view_size": _get_view_size,
+    "/view_chars": _get_view_chars,
+    "/view_phantoms": _get_view_phantoms,
+    "/view_regions": _get_view_regions,
+    "/output_panel": _get_output_panel,
+    "/console": _get_console,
+    "/console_log": _get_console_log,
+    "/console_full": _get_console_full,
+    "/console_win": _get_console_win,
+    "/symbols": _get_symbols,
+    "/lookup_symbol": _lookup_symbol,
+    "/project_data": _get_project_data,
+    "/variables": _get_variables,
+    "/bookmarks": _get_bookmarks,
+    "/line_count": _get_line_count,
+    "/syntaxes": _get_syntaxes,
+    "/command_palette": _get_command_palette,
+    "/commands": _get_commands,
+    "/menu_items": _get_menu_items,
+    "/active_panel": _get_active_panel,
+    "/scope_at_cursor": _get_scope_at_cursor,
+    "/encoding": _get_encoding,
+    "/word_at_cursor": _get_word_at_cursor,
+    "/layout": _get_layout,
+    "/mcp_tools": _get_mcp_tools,
+    "/health": _health,
+}
+
+_POST = {
+    "/set_project_data": _set_project_data,
+    "/open_file": _open_file,
+    "/goto_line": _goto_line,
+    "/show_panel": _show_panel,
+    "/replace_selection": _replace_selection,
+    "/replace_lines": _replace_lines,
+    "/run_command": _run_command,
+    "/run_build": _run_build,
+    "/set_status": _set_status,
+    "/claim_resource": _claim_resource,
+    "/release_resource": _release_resource,
+    "/list_claims": _list_claims,
+    "/save_file": _save_file,
+    "/save_all": _save_all,
+    "/close_file": _close_file,
+    "/find_in_file": _find_in_file,
+    "/next_result": _next_result,
+    "/prev_result": _prev_result,
+    "/toggle_bookmark": _toggle_bookmark,
+    "/next_bookmark": _next_bookmark,
+    "/prev_bookmark": _prev_bookmark,
+    "/clear_bookmarks": _clear_bookmarks,
+    "/select_all_bookmarks": _select_all_bookmarks,
+    "/drive_input_panel": _drive_input_panel,
+    "/click_menu_item": _click_menu_item,
+    "/get_quick_panel": _get_quick_panel,
+    "/pick_quick_panel": _pick_quick_panel,
+    "/set_syntax": _set_syntax,
+    "/toggle_comment": _toggle_comment,
+    "/toggle_sidebar": _toggle_sidebar,
+    "/select_lines": _select_lines,
+    "/sort_lines": _sort_lines,
+    "/eval_python": _eval_python,
+    "/eval_python_latest": _eval_python_latest,
+    "/fold_lines": _fold_lines,
+    "/set_encoding": _set_encoding,
+    "/revert_file": _revert_file,
+    "/undo": _undo,
+    "/redo": _redo,
+    "/duplicate_line": _duplicate_line,
+    "/select_sheets": _select_sheets,
+    "/focus_sheet": _focus_sheet,
+    "/set_sheet_index": _set_sheet_index,
+    "/move_sheets_to_group": _move_sheets_to_group,
+    "/unselect_others": _wc("unselect_others"),
+    "/unselect_to_left": _wc("unselect_to_left"),
+    "/unselect_to_right": _wc("unselect_to_right"),
+    "/select_to_left": _wc("select_to_left"),
+    "/select_to_right": _wc("select_to_right"),
+    "/focus_to_left": _wc("focus_to_left"),
+    "/focus_to_right": _wc("focus_to_right"),
+    # ── Phase B batch 1: selection / edit / view ops ────────────────────────
+    "/new_file": _wc("new_file"),
+    "/close_all": _wc("close_all"),
+    "/close_unmodified": _wc("close_unmodified"),
+    "/close_pane": _wc("close_pane"),
+    "/close_transient": _wc("close_transient"),
+    "/clone_file": _wc("clone_file"),
+    "/next_view": _wc("next_view"),
+    "/prev_view": _wc("prev_view"),
+    "/next_view_in_stack": _wc("next_view_in_stack"),
+    "/prev_view_in_stack": _wc("prev_view_in_stack"),
+    "/focus_neighboring_group": _wc("focus_neighboring_group"),
+    "/move_to_neighboring_group": _wc("move_to_neighboring_group"),
+    "/toggle_full_screen": _wc("toggle_full_screen"),
+    "/toggle_menu": _wc("toggle_menu"),
+    "/toggle_side_bar": _wc("toggle_side_bar"),
+    "/toggle_minimap": _wc("toggle_minimap"),
+    "/toggle_status_bar": _wc("toggle_status_bar"),
+    "/toggle_tabs": _wc("toggle_tabs"),
+    "/toggle_distraction_free": _wc("toggle_distraction_free"),
+    # edit ops (text scope)
+    "/insert": _vc("insert"),
+    "/paste": _vc("paste"),
+    "/paste_from_history": _vc("paste_from_history"),
+    "/paste_and_indent": _vc("paste_and_indent"),
+    "/cut": _vc("cut"),
+    "/copy": _vc("copy"),
+    "/select_all": _vc("select_all"),
+    "/expand_selection": _vc("expand_selection"),
+    "/expand_selection_to_paragraph": _vc("expand_selection_to_paragraph"),
+    "/split_selection_into_lines": _vc("split_selection_into_lines"),
+    "/single_selection": _vc("single_selection"),
+    "/clear_fields": _vc("clear_fields"),
+    "/join_lines": _vc("join_lines"),
+    "/swap_line_up": _vc("swap_line_up"),
+    "/swap_line_down": _vc("swap_line_down"),
+    "/indent": _vc("indent"),
+    "/unindent": _vc("unindent"),
+    "/reindent": _vc("reindent"),
+    "/wrap_lines": _vc("wrap_lines"),
+    "/transpose": _vc("transpose"),
+    "/upper_case": _vc("upper_case"),
+    "/lower_case": _vc("lower_case"),
+    "/title_case": _vc("title_case"),
+    "/swap_case": _vc("swap_case"),
+    "/invert_selection": _vc("invert_selection"),
+    "/sort_selection": _vc("sort_selection"),
+    "/permute_lines": _vc("permute_lines"),
+    "/permute_selection": _vc("permute_selection"),
+    "/trim_trailing_white_space": _vc("trim_trailing_white_space"),
+    "/ensure_newline_at_eof": _vc("ensure_newline_at_eof"),
+    "/expand_tabs": _vc("expand_tabs"),
+    "/unexpand_tabs": _vc("unexpand_tabs"),
+    "/detect_indentation": _vc("detect_indentation"),
+    "/yank": _vc("yank"),
+    "/scroll_to_bof": _vc("scroll_to_bof"),
+    "/scroll_to_eof": _vc("scroll_to_eof"),
+    "/show_at_center": _vc("show_at_center"),
+    "/toggle_record_macro": _ac("toggle_record_macro"),
+    "/run_macro": _vc("run_macro"),
+    "/insert_snippet": _insert_snippet,
+    # ── Phase B batch 2: file/project operations ─────────────────────────
+    "/new_file_at": _wc("new_file_at"),
+    "/new_folder": _wc("new_folder"),
+    "/open_folder": _open_folder,
+    "/open_containing_folder": _wc("open_containing_folder"),
+    "/rename_file": _wc("rename_file"),
+    "/copy_path": _wc("copy_path"),
+    "/switch_file": _wc("switch_file"),
+    "/open_file_settings": _wc("open_file_settings"),
+    "/edit_settings": _wc("edit_settings"),
+    "/new_build_system": _wc("new_build_system"),
+    "/new_plugin": _wc("new_plugin"),
+    "/new_snippet": _wc("new_snippet"),
+    "/new_syntax": _wc("new_syntax"),
+    "/new_pane": _wc("new_pane"),
+    "/set_max_columns": _wc("set_max_columns"),
+    "/view_resource": _wc("view_resource"),
+    "/exec": _wc("exec"),
+    "/find_in_folder": _wc("find_in_folder"),
+    "/goto_definition": _wc("goto_definition"),
+    "/goto_reference": _wc("goto_reference"),
+    "/auto_complete_goto_definition": _vc("auto_complete_goto_definition"),
+    "/open_symbol_definition": _wc("open_symbol_definition"),
+    "/prompt_goto_line": _wc("prompt_goto_line"),
+    "/show_overlay": _wc("show_overlay"),
+    "/select_color_scheme": _wc("select_color_scheme"),
+    "/select_theme": _wc("select_theme"),
+    "/customize_color_scheme": _wc("customize_color_scheme"),
+    "/customize_theme": _wc("customize_theme"),
+    "/convert_color_scheme": _wc("convert_color_scheme"),
+    "/convert_syntax": _wc("convert_syntax"),
+    "/edit_syntax_settings": _wc("edit_syntax_settings"),
+    "/run_syntax_tests": _wc("run_syntax_tests"),
+    "/profile_plugins": _ac("profile_plugins"),
+    "/profile_syntax_definition": _ac("profile_syntax_definition"),
+    "/install_package_control": _ac("install_package_control"),
+    "/echo": _ac("echo"),
+    # Phase B batch 3: remaining text commands (marks, jumps, folds, transform, browser, scope)
+    "/set_mark": _vc("set_mark"),
+    "/select_to_mark": _vc("select_to_mark"),
+    "/swap_with_mark": _vc("swap_with_mark"),
+    "/delete_to_mark": _vc("delete_to_mark"),
+    "/add_to_kill_ring": _vc("add_to_kill_ring"),
+    "/jump_back": _vc("jump_back"),
+    "/jump_forward": _vc("jump_forward"),
+    "/fold_unfold": _vc("fold_unfold"),
+    "/rot13": _vc("rot13"),
+    "/wrap_block": _vc("wrap_block"),
+    "/open_context_url": _vc("open_context_url"),
+    "/open_in_browser": _vc("open_in_browser"),
+    "/show_scope_name": _vc("show_scope_name"),
+    "/html_print": _vc("html_print"),
+    "/arithmetic": _vc("arithmetic"),
+    "/auto_indent_tag": _vc("auto_indent_tag"),
+    "/convert_ident_case": _vc("convert_ident_case"),
+    "/old_expand_selection_to_paragraph": _vc("old_expand_selection_to_paragraph"),
+    "/old_wrap_lines": _vc("old_wrap_lines"),
+    "/transformer": _vc("transformer"),
+    "/get_setting": _get_setting,
+    "/set_setting": _set_setting,
+    "/focus_group": _focus_group,
+    "/set_layout": _set_layout,
+    "/send_to_view": _send_to_view,
+    "/edit_file": _edit_file,
+    "/open_control_panel": _open_control_panel,
+    "/get_help": _get_help,
+    # BEGIN GENERATED ST COMMAND ROUTES (tools/generate_st_command_tools.py)
+    "/add_directory": _wc("add_directory"),
+    "/add_jump_record": _vc("add_jump_record"),
+    "/add_where_snippet": _wc("add_where_snippet"),
+    "/add_word": _vc("add_word"),
+    "/append": _vc("append"),
+    "/auto_complete": _vc("auto_complete"),
+    "/auto_complete_open_link": _vc("auto_complete_open_link"),
+    "/build": _wc("build"),
+    "/cancel": _wc("cancel"),
+    "/cancel_build": _wc("cancel_build"),
+    "/cancel_find": _wc("cancel_find"),
+    "/chain": _wc("chain"),
+    "/clear_location": _wc("clear_location"),
+    "/clear_missing_recent_projects_and_workspaces": _wc("clear_missing_recent_projects_and_workspaces"),
+    "/clear_recent_files": _wc("clear_recent_files"),
+    "/clear_recent_projects_and_workspaces": _wc("clear_recent_projects_and_workspaces"),
+    "/close": _wc("close"),
+    "/close_by_index": _wc("close_by_index"),
+    "/close_deleted_files": _wc("close_deleted_files"),
+    "/close_folder_list": _wc("close_folder_list"),
+    "/close_others_by_index": _wc("close_others_by_index"),
+    "/close_selected": _wc("close_selected"),
+    "/close_tag": _wc("close_tag"),
+    "/close_to_right_by_index": _wc("close_to_right_by_index"),
+    "/close_unmodified_to_right_by_index": _wc("close_unmodified_to_right_by_index"),
+    "/close_unselected": _wc("close_unselected"),
+    "/close_window": _wc("close_window"),
+    "/close_workspace": _wc("close_workspace"),
+    "/commit_completion": _vc("commit_completion"),
+    "/console_python_version": _wc("console_python_version"),
+    "/context_menu": _wc("context_menu"),
+    "/copy_as_html": _vc("copy_as_html"),
+    "/correct_spelling": _vc("correct_spelling"),
+    "/decrease_font_size": _ac("decrease_font_size"),
+    "/delete_file": _wc("delete_file"),
+    "/delete_folder": _wc("delete_folder"),
+    "/delete_word": _vc("delete_word"),
+    "/drag_select": _vc("drag_select"),
+    "/encode_html_entities": _vc("encode_html_entities"),
+    "/exit": _exit_app,
+    "/expand_snippet": _vc("expand_snippet"),
+    "/find_all": _wc("find_all"),
+    "/find_all_under": _vc("find_all_under"),
+    "/find_next": _vc("find_next"),
+    "/find_prev": _vc("find_prev"),
+    "/find_under": _vc("find_under"),
+    "/find_under_expand": _vc("find_under_expand"),
+    "/find_under_expand_skip": _vc("find_under_expand_skip"),
+    "/find_under_prev": _vc("find_under_prev"),
+    "/focus_by_index": _wc("focus_by_index"),
+    "/focus_side_bar": _wc("focus_side_bar"),
+    "/fold": _vc("fold"),
+    "/fold_all": _vc("fold_all"),
+    "/fold_by_level": _vc("fold_by_level"),
+    "/fold_tag_attributes": _vc("fold_tag_attributes"),
+    "/goto_symbol_in_project": _wc("goto_symbol_in_project"),
+    "/hide_auto_complete": _vc("hide_auto_complete"),
+    "/hide_overlay": _wc("hide_overlay"),
+    "/hide_panel": _wc("hide_panel"),
+    "/hide_popup": _vc("hide_popup"),
+    "/hot_exit": _ac("hot_exit"),
+    "/ignore_word": _vc("ignore_word"),
+    "/increase_font_size": _ac("increase_font_size"),
+    "/left_delete": _vc("left_delete"),
+    "/move": _vc("move"),
+    "/move_to": _vc("move_to"),
+    "/move_to_group": _wc("move_to_group"),
+    "/new_os_tab": _wc("new_os_tab"),
+    "/new_window": _ac("new_window"),
+    "/new_window_for_project": _wc("new_window_for_project"),
+    "/next_field": _vc("next_field"),
+    "/next_misspelling": _vc("next_misspelling"),
+    "/next_modification": _vc("next_modification"),
+    "/next_os_tab": _wc("next_os_tab"),
+    "/noop": _wc("noop"),
+    "/open_dir": _wc("open_dir"),
+    "/open_project_or_workspace": _wc("open_project_or_workspace"),
+    "/open_recent_file": _wc("open_recent_file"),
+    "/open_recent_folder": _wc("open_recent_folder"),
+    "/open_recent_project_or_workspace": _wc("open_recent_project_or_workspace"),
+    "/open_url": _ac("open_url"),
+    "/overwrite": _vc("overwrite"),
+    "/paste_selection_clipboard": _vc("paste_selection_clipboard"),
+    "/prev_field": _vc("prev_field"),
+    "/prev_misspelling": _vc("prev_misspelling"),
+    "/prev_modification": _vc("prev_modification"),
+    "/prev_os_tab": _wc("prev_os_tab"),
+    "/primary_j_changed": _wc("primary_j_changed"),
+    "/prompt_add_folder": _wc("prompt_add_folder"),
+    "/prompt_open": _wc("prompt_open"),
+    "/prompt_open_file": _wc("prompt_open_file"),
+    "/prompt_open_folder": _wc("prompt_open_folder"),
+    "/prompt_open_project_or_workspace": _wc("prompt_open_project_or_workspace"),
+    "/prompt_save_as": _wc("prompt_save_as"),
+    "/prompt_select_workspace": _wc("prompt_select_workspace"),
+    "/prompt_switch_project_or_workspace": _wc("prompt_switch_project_or_workspace"),
+    "/purchase_license": _ac("purchase_license"),
+    "/redo_or_repeat": _vc("redo_or_repeat"),
+    "/refresh_folder_list": _wc("refresh_folder_list"),
+    "/remove_license": _ac("remove_license"),
+    "/rename_path": _wc("rename_path"),
+    "/reopen": _vc("reopen"),
+    "/reopen_last_file": _wc("reopen_last_file"),
+    "/replace_all": _wc("replace_all"),
+    "/replace_completion_with_auto_complete": _vc("replace_completion_with_auto_complete"),
+    "/replace_next": _wc("replace_next"),
+    "/reset_font_size": _ac("reset_font_size"),
+    "/resize_window": _wc("resize_window"),
+    "/reveal_in_side_bar": _wc("reveal_in_side_bar"),
+    "/reveal_link_source": _wc("reveal_link_source"),
+    "/revert": _vc("revert"),
+    "/revert_hunk": _vc("revert_hunk"),
+    "/revert_modification": _vc("revert_modification"),
+    "/right_delete": _vc("right_delete"),
+    "/run_macro_file": _vc("run_macro_file"),
+    "/save": _vc("save"),
+    "/save_macro": _wc("save_macro"),
+    "/save_project_and_workspace_as": _wc("save_project_and_workspace_as"),
+    "/save_workspace_as": _wc("save_workspace_as"),
+    "/scroll_lines": _vc("scroll_lines"),
+    "/select": _wc("select"),
+    "/select_bookmark": _vc("select_bookmark"),
+    "/select_by_index": _wc("select_by_index"),
+    "/set_build_system": _wc("set_build_system"),
+    "/set_file_type": _vc("set_file_type"),
+    "/set_line_ending": _vc("set_line_ending"),
+    "/show_about_window": _ac("show_about_window"),
+    "/show_changelog": _ac("show_changelog"),
+    "/show_license_window": _ac("show_license_window"),
+    "/show_progress_window": _ac("show_progress_window"),
+    "/slurp_find_string": _wc("slurp_find_string"),
+    "/slurp_replace_string": _wc("slurp_replace_string"),
+    "/soft_redo": _vc("soft_redo"),
+    "/soft_undo": _vc("soft_undo"),
+    "/sublime_merge_blame_file": _wc("sublime_merge_blame_file"),
+    "/sublime_merge_file_history": _wc("sublime_merge_file_history"),
+    "/sublime_merge_folder_history": _wc("sublime_merge_folder_history"),
+    "/sublime_merge_line_history": _vc("sublime_merge_line_history"),
+    "/sublime_merge_open_repo": _wc("sublime_merge_open_repo"),
+    "/toggle_case_sensitive": _wc("toggle_case_sensitive"),
+    "/toggle_highlight": _wc("toggle_highlight"),
+    "/toggle_in_selection": _wc("toggle_in_selection"),
+    "/toggle_inline_diff": _vc("toggle_inline_diff"),
+    "/toggle_overwrite": _vc("toggle_overwrite"),
+    "/toggle_preserve_case": _wc("toggle_preserve_case"),
+    "/toggle_regex": _wc("toggle_regex"),
+    "/toggle_save_all_on_build": _wc("toggle_save_all_on_build"),
+    "/toggle_setting": _vc("toggle_setting"),
+    "/toggle_show_context": _wc("toggle_show_context"),
+    "/toggle_show_open_files": _wc("toggle_show_open_files"),
+    "/toggle_use_buffer": _wc("toggle_use_buffer"),
+    "/toggle_use_gitignore": _wc("toggle_use_gitignore"),
+    "/toggle_whole_word": _wc("toggle_whole_word"),
+    "/toggle_wrap": _wc("toggle_wrap"),
+    "/unfold": _vc("unfold"),
+    "/unfold_all": _vc("unfold_all"),
+    "/update_check": _ac("update_check"),
+    "/upgrade_license": _ac("upgrade_license"),
+    # END GENERATED ST COMMAND ROUTES
+}
+
+
+def _read_json_body(handler):
+    """(body, None) from a request's JSON body, or (None, message) when it cannot be used.
+
+    An unreadable body used to raise inside the handler: the connection was dropped without any
+    answer and a traceback was printed into the console."""
+    try:
+        length = int(handler.headers.get("Content-Length", 0) or 0)
+    except ValueError:
+        return None, "invalid Content-Length header"
+    if length < 0:
+        return None, "invalid Content-Length header"
+    raw = handler.rfile.read(length) if length else b""
+    if not raw.strip():
+        return {}, None
+    try:
+        return json.loads(raw.decode("utf-8")), None
+    except (ValueError, UnicodeDecodeError) as e:
+        return None, "request body is not valid JSON: {}".format(e)
+
+
+class _Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass  # suppress request log
+
+    def _json(self, data, status=200):
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if is_oauth_discovery_path(self.path):
+            send_no_authorization(self)
+            return
+        if not _check_auth(self):
+            _deny_auth_json(self)
+            return
+        if parsed.path in _PLATFORM_UNAVAILABLE_ROUTES:
+            self._json({"error": "'{}' is only available on Windows".format(parsed.path.lstrip("/"))}, 403)
+            return
+        params = parse_qs(parsed.query)
+        handler = _GET.get(parsed.path)
+        if handler:
+            try:
+                data = handler(params)
+                # Same unknown-argument warning the POST routes and MCP calls give: a GET route
+                # answered silently, so /sheets?bogus=1 looked accepted (found 2026-11-08).
+                schema = _schema_for_handler(handler, parsed.path)
+                if schema is not None:
+                    data = _with_arg_warning(data, schema, params)
+                self._json(data)
+            except Exception as e:
+                self._json({"error": str(e)}, 500)
+        else:
+            self._json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        if not _check_auth(self):
+            _deny_auth_json(self)
+            return
+        parsed = urlparse(self.path)
+        tool_name = parsed.path.lstrip("/")
+        if parsed.path in _PLATFORM_UNAVAILABLE_ROUTES:
+            self._json({"error": "'{}' is only available on Windows".format(tool_name)}, 403)
+            return
+        if tool_name in _DISABLED_TOOLS:
+            self._json(_tool_disabled_error(tool_name), 403)
+            return
+        body, problem = _read_json_body(self)
+        if problem:
+            self._json({"error": problem}, 400)
+            return
+        if not isinstance(body, dict):
+            self._json({"error": "request body must be a JSON object"}, 400)
+            return
+        denial = _bridge_consent_denial(tool_name, body)
+        if denial:
+            self._json({"error": denial}, 403)
+            return
+        handler = _POST.get(parsed.path)
+        if handler:
+            try:
+                data = handler(body)
+                # The same unknown-argument warning an MCP tools/call gets: the direct HTTP
+                # routes answered silently, so {"ctrl": true} on /ui_press_key was accepted and
+                # dropped although the schema says mods: ["ctrl"] (found 2026-11-08 through the
+                # audit rig, which talks to these routes and not to /mcp).
+                schema = _schema_for_handler(handler, parsed.path)
+                if schema is not None:
+                    data = _with_arg_warning(data, schema, body)
+                self._json(data)
+            except Exception as e:
+                self._json({"error": str(e)}, 500)
+        else:
+            self._json({"error": "not found"}, 404)
+
+
+# ── MCP SSE server (Python 3.8, no external dependencies) ────────────────────
+#
+# Implements the MCP 2024-11-05 SSE transport so agents can connect directly
+# to Sublime Text without running index.js / npx.
+#
+# Claude Code config:
+#   { "type": "sse", "url": "http://127.0.0.1:9502/sse" }   (Windows)
+#   { "type": "sse", "url": "http://127.0.0.1:9503/sse" }   (Mac/Linux)
+# Override via MCP Commander.sublime-settings ("mcp_port" / "http_port").
+
+import queue as _queue
+import uuid as _uuid
+
+_MCP_PORT = 9502 if sys.platform == "win32" else 9503
+_mcp_sessions = {}  # session_id -> queue.Queue
+
+# Loopback-only by default: both HTTP servers below have no authentication
+# at all (see lib/mcp_http_policy.py's own "loopback servers are no-auth"
+# design note), and one of their tools (eval_python) is arbitrary code
+# execution in Sublime's process by design. Binding 0.0.0.0 instead of
+# 127.0.0.1 makes that reachable from every other device on the same
+# network with zero auth -- opt into "allow_lan_access": true in
+# MCP Commander.sublime-settings only if something like a WSL client
+# genuinely can't reach 127.0.0.1 on the Windows host directly (confirmed
+# live 2026-09-15: WSL's default NAT networking mode doesn't always forward
+# localhost from the Linux side without either mirrored networking mode or
+# binding all interfaces on the Windows side).
+_BIND_HOST = "127.0.0.1"
+
+# Empty (default) = no auth required, matching every prior release's
+# behavior. Set "auth_token" in MCP Commander.sublime-settings to require a
+# matching `Authorization: Bearer <token>` header on every request to
+# either HTTP server -- the one control that works regardless of bind
+# address, since loopback-only does not protect against another process (or
+# another user, on a shared/multi-user machine) on the same host.
+_AUTH_TOKEN = ""
+
+# Tool names in "disabled_tools" (MCP Commander.sublime-settings) are
+# blocked at every call path that can reach a tool's handler: tools/call
+# (_mcp_dispatch), batch (_batch), and the direct POST /<tool_name> routes
+# _Handler serves for node-proxy/dynamic-registration compatibility
+# (register_mcp_tools). All three call the same handler functions
+# independently -- a check added to only one of them is not a real
+# restriction, confirmed by reading _batch's own tools_by_name lookup,
+# which bypasses _mcp_dispatch entirely.
+# Tools that need Win32 and cannot work on any other platform. Off Windows they
+# are gated exactly like a tool named in disabled_tools: not listed, not
+# discoverable, and refused on every call path (tools/call, batch, and the
+# direct GET/POST routes).
+_WINDOWS_ONLY_TOOLS = frozenset({
+    "get_console_full", "get_console_win", "list_native_windows", "dismiss_native_window",
+    "ui_screenshot", "ui_press_key", "ui_type_text", "ui_click", "ui_hover",
+})
+_WINDOWS_ONLY_ROUTES = frozenset({
+    "/console_full", "/console_win", "/list_native_windows", "/dismiss_native_window",
+    "/ui_screenshot", "/ui_press_key", "/ui_type_text", "/ui_click", "/ui_hover",
+})
+_PLATFORM_UNAVAILABLE_TOOLS = _WINDOWS_ONLY_TOOLS if sys.platform != "win32" else frozenset()
+_PLATFORM_UNAVAILABLE_ROUTES = _WINDOWS_ONLY_ROUTES if sys.platform != "win32" else frozenset()
+_DISABLED_TOOLS = set(_PLATFORM_UNAVAILABLE_TOOLS)
+
+# Destructive actions asked about before they run (lib/consent.py). On by default; the setting
+# "require_consent_for_destructive": false in MCP Commander.sublime-settings turns it off.
+_REQUIRE_CONSENT = True
+_CONSENT_PANEL = "sublime_mcp_consent"
+
+
+def _consent_required():
+    """The setting, kept current by a settings listener (see _load_ports), so changing it
+    needs no restart. Never touches the sublime API: this runs on request threads before every
+    tool call, and a sublime.load_settings call there waits for the main thread, which a native
+    dialog can block (list_native_windows and dismiss_native_window then never get answered)."""
+    return _REQUIRE_CONSENT
+
+
+def _refresh_consent_setting():
+    """Settings listener (main thread): copy the current value into _REQUIRE_CONSENT."""
+    global _REQUIRE_CONSENT
+    _REQUIRE_CONSENT = bool(sublime.load_settings("MCP Commander.sublime-settings")
+                            .get("require_consent_for_destructive", True))
+
+
+def _show_consent_code(codes):
+    """Open (codes) or close (None) the panel with the whole eval_python code while the question
+    is open. The prompt of a client like Claude Code shows only a few short lines, so the code the
+    person approves is read here. Returns True when a panel will be shown."""
+    if codes is None:
+        def close():
+            window = sublime.active_window()
+            if window:
+                window.destroy_output_panel(_CONSENT_PANEL)
+        sublime.set_timeout(close, 0)
+        return False
+    if not sublime.active_window():
+        return False
+
+    def show():
+        window = sublime.active_window()
+        if not window:
+            return
+        view = window.create_output_panel(_CONSENT_PANEL)
+        view.set_read_only(False)
+        text = "\n\n".join("# eval_python code to approve ({} of {})\n{}".format(i + 1, len(codes), code)
+                           for i, code in enumerate(codes))
+        view.run_command("append", {"characters": text})
+        view.set_read_only(True)
+        view.set_syntax_file("Packages/Python/Python.sublime-syntax")
+        window.run_command("show_panel", {"panel": "output." + _CONSENT_PANEL})
+    sublime.set_timeout(show, 0)
+    return True
+
+
+_CONSENT_GATE = consent.ConsentGate(log=lambda text: print("sublime-mcp: " + text),
+                                    show_code=_show_consent_code)
+
+
+_LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
+
+
+def _host_name(value):
+    value = value.strip().lower()
+    if value.startswith("["):
+        return value.split("]")[0] + "]"
+    return value.split(":")[0]
+
+
+def _is_loopback_request(handler):
+    origin = handler.headers.get("Origin")
+    if origin is not None:
+        if origin == "null" or _host_name(origin.split("://", 1)[-1]) not in _LOOPBACK_NAMES:
+            return False
+    if _BIND_HOST == "127.0.0.1":
+        host = handler.headers.get("Host")
+        if host is not None and _host_name(host) not in _LOOPBACK_NAMES:
+            return False  # DNS rebinding
+    return True
+
+
+def _check_auth(handler):
+    """True if this request may proceed. Without an auth_token (default) only
+    browser-borne requests are refused: a webpage can POST text/plain JSON to
+    127.0.0.1 without a CORS preflight, so an Origin or Host header naming
+    anything but loopback is rejected. CLI/desktop MCP clients send no Origin."""
+    if not _AUTH_TOKEN:
+        return _is_loopback_request(handler)
+    got = handler.headers.get("Authorization", "")
+    if got.startswith("Bearer "):
+        got = got[7:]
+    return got == _AUTH_TOKEN
+
+
+def _deny_auth_json(handler):
+    body = b'{"error":"unauthorized"}'
+    handler.send_response(401)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("WWW-Authenticate", "Bearer")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _tool_disabled_error(name):
+    if name in _PLATFORM_UNAVAILABLE_TOOLS:
+        return {"error": "tool '{}' is only available on Windows. For a dialog here: look at the screen; "
+                         "under WSL (WSLg) a computer-use client lists it as a window titled ' (Ubuntu)', "
+                         "reads it with an image snapshot and clicks its button.".format(name)}
+    return {"error": "tool '{}' is disabled by this server's settings (disabled_tools)".format(name)}
+
+
+def _load_ports():
+    global _PORT, _MCP_PORT, _BIND_HOST, _AUTH_TOKEN, _DISABLED_TOOLS, _REQUIRE_CONSENT
+    settings = sublime.load_settings("MCP Commander.sublime-settings")
+    _REQUIRE_CONSENT = bool(settings.get("require_consent_for_destructive", True))
+    settings.clear_on_change("sublime_mcp_consent")
+    settings.add_on_change("sublime_mcp_consent", _refresh_consent_setting)
+    # install_py33_helper: write or stop reading the 3.3 helper the moment the setting changes.
+    # Without this, turning it on in a running Sublime left _PY33_HELPER_ENABLED false, so the
+    # retry the error message asks for could never work.
+    settings.clear_on_change("sublime_mcp_py33")
+    settings.add_on_change("sublime_mcp_py33", _ensure_py33_companion)
+    default_mcp_port = 9502 if sys.platform == "win32" else 9503
+    default_http_port = 9500 if sys.platform == "win32" else 9501
+    _MCP_PORT = int(settings.get("mcp_port", default_mcp_port))
+    _PORT = int(settings.get("http_port", default_http_port))
+    _BIND_HOST = "0.0.0.0" if settings.get("allow_lan_access", False) else "127.0.0.1"
+    _AUTH_TOKEN = str(settings.get("auth_token", "") or "")
+    disabled = settings.get("disabled_tools", [])
+    _DISABLED_TOOLS = (set(disabled) if isinstance(disabled, list) else set()) | _PLATFORM_UNAVAILABLE_TOOLS
+
+_EXTENSION_TEMPLATE = """\
+Place this file in Packages/<YourPackage>/<yourpackage>_mcp_tools.py.
+It is a standard Sublime Text plugin — ST loads and unloads it automatically.
+
+from sublime_mcp import register_mcp_tools, unregister_mcp_tools, run_st_command
+
+# Each entry: (name, description, input_schema, handler)
+# handler(body: dict) -> dict  (must be JSON-serialisable)
+# run_st_command(command, args=None, scope="window") runs any ST command.
+# scope values: "text"/"view" (TextCommand), "window" (WindowCommand), "application" (ApplicationCommand)
+
+TOOLS = [
+    ("example_command",
+     "One-line description of what this does.",
+     {},
+     lambda body: run_st_command("example_command", scope="window")),
+
+    ("example_with_args",
+     "Description of a command that takes arguments.",
+     {"type": "object", "properties": {"arg1": {"type": "string"}}, "required": ["arg1"]},
+     lambda body: run_st_command("example_command", args={"arg1": body["arg1"]}, scope="window")),
+]
+
+def plugin_loaded():
+    register_mcp_tools(TOOLS)
+
+def plugin_unloaded():
+    unregister_mcp_tools(TOOLS)
+"""
+
+
+def _to_get_params(args):
+    """Convert MCP args dict to parse_qs list-of-strings format for GET handlers."""
+    return {k: [str(v)] for k, v in args.items() if v is not None}
+
+
+def _mcp_add_folder(args):
+    path = args.get("path")
+    if not path:
+        return {"error": "path required"}
+    data = _get_project_data({}).get("project_data") or {}
+    folders = data.get("folders") or []
+    if any(f.get("path") == path for f in folders):
+        return {"ok": True, "note": "already present"}
+    folders.append({"path": path})
+    data["folders"] = folders
+    return _set_project_data({"data": data})
+
+
+def _mcp_remove_folder(args):
+    path = args.get("path")
+    if not path:
+        return {"error": "path required"}
+    data = _get_project_data({}).get("project_data") or {}
+    folders = data.get("folders") or []
+    new_folders = [f for f in folders if f.get("path") != path]
+    if len(new_folders) == len(folders):
+        return {"ok": False, "note": "folder not found"}
+    data["folders"] = new_folders
+    return _set_project_data({"data": data})
+
+
+def _g(endpoint):
+    """Wrap a GET handler for use as an MCP tool handler."""
+    def handler(args):
+        return _GET[endpoint](_to_get_params(args))
+    return handler
+
+
+def _p(endpoint):
+    """Wrap a POST handler for use as an MCP tool handler."""
+    def handler(args):
+        return _POST[endpoint](args)
+    return handler
+
+
+def _unknown_arg_warning(schema, args):
+    """Say which argument names a tool's schema does not list, or return None.
+
+    Many tools hand their arguments on to a Sublime command, which drops an
+    argument it does not know and still succeeds. Without this note a call such
+    as delete_file(path=...) (the argument is `files`) returns ok and does
+    nothing. The call is still run; only the result gets a warning. Tools whose
+    schema lists no properties are left alone, so an incomplete schema cannot
+    produce false warnings.
+    """
+    if not isinstance(args, dict) or not args:
+        return None
+    props = (schema or {}).get("properties")
+    if not isinstance(props, dict) or not props:
+        return None
+    unknown = sorted(str(k) for k in args if k not in props)
+    if not unknown:
+        return None
+    return ("argument(s) not in this tool's schema: {}; its arguments are: {}. "
+            "The call ran, but an unknown argument may have been dropped."
+            .format(", ".join(unknown), ", ".join(sorted(props))))
+
+
+def _with_arg_warning(result, schema, args):
+    """Add the unknown-argument warning to a dict result (lists are left alone)."""
+    warning = _unknown_arg_warning(schema, args)
+    if warning and isinstance(result, dict) and "warning" not in result:
+        result = dict(result)
+        result["warning"] = warning
+    return result
+
+
+_SCHEMAS_BY_HANDLER = {}
+_SCHEMAS_BY_ROUTE = {}
+
+
+def _schema_for_handler(handler, route=None):
+    """The arguments schema of the tool behind this request, or None.
+
+    Two keys, because the tool table mixes two wrappers: `_p`/`_g` build a fresh closure per tool
+    (the endpoint string sits in a cell), while some entries reuse the `_POST` callable itself.
+    Neither key alone covers every tool -- keying only on the route missed get_sheets, keying only
+    on identity missed ui_press_key -- so both maps are tried. This exists so a direct HTTP route
+    warns about an unknown argument exactly as an MCP tools/call does: the routes answered
+    silently, which is how {"ctrl": true} on /ui_press_key was accepted and dropped although the
+    schema names mods (found 2026-11-08 through the audit rig, which uses these routes).
+    """
+    global _SCHEMAS_BY_HANDLER, _SCHEMAS_BY_ROUTE
+    if not _SCHEMAS_BY_HANDLER:
+        by_handler, by_route = {}, {}
+        for entry in _MCP_TOOLS:
+            by_handler[id(entry[3])] = entry[2]
+            for cell in getattr(entry[3], "__closure__", None) or ():
+                try:
+                    value = cell.cell_contents
+                except ValueError:
+                    continue
+                if isinstance(value, str) and value.startswith("/"):
+                    by_route[value] = entry[2]
+                    break
+        _SCHEMAS_BY_HANDLER, _SCHEMAS_BY_ROUTE = by_handler, by_route
+    return _SCHEMAS_BY_HANDLER.get(id(handler)) or _SCHEMAS_BY_ROUTE.get(route)
+
+
+_BATCH_MAX_CALLS = 50
+_PROJECT_SEARCH_TIMEOUT_SECONDS = 120.0
+_project_search_lock = threading.Lock()
+
+
+def _batch(args):
+    """Run multiple MCP tool calls in a single HTTP request (worker-thread loop).
+
+    Saves N HTTP round trips / TCP connections by dispatching many tools in one
+    request. Each nested handler still performs its own _on_main() when it needs
+    the ST API — this function does NOT wrap the whole batch in one outer
+    _on_main(), so tools that poll with time.sleep between brief main-thread
+    ticks (e.g. waiting for open_file load) cannot freeze the UI or deadlock.
+    """
+    calls = args.get("calls")
+    if not isinstance(calls, list) or not calls:
+        return {"error": "calls must be a non-empty list of {tool, args}"}
+    if len(calls) > _BATCH_MAX_CALLS:
+        return {"error": "calls exceeds max batch size of {}".format(_BATCH_MAX_CALLS)}
+
+    with _mcp_tools_lock:
+        tools_by_name = {t[0]: t[3] for t in _MCP_TOOLS}
+        schemas_by_name = {t[0]: t[2] for t in _MCP_TOOLS}
+    results = []
+    for call in calls:
+        if not isinstance(call, dict):
+            results.append({"error": "each call must be an object with tool/args"})
+            continue
+        tool_name = call.get("tool")
+        tool_args = call.get("args") or {}
+        if tool_name == "batch":
+            results.append({"error": "batch cannot call itself"})
+            continue
+        if tool_name in _DISABLED_TOOLS:
+            results.append(_tool_disabled_error(tool_name))
+            continue
+        handler = tools_by_name.get(tool_name)
+        if handler is None:
+            results.append({"error": "unknown tool: {!r}".format(tool_name)})
+            continue
+        try:
+            results.append(_with_arg_warning(
+                handler(tool_args), schemas_by_name.get(tool_name), tool_args))
+        except Exception as e:
+            message = str(e)
+            results.append({"error": message})
+            # A blocked main thread fails every later call in the same way, one timeout each: six
+            # calls at 5 s reached the client's 30 s limit and the batch timed out as a whole
+            # (2026-11-07, closing tabs while a "Save Deleted File?" dialog was up). Stop at the
+            # first such call and say what was not run, so the reply is prompt and explains itself.
+            if "main-thread timeout" in message:
+                left = len(calls) - len(results)
+                if left > 0:
+                    results.append({"error": "not run: the remaining {} call(s) need the same blocked "
+                                             "main thread and would each wait out their own timeout. Dismiss "
+                                             "the dialog (list_native_windows, dismiss_native_window), then run "
+                                             "them again.".format(left)})
+                break
+    # A tool that returns content blocks (ui_screenshot inline) must reach the client as real
+    # image blocks, not as base64 text inside the JSON: pull the images out, leave a marker.
+    images = []
+    for i, r in enumerate(results):
+        if isinstance(r, list):
+            texts = []
+            for block in r:
+                if isinstance(block, dict) and block.get("type") == "image":
+                    images.append(block)
+                    texts.append("[image {} below]".format(len(images)))
+                elif isinstance(block, dict) and block.get("type") == "text":
+                    texts.append(block.get("text", ""))
+                else:
+                    texts.append(block)
+            results[i] = (texts[0] if len(texts) == 1 else
+                          "\n".join(t if isinstance(t, str) else json.dumps(t) for t in texts))
+    if images:
+        # Image first, like a plain screenshot tool's reply: the phone app shows a thumbnail
+        # for a result that starts with the image.
+        return images + [{"type": "text", "text": json.dumps({"results": results})}]
+    return {"results": results}
+
+
+_TOOL_TREE_CACHE = []
+
+
+def _tool_tree():
+    """The category tree from tool_tree.json (built by tools/build_tool_tree.py)."""
+    if not _TOOL_TREE_CACHE:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tool_tree.json")
+        with open(path, encoding="utf-8") as f:
+            _TOOL_TREE_CACHE.append(json.load(f))
+    return _TOOL_TREE_CACHE[0]
+
+
+def _tool_definition(name, snapshot):
+    for tool_name, desc, schema, _handler in snapshot:
+        if tool_name == name:
+            input_schema = dict(schema) if schema else {}
+            input_schema.setdefault("type", "object")
+            input_schema.setdefault("properties", {})
+            return {"name": name, "description": desc, "inputSchema": input_schema}
+    return None
+
+
+def _discover_by_category(category):
+    tree = _tool_tree()
+    parts = [p for p in category.strip("/").split("/") if p]
+    usage = ("Call a discovered tool through batch, even for one call: "
+             "batch(calls=[{tool: <name>, args: {...}}]).")
+    if not parts:
+        return {
+            "categories": [
+                {"path": name, "description": node["description"],
+                 "tools": sum(len(c["tools"]) for c in node["children"].values()),
+                 "subcategories": sorted(node["children"])}
+                for name, node in sorted(tree.items())],
+            "usage": "Call discover_tools(category=<path>) to open a category, "
+                     "or discover_tools(query=<words>) to search all tools.",
+        }
+    node = tree.get(parts[0])
+    if node is None or len(parts) > 2:
+        return {"error": "unknown category {!r}".format(category), "categories": sorted(tree)}
+    if len(parts) == 1:
+        return {
+            "path": parts[0], "description": node["description"],
+            "subcategories": [
+                {"path": parts[0] + "/" + name, "description": child["description"],
+                 "tools": len(child["tools"])}
+                for name, child in sorted(node["children"].items())],
+            "usage": "Call discover_tools(category=<subcategory path>) to list its tools.",
+        }
+    child = node["children"].get(parts[1])
+    if child is None:
+        return {"error": "unknown category {!r}".format(category),
+                "subcategories": sorted(parts[0] + "/" + n for n in node["children"])}
+    with _mcp_tools_lock:
+        snapshot = [tool for tool in _MCP_TOOLS if tool[0] not in _DISABLED_TOOLS]
+    tools = [d for d in (_tool_definition(n, snapshot) for n in child["tools"]) if d]
+    return {"path": category.strip("/"), "description": child["description"],
+            "tools": tools, "usage": usage}
+
+
+def _discover_tools(args):
+    """Walk the category tree (category=...) or search the whole catalog (query=...)."""
+    query = (args.get("query") or "").strip().lower()
+    if "category" in args or not query:
+        return _discover_by_category(args.get("category") or "")
+    limit = max(1, min(int(args.get("limit", 10)), 25))
+    terms = [term for term in re.split(r"[^a-z0-9_]+", query) if term]
+    with _mcp_tools_lock:
+        snapshot = [tool for tool in _MCP_TOOLS if tool[0] not in _DISABLED_TOOLS]
+    ranked = []
+    for name, desc, schema, _handler in snapshot:
+        if name in _MCP_DEFAULT_TOOL_NAMES:
+            continue
+        name_text = name.lower()
+        haystack = name_text + " " + (desc or "").lower()
+        score = 0
+        for term in terms:
+            if term == name_text:
+                score += 100
+            elif term in name_text:
+                score += 20
+            if term in haystack:
+                score += 3
+        if score:
+            ranked.append((score, name, desc, schema))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    tools = []
+    for _score, name, desc, schema in ranked[:limit]:
+        input_schema = dict(schema) if schema else {}
+        input_schema.setdefault("type", "object")
+        input_schema.setdefault("properties", {})
+        tools.append({"name": name, "description": desc, "inputSchema": input_schema})
+    return {
+        "tools": tools,
+        "usage": "Call a discovered tool through batch, even for one call: "
+                 "batch(calls=[{tool: <name>, args: {...}}]).",
+    }
+
+
+def _project_search(args):
+    """Run ST's native Find in Files engine and return parsed match records."""
+    import time
+
+    pattern = args.get("pattern", "")
+    if not pattern:
+        return {"error": "pattern required"}
+    where = args.get("where", "")
+    regex = bool(args.get("regex", False))
+    case_sensitive = bool(args.get("case_sensitive", False))
+    whole_word = bool(args.get("whole_word", False))
+    limit = max(1, min(int(args.get("limit", 200)), 2000))
+    timeout = max(1.0, min(float(args.get("timeout", 30.0)), _PROJECT_SEARCH_TIMEOUT_SECONDS))
+    show_panel = bool(args.get("show_panel", False))
+
+    if not _project_search_lock.acquire(False):
+        return {"error": "another native project search is already running"}
+    try:
+        def start_search():
+            window = sublime.active_window()
+            if not window:
+                return {"error": "no active window"}
+            panel = window.find_output_panel("find_results")
+            panel.set_read_only(False)
+            panel.run_command("select_all")
+            panel.run_command("right_delete")
+            panel.set_read_only(True)
+            window.run_command("show_panel", {
+                "panel": "find_in_files", "pattern": pattern, "where": where,
+                "case_sensitive": case_sensitive, "regex": regex,
+                "whole_word": whole_word,
+                # The tool reads the results from the output panel; with Find's "Use Buffer" on they
+                # would open in a Find Results tab instead and the tool would wait for nothing.
+                "use_buffer": False,
+            })
+            # This is the Find button command for the native Find in Files panel.
+            window.run_command("find_all")
+            return {"ok": True}
+
+        started = _on_main(start_search)
+        if started.get("error"):
+            return started
+        deadline = time.time() + timeout
+        content = ""
+        while time.time() < deadline:
+            def read_results():
+                panel = sublime.active_window().find_output_panel("find_results")
+                return panel.substr(sublime.Region(0, panel.size()))
+            content = _on_main(read_results)
+            if search_is_complete(content):
+                break
+            time.sleep(0.05)
+        else:
+            return {"error": "native project search timed out", "timeout": timeout}
+
+        matches = parse_find_results(content, pattern, regex, case_sensitive, limit)
+        summary = content.rstrip().splitlines()[-1] if content.strip() else ""
+        if not show_panel:
+            _on_main(lambda: sublime.active_window().run_command("hide_panel"))
+        return {
+            "engine": "sublime_find_in_files",
+            "pattern": pattern,
+            "where": where,
+            "matches": matches,
+            "returned": len(matches),
+            "truncated": len(matches) >= limit,
+            "summary": summary,
+        }
+    finally:
+        _project_search_lock.release()
+
+_POST["/batch"] = _batch
+_POST["/discover_tools"] = _discover_tools
+_POST["/project_search"] = _project_search
+
+
+def _get_package_mcp_info(body):
+    package = body.get("package", "").strip()
+    if not package:
+        return {"error": "package required"}
+
+    # Phase 1: ST API calls on the main thread (fast, in-memory).
+    def collect_st_data():
+        pkg_path = os.path.join(sublime.packages_path(), package)
+        zip_path = None
+
+        if not os.path.isdir(pkg_path):
+            user_zip = os.path.join(
+                sublime.installed_packages_path(), package + ".sublime-package"
+            )
+            if os.path.isfile(user_zip):
+                zip_path = user_zip
+            else:
+                bundled_zip = os.path.join(
+                    os.path.dirname(sublime.executable_path()),
+                    "Packages", package + ".sublime-package"
+                )
+                if os.path.isfile(bundled_zip):
+                    zip_path = bundled_zip
+            if zip_path is None:
+                return {"error": "Package '{}' not found".format(package)}
+
+        commands = {}
+        loaded_here = False
+        for classes in (getattr(sublime_plugin, "event_listener_classes", []),
+                        getattr(sublime_plugin, "view_event_listener_classes", [])):
+            for cls in classes:
+                module = getattr(cls, "__module__", "")
+                if (module.split(".", 1)[0] if module else "").lower() == package.lower():
+                    loaded_here = True
+        for scope_name, classes in (
+            ("application", getattr(sublime_plugin, "application_command_classes", [])),
+            ("window", getattr(sublime_plugin, "window_command_classes", [])),
+            ("text", getattr(sublime_plugin, "text_command_classes", [])),
+        ):
+            for cls in classes:
+                module = getattr(cls, "__module__", "")
+                pkg = module.split(".", 1)[0] if module else ""
+                if pkg.lower() != package.lower():
+                    continue
+                loaded_here = True
+                cmd = _command_name_from_class(cls)
+                entry = commands.setdefault(cmd, {"command": cmd, "scopes": [], "caption": "", "args": {}})
+                if scope_name not in entry["scopes"]:
+                    entry["scopes"].append(scope_name)
+
+        for resource in sorted(sublime.find_resources("*.sublime-commands")):
+            if _package_name_from_resource(resource) != package:
+                continue
+            try:
+                data = sublime.decode_value(sublime.load_resource(resource))
+            except Exception:
+                continue
+            if not isinstance(data, list):
+                continue
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                cmd = item.get("command", "")
+                if not cmd:
+                    continue
+                entry = commands.setdefault(cmd, {"command": cmd, "scopes": [], "caption": "", "args": {}})
+                if item.get("caption"):
+                    entry["caption"] = item["caption"]
+                if item.get("args"):
+                    entry["args"] = item["args"]
+
+        settings_keys = []
+        seen_keys = set()
+        for resource in sorted(sublime.find_resources("*.sublime-settings")):
+            if _package_name_from_resource(resource) != package:
+                continue
+            try:
+                data = sublime.decode_value(sublime.load_resource(resource))
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                for k in data:
+                    if k not in seen_keys:
+                        settings_keys.append(k)
+                        seen_keys.add(k)
+
+        safe_name = package.lower().replace(" ", "_").replace("-", "_")
+        output_file = os.path.join(pkg_path, "{}_mcp_tools.py".format(safe_name))
+        return {
+            "commands": list(commands.values()),
+            "settings_keys": settings_keys,
+            "pkg_path": pkg_path,
+            "zip_path": zip_path,
+            "output_file": output_file,
+            "loaded_here": loaded_here,
+        }
+
+    st = _on_main(collect_st_data)
+    if "error" in st:
+        return st
+
+    # Phase 2: file IO off the main thread (here in the HTTP handler thread).
+    import zipfile as _zipfile
+    python_files = []
+    declared_version = None
+    if st["zip_path"]:
+        try:
+            with _zipfile.ZipFile(st["zip_path"], "r") as zf:
+                names = zf.namelist()
+                python_files = sorted(n for n in names if n.endswith(".py"))
+                if ".python-version" in names:
+                    declared_version = zf.read(".python-version").decode("utf-8", "replace").strip()
+        except Exception:
+            pass
+    else:
+        for root, dirs, files in os.walk(st["pkg_path"]):
+            dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d != "__pycache__")
+            for fname in sorted(files):
+                if fname.endswith(".py"):
+                    python_files.append(os.path.join(root, fname))
+        try:
+            with open(os.path.join(st["pkg_path"], ".python-version"), encoding="utf-8") as fh:
+                declared_version = fh.read().strip()
+        except OSError:
+            pass
+
+    this_host = ".".join(str(n) for n in sys.version_info[:3])
+    if st["loaded_here"]:
+        host_note = ("Its commands or listeners are loaded in the same Python host as sublime-mcp "
+                     "(Python {}).".format(this_host))
+    else:
+        host_note = ("None of its commands or listeners are loaded in the Python host sublime-mcp runs in "
+                     "(Python {}). It runs in another plugin host (see python_version_file), has no Python "
+                     "plugins, or has not finished loading, so its commands may be missing from this list; "
+                     "look for 'reloading python <version> plugin {}' in the console."
+                     .format(this_host, package))
+
+    return {
+        "package": package,
+        "path": st["zip_path"] or st["pkg_path"],
+        "output_file": st["output_file"],
+        "commands": st["commands"],
+        "settings_keys": st["settings_keys"],
+        "python_files": python_files,
+        "python_version_file": declared_version,
+        "loaded_in_this_host": st["loaded_here"],
+        "this_host_python": this_host,
+        "host_note": host_note,
+        "extension_template": _EXTENSION_TEMPLATE,
+    }
+
+
+_POST["/package_mcp_info"] = _get_package_mcp_info
+
+
+# ── Native windows (dialogs, menus): work while ST's main thread is blocked ──
+#
+# A command that opens a native OS dialog or menu (prompt_open_file, delete_file,
+# context_menu, ...) blocks ST's main thread until a person dismisses it, so every
+# tool that goes through _on_main() times out. These two handlers never touch the
+# main thread: they run on the HTTP request thread and call Win32 on this process's
+# own windows (lib/native_windows.py), so they keep working while ST is blocked.
+
+_BLOCKED_AFTER_SECONDS = 2.0
+
+
+def _sublime_process_id():
+    """Plugins run in a plugin-host process; the native windows belong to sublime_text.exe."""
+    return native_windows.sublime_pid(os.getpid(), os.getppid())
+
+
+def _native_window_pids():
+    """Both processes whose windows matter: sublime_text.exe and this plugin host.
+
+    A command of Sublime's own opens its dialog in sublime_text.exe, but a package that raises one
+    from Python (sublime.ok_cancel_dialog, a ctypes ChooseColorW, ...) creates it in the plugin-host
+    process. Listing only sublime_text.exe made those invisible: measured 2026-11-08, ColorHelper's
+    colour picker was alive in plugin_host-3.14 while list_native_windows reported no dialog, so it
+    could not be dismissed and a blocked callback looked like a hang. Other plugin hosts (the 3.3
+    one) are still not covered."""
+    st = native_windows.sublime_pid(os.getpid(), os.getppid())
+    return [st] if st == os.getpid() else [st, os.getpid()]
+
+
+def _list_native_windows(body):
+    if not native_windows.SUPPORTED:
+        return {"error": "list_native_windows is implemented for Windows only. Here, look at the screen; under "
+                         "WSL (WSLg) a computer-use client lists the dialog as a window titled ' (Ubuntu)', "
+                         "reads it with an image snapshot and clicks its button."}
+    started = _in_flight_dispatch.get("started")
+    label = _in_flight_dispatch.get("label")
+    running_for = round(time.time() - started, 1) if started else None
+    blocked = bool(running_for is not None and running_for > _BLOCKED_AFTER_SECONDS)
+    result = {
+        "windows": native_windows.list_windows(_native_window_pids()),
+        "main_thread_blocked": blocked,
+        "dispatch_running_seconds": running_for,
+    }
+    if blocked:
+        result["blocked_by"] = label
+    return result
+
+
+def _dismiss_native_window(body):
+    if not native_windows.SUPPORTED:
+        return {"error": "dismiss_native_window is implemented for Windows only. Here, answer the dialog on the "
+                         "screen; under WSL (WSLg) a computer-use client can click its button."}
+    hwnd = body.get("hwnd")
+    try:
+        hwnd = int(hwnd) if hwnd is not None else None
+    except (TypeError, ValueError):
+        return {"error": "hwnd must be an integer from list_native_windows"}
+    return native_windows.dismiss(
+        _native_window_pids(),
+        hwnd=hwnd,
+        action=body.get("action") or ("button" if body.get("button") else "cancel"),
+        button_text=body.get("button"),
+    )
+
+
+_POST["/list_native_windows"] = _list_native_windows
+_POST["/dismiss_native_window"] = _dismiss_native_window
+
+
+def _ui_screenshot(body):
+    """PNG of one window of this Sublime Text process, returned as an MCP image."""
+    if not native_windows.SUPPORTED:
+        return {"error": "ui_screenshot is implemented for Windows only"}
+    from .lib import ui_input
+    pid = _sublime_process_id()
+    wins = native_windows.list_windows(pid)
+    hwnd = body.get("hwnd")
+    title = str(body.get("window_title") or "").strip()
+    kind = str(body.get("kind") or "").strip().lower()
+    matched = None
+    if hwnd is None and (title or kind):
+        hits = [w for w in wins
+                if (not title or title.lower() in (w.get("title") or "").lower())
+                and (not kind or w["kind"] == kind)]
+        if not hits:
+            what = " and ".join(x for x in ("a title containing {!r}".format(title) if title else "",
+                                            "kind {!r}".format(kind) if kind else "") if x)
+            return {"error": "no window of Sublime Text has " + what,
+                    "windows": [{"hwnd": w["hwnd"], "title": w["title"], "kind": w["kind"]} for w in wins]}
+        hwnd, matched = hits[0]["hwnd"], hits[0]["title"] or hits[0]["kind"]
+    popups = []
+    if hwnd is None:
+        editors = [w for w in wins if w["kind"] == "editor_window"]
+        if not editors:
+            return {"error": "no editor window found; pass hwnd from list_native_windows"}
+        hwnd = editors[0]["hwnd"]
+        # A dialog or menu in front of the editor is not in this picture: say so.
+        popups = [{"hwnd": w["hwnd"], "kind": w["kind"], "title": w["title"]}
+                  for w in wins if w["kind"] in ("dialog", "menu")]
+    tab = body.get("tab")
+    tab_name = None
+    previous = []
+    settle = body.get("settle_ms", 200)
+    if tab not in (None, ""):
+        # Show the named tab for the picture, then put back the tab that was in front
+        # (the tab is looked up in the active window). Switching tabs moves the person's own
+        # focus for a moment, so, like ui_click, wait for them to stop typing first.
+        try:
+            idle_need = float(body.get("min_idle_s", 3))
+        except (TypeError, ValueError):
+            idle_need = 3.0
+        idle = ui_input.wait_for_idle(idle_need, body.get("wait_idle_s", 10))
+        if idle < idle_need:
+            return {"error": "the person at the computer is typing or using the mouse (idle {:.1f}s, need "
+                             "{:.1f}s); switching tabs now would send their keys to another tab. Try again, "
+                             "pass wait_idle_s to wait longer, or leave out tab".format(idle, idle_need),
+                    "idle_seconds": round(idle, 1)}
+        def show_tab():
+            w = sublime.active_window()
+            name, index = (None, int(tab)) if str(tab).strip().isdigit() else (str(tab), -1)
+            v, err = _resolve_view(w, name, index)
+            if err:
+                return err
+            group, _ = w.get_view_index(v)
+            prior_in_group = w.active_view_in_group(group)
+            prior = w.active_view()
+            w.focus_view(v)
+            return {"view": v, "restore": [x for x in (prior_in_group, prior) if x is not None],
+                    "window": w, "name": _view_display_name(v)}
+        shown = _on_main(show_tab)
+        if "error" in shown:
+            return shown
+        tab_name = shown["name"]
+        previous = shown["restore"]
+        settle = max(int(settle), 350)
+    try:
+        res = ui_input.screenshot(pid, hwnd, settle, body.get("region"), body.get("scale"), body.get("max_width"))
+    finally:
+        if previous:
+            def put_back():
+                for v in previous:
+                    if v.is_valid():
+                        sublime.active_window().focus_view(v)
+            _on_main(put_back)
+    if "png" not in res:
+        return res
+    info = {"hwnd": int(hwnd), "width": res["width"], "height": res["height"]}
+    if matched:
+        info["window_title"] = matched
+    if popups:
+        info["open_popups_not_in_picture"] = popups  # pass kind='dialog' or 'menu', or its hwnd
+    if tab_name:
+        info["tab"] = tab_name
+    saved = None
+    save_dir = body.get("save_dir")
+    if save_dir:
+        if not os.path.isabs(str(save_dir)):
+            return {"error": "save_dir must be an absolute folder path"}
+        day = os.path.join(str(save_dir), time.strftime("%Y-%m-%d"))
+        os.makedirs(day, exist_ok=True)
+        saved = os.path.join(day, "window_{}_{}.png".format(int(hwnd), int(time.time() * 1000)))
+        with open(saved, "wb") as f:
+            f.write(res["png"])
+        info["saved_path"] = saved
+    if body.get("inline", True):
+        import base64
+        return [{"type": "image", "data": base64.b64encode(res["png"]).decode("ascii"), "mimeType": "image/png"},
+                {"type": "text", "text": json.dumps(info)}]  # image first
+    if saved:
+        info["path"] = saved
+        return info
+    import tempfile
+    folder = os.path.join(tempfile.gettempdir(), "sublime-mcp-ui")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "window_{}_{}.png".format(int(hwnd), int(time.time() * 1000)))
+    with open(path, "wb") as f:
+        f.write(res["png"])
+    # keep the folder small: drop pictures older than an hour
+    for name in os.listdir(folder):
+        fp = os.path.join(folder, name)
+        try:
+            if name.endswith(".png") and time.time() - os.path.getmtime(fp) > 3600:
+                os.remove(fp)
+        except OSError:
+            pass
+    info["path"] = path
+    return info
+
+
+def _ui_press_key(body):
+    """Send one key to one window of this Sublime Text process."""
+    if not native_windows.SUPPORTED:
+        return {"error": "ui_press_key is implemented for Windows only"}
+    from .lib import ui_input
+    pid = _sublime_process_id()
+    hwnd = body.get("hwnd")
+    if hwnd is None:
+        wins = [w for w in native_windows.list_windows(pid) if w["kind"] == "editor_window"]
+        if not wins:
+            return {"error": "no editor window found; pass hwnd from list_native_windows"}
+        hwnd = wins[0]["hwnd"]
+    key = body.get("key")
+    if not key:
+        return {"error": "key is required, for example 'Return', 'Down', 'a', 'F5'"}
+    return ui_input.press_key(pid, hwnd, key, body.get("mods"), body.get("method") or "post", body.get("settle_ms", 150), body.get("min_idle_s", 8), body.get("wait_idle_s", 0))
+
+
+_POST["/ui_screenshot"] = _ui_screenshot
+_POST["/ui_press_key"] = _ui_press_key
+
+
+def _ui_type_text(body):
+    """Type text into one window of this Sublime Text process."""
+    if not native_windows.SUPPORTED:
+        return {"error": "ui_type_text is implemented for Windows only"}
+    from .lib import ui_input
+    pid = _sublime_process_id()
+    hwnd = body.get("hwnd")
+    if hwnd is None:
+        wins = [w for w in native_windows.list_windows(pid) if w["kind"] == "editor_window"]
+        if not wins:
+            return {"error": "no editor window found; pass hwnd from list_native_windows"}
+        hwnd = wins[0]["hwnd"]
+    if body.get("text") is None:
+        return {"error": "text is required"}
+    return ui_input.type_text(pid, hwnd, body.get("text"), body.get("settle_ms", 150))
+
+
+_POST["/ui_type_text"] = _ui_type_text
+
+
+def _ui_click(body):
+    """Click in one window of this Sublime Text process with the real mouse (gated)."""
+    if not native_windows.SUPPORTED:
+        return {"error": "ui_click is implemented for Windows only"}
+    from .lib import ui_input
+    pid = _sublime_process_id()
+    hwnd = body.get("hwnd")
+    if hwnd is None:
+        wins = [w for w in native_windows.list_windows(pid) if w["kind"] == "editor_window"]
+        if not wins:
+            return {"error": "no editor window found; pass hwnd from list_native_windows"}
+        hwnd = wins[0]["hwnd"]
+    if body.get("x") is None or body.get("y") is None:
+        return {"error": "x and y are required (pixels in the picture ui_screenshot returns)"}
+    return ui_input.click(pid, hwnd, body.get("x"), body.get("y"), body.get("button") or "left",
+                          bool(body.get("double")), body.get("min_idle_s", 8), body.get("settle_ms", 250), body.get("wait_idle_s", 0))
+
+
+_POST["/ui_click"] = _ui_click
+
+
+def _ui_hover(body):
+    """Hover the real pointer over a point of one window (gated), optionally with a picture."""
+    if not native_windows.SUPPORTED:
+        return {"error": "ui_hover is implemented for Windows only"}
+    from .lib import ui_input
+    pid = _sublime_process_id()
+    hwnd = body.get("hwnd")
+    if hwnd is None:
+        wins = [w for w in native_windows.list_windows(pid) if w["kind"] == "editor_window"]
+        if not wins:
+            return {"error": "no editor window found; pass hwnd from list_native_windows"}
+        hwnd = wins[0]["hwnd"]
+    if body.get("x") is None or body.get("y") is None:
+        return {"error": "x and y are required (pixels in the picture ui_screenshot returns)"}
+    res = ui_input.hover(pid, hwnd, body.get("x"), body.get("y"), body.get("dwell_ms", 900),
+                         body.get("hold_ms", 0), bool(body.get("screenshot")), body.get("min_idle_s", 8), body.get("wait_idle_s", 0),
+                         {"region": body.get("region"), "scale": body.get("scale"), "max_width": body.get("max_width")})
+    shot = res.pop("shot", None)
+    if shot is not None:
+        if "png" not in shot:
+            res["screenshot_error"] = shot.get("error")
+        elif body.get("inline", True):
+            # The picture itself, first in the reply, like ui_screenshot.
+            import base64
+            return [{"type": "image", "data": base64.b64encode(shot["png"]).decode("ascii"), "mimeType": "image/png"},
+                    {"type": "text", "text": json.dumps(res)}]
+        else:
+            import tempfile
+            folder = os.path.join(tempfile.gettempdir(), "sublime-mcp-ui")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, "hover_{}_{}.png".format(int(hwnd), int(time.time() * 1000)))
+            with open(path, "wb") as f:
+                f.write(shot["png"])
+            res["path"] = path
+    return res
+
+
+_POST["/ui_hover"] = _ui_hover
+
+
+# (name, description, inputSchema, handler)
+_MCP_TOOLS = [
+    # ── batch execution ───────────────────────────────────────────────────────
+    ("batch",
+     "Run multiple sublime-mcp tool calls in a single request instead of paying a\n"
+     "separate HTTP round trip per call. Each call still does its own main-thread\n"
+     "work independently: the batch is not wrapped in one shared main-thread\n"
+     "dispatch, so a slow or polling call cannot freeze the UI for the rest of\n"
+     "the batch. Use this whenever you need more than one piece of editor state\n"
+     "at once (e.g. get_active_file + get_selection + get_cursor_context), or\n"
+     "want to chain several edits/reads together.\n"
+     "calls: list of {tool: <tool name>, args: <object, optional>}. Cannot call 'batch' itself.\n"
+     "Max 50 calls per batch.\n"
+     "Returns {results: [...]} — one entry per call, in order; failed calls return {error: ...}\n"
+     "instead of aborting the whole batch.",
+     {"type": "object", "properties": {
+         "calls": {
+             "type": "array",
+             "maxItems": 50,
+             "items": {
+                 "type": "object",
+                 "properties": {
+                     "tool": {"type": "string"},
+                     "args": {"type": "object"},
+                 },
+                 "required": ["tool"],
+             },
+         },
+     }, "required": ["calls"]},
+     _batch),
+    ("discover_tools",
+     "Find advanced Sublime tools hidden from the default tool surface. With no arguments "
+     "it lists the top-level categories; category=<path> opens a category (then a subcategory, "
+     "which lists its tools with schemas); query=<words> searches all tools. Invoke a result "
+     "through batch(calls=[{tool: <name>, args: {...}}]), including for a single call.",
+     {"type": "object", "properties": {
+         "category": {"type": "string", "description": "Category path, such as editing or editing/lines. Empty lists the categories."},
+         "query": {"type": "string", "description": "Words to search for, such as bookmarks, tabs, syntax, or commands."},
+         "limit": {"type": "integer", "default": 10},
+     }},
+     _discover_tools),
+    ("project_search",
+     "Search project files with Sublime Text's native Find in Files engine and return "
+     "structured {path,line,col,text} matches. This is the preferred project search tool.",
+     {"type": "object", "properties": {
+         "pattern": {"type": "string"},
+         "where": {"type": "string", "description": "ST Where expression; empty uses current project folders."},
+         "case_sensitive": {"type": "boolean", "default": False},
+         "regex": {"type": "boolean", "default": False},
+         "whole_word": {"type": "boolean", "default": False},
+         "limit": {"type": "integer", "default": 200},
+         "timeout": {"type": "number", "default": 30},
+         "show_panel": {"type": "boolean", "default": False},
+     }, "required": ["pattern"]},
+     _project_search),
+    ("claim_resource",
+     "Announce intent to use a shared Sublime Text singleton (the native input panel, the "
+     "Control Panel, or any other resource name agents agree on) for a short multi-step "
+     "sequence, so other agents sharing this Sublime Text instance can avoid colliding with "
+     "it. Advisory only -- nothing enforces it except callers checking it, the same trust "
+     "level as every other tool here. Returns {error: 'busy', holder, note, expires_in} if "
+     "already claimed; call release_resource as soon as the sequence finishes.",
+     {"type": "object", "properties": {
+         "resource": {"type": "string", "description": "Name of the shared resource, e.g. 'input_panel' or 'control_panel'."},
+         "holder": {"type": "string", "description": "A short, stable label identifying who is claiming it."},
+         "note": {"type": "string", "description": "What the holder is doing, e.g. 'filling Goto Line'."},
+         "ttl_seconds": {"type": "number", "default": 60, "description": "Auto-expiry; max 600."},
+         "force": {"type": "boolean", "default": False, "description": "Take the claim even if already held (recovery only)."},
+     }, "required": ["resource", "holder"]},
+     _p("/claim_resource")),
+    ("release_resource",
+     "Release a claim taken with claim_resource before its TTL expires. Only the current "
+     "holder (same 'holder' value) can release it.",
+     {"type": "object", "properties": {
+         "resource": {"type": "string"},
+         "holder": {"type": "string"},
+     }, "required": ["resource", "holder"]},
+     _p("/release_resource")),
+    ("list_claims",
+     "List every currently live (non-expired) resource claim, so an agent can check whether "
+     "a shared singleton is in use before starting its own multi-step sequence on it.",
+     {"type": "object", "properties": {}},
+     _p("/list_claims")),
+    # ── no-parameter GET tools ────────────────────────────────────────────────
+    ("get_active_file",
+     "Return the active file's path, content, cursor line/col, dirty flag, and syntax name. "
+     "Content is cut at 20000 characters by default (truncated: true, size = the full length, with a "
+     "note); pass max_chars to change the cut, or 0 for the whole file. Read a slice of any tab with "
+     "get_view_chars.",
+     {"type": "object", "properties": {
+         "max_chars": {"type": "integer", "default": 20000,
+                       "description": "Most characters of content to return; 0 = no limit."},
+     }},
+     _g("/active_file")),
+    ("get_selection",
+     "Return the current selection(s): text and begin/end line+col for each.",
+     {}, _g("/selection")),
+    ("get_open_files",
+     "List all files open in the current window (path, name, is_dirty).",
+     {}, _g("/open_files")),
+    ("get_sheets",
+     "List ALL sheets (tabs) in the current window by index, including images and untitled buffers.\n"
+     "Returns identity, group position, selection/focus state, type, path, name, and dirty state.\n"
+     "Use index with get_sheet_content to read a specific tab.\n"
+     "Every tab also carries its full settings (over 100 keys); pass settings=false to leave them out.\n"
+     "The reply also lists every window (id, folders, tab count, which is active); pass "
+     "window=<id> to list another one. A command that opens a new window (open_folder, "
+     "PackageDev's Create Package) makes it active and empty, so check that array before "
+     "concluding nothing happened.",
+     {"type": "object", "properties": {
+         "settings": {"type": "boolean", "default": True,
+                      "description": "Include each tab's full settings dict (default true). "
+                                     "false gives a compact list."},
+         "window": {"type": "integer",
+                    "description": "List this window by id from the reply's windows array "
+                                   "(default: the active window)."}}},
+     _g("/sheets")),
+    ("get_selected_sheets",
+     "Return the currently multi-selected sheets, optionally limited to one group, with stable IDs and group positions.",
+     {"type": "object", "properties": {"group": {"type": "integer", "minimum": 0}}},
+     _g("/selected_sheets")),
+    ("get_sheet_index",
+     "Return a sheet's current group and index within that group. Identify it by global index or stable sheet ID.",
+     {"type": "object", "properties": {
+         "index": {"type": "integer", "minimum": 0},
+         "id": {"type": "integer"},
+     }},
+     _g("/sheet_index")),
+    ("get_project_folders", "Return the project's root folder paths.", {}, _g("/project_folders")),
+    ("get_symbols", "Return all symbols (functions, classes, etc.) in the active file with line numbers.", {}, _g("/symbols")),
+    ("get_project_data", "Return the raw .sublime-project JSON data for the current project.", {}, _g("/project_data")),
+    ("get_variables", "Return Sublime Text's build variables: $file, $project_path, $platform, etc.", {}, _g("/variables")),
+    ("get_active_panel", "Return the active panel id and, if it is an output panel, its content.", {}, _g("/active_panel")),
+    ("get_syntaxes", "List all syntax definitions available in Sublime Text (name + path).", {}, _g("/syntaxes")),
+    ("get_encoding", "Return the character encoding of the active file.", {}, _g("/encoding")),
+    ("get_scope_at_cursor", "Return the full syntax scope string at the cursor position.", {}, _g("/scope_at_cursor")),
+    ("get_word_at_cursor", "Return the word under the cursor and its line/col.", {}, _g("/word_at_cursor")),
+    ("get_bookmarks", "Return all bookmarked positions in the active file.", {}, _g("/bookmarks")),
+    ("get_line_count", "Return the total number of lines in the active file.", {}, _g("/line_count")),
+    ("get_layout", "Return the current window layout (groups, cells) and which files are in each group.", {}, _g("/layout")),
+    # ── no-parameter POST tools ───────────────────────────────────────────────
+    ("save_all", "Save all open files.", {}, _p("/save_all")),
+    ("revert_file",
+     "Revert a file to its last saved state, discarding unsaved changes. Pass name (partial, "
+     "case-insensitive; refused if it fits several tabs) or index (0-based, from get_open_files); "
+     "with neither it reverts the active tab, so name the tab you mean. Asks the person first.",
+     {"type": "object", "properties": {
+         "name": {"type": "string", "default": ""},
+         "index": {"type": "integer", "default": -1},
+     }},
+     _p("/revert_file")),
+    ("undo", "Undo the last edit in the active file.", {}, _p("/undo")),
+    ("redo", "Redo the last undone edit in the active file.", {}, _p("/redo")),
+    ("duplicate_line", "Duplicate the current line(s) in the active file.", {}, _p("/duplicate_line")),
+    ("toggle_sidebar", "Show or hide the Sublime Text sidebar.", {}, _p("/toggle_sidebar")),
+    ("unselect_others", "Collapse tab multi-selection to the focused sheet.", {}, _p("/unselect_others")),
+    ("unselect_to_left", "Remove sheets left of the focused sheet from the tab multi-selection.", {}, _p("/unselect_to_left")),
+    ("unselect_to_right", "Remove sheets right of the focused sheet from the tab multi-selection.", {}, _p("/unselect_to_right")),
+    ("select_to_left", "Add the sheet left of the focused sheet to the tab multi-selection.", {}, _p("/select_to_left")),
+    ("select_to_right", "Add the sheet right of the focused sheet to the tab multi-selection.", {}, _p("/select_to_right")),
+    ("focus_to_left", "Move input focus to the selected sheet on the left.", {}, _p("/focus_to_left")),
+    ("focus_to_right", "Move input focus to the selected sheet on the right.", {}, _p("/focus_to_right")),
+    # ── parameterized GET tools ───────────────────────────────────────────────
+    ("get_cursor_context",
+     "Return `lines` lines above and below the cursor with 1-based line numbers prepended.",
+     {"type": "object", "properties": {"lines": {"type": "integer", "default": 10}}},
+     _g("/cursor_context")),
+    ("get_sheet_content",
+     "Return the content of any tab by its sheet index (from get_sheets).\n"
+     "Works for text tabs including untitled buffers and Terminus tabs.\n"
+     "For image tabs returns the file path and content_base64 (base64-encoded image data).",
+     {"type": "object", "properties": {"index": {"type": "integer"}}, "required": ["index"]},
+     _g("/sheet_content")),
+    ("get_file_content",
+     "Return the full content of an already-open file by its path.",
+     {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+     _g("/file_content")),
+    ("get_view_content",
+     "Return the full content of any open tab by name (partial match, case-insensitive).\n"
+     "Works for Terminus tabs and other nameless views that have no file path.\n"
+     "Use index (0-based, from get_open_files) to target a tab by position instead of name.\n"
+     "Omit both to read the active view.",
+     {"type": "object", "properties": {
+         "name": {"type": "string", "default": ""},
+         "index": {"type": "integer", "default": -1},
+     }},
+     _g("/view_content")),
+    ("get_view_size",
+     "Return the total character count of any open tab by name (partial match, case-insensitive).\n"
+     "Use before get_view_chars to compute offsets. Pass name, or index (0-based, from get_open_files); "
+     "omit both for the active view.",
+     {"type": "object", "properties": {
+         "name": {"type": "string", "default": ""},
+         "index": {"type": "integer", "default": -1},
+     }},
+     _g("/view_size")),
+    ("get_view_chars",
+     "Return text at character offsets begin..end (0-based, end exclusive) from any open tab.\n"
+     "Clamps to buffer bounds automatically. Pass name, or index (0-based, from get_open_files); "
+     "omit both for the active view.",
+     {"type": "object", "properties": {
+         "begin": {"type": "integer"},
+         "end": {"type": "integer"},
+         "name": {"type": "string", "default": ""},
+         "index": {"type": "integer", "default": -1},
+     }, "required": ["begin", "end"]},
+     _g("/view_chars")),
+    ("get_view_phantoms",
+     "Return phantom HTML and extracted text from a view by name.\n"
+     "Sublime has no API to list phantoms, so this sees only phantom sets that a plugin keeps in a "
+     "module-level _phantom_sets dict (view id -> PhantomSet), as GhostShell does; phantoms added any other "
+     "way are not listed.\n"
+     "If key is omitted, returns phantoms for all keys. Output can be huge for a view with hundreds "
+     "of phantoms (a GhostShell omp tab: about 290 KB): html=false drops the HTML and the empty "
+     "spacer phantoms, last=N keeps only the newest N, max_chars cuts each text. One phantom can be "
+     "very long (omp's /changelog is a single phantom of about 60,000 characters): read it in slices "
+     "with offset (characters to skip) and max_chars (slice size); text_length is the full length, "
+     "and a cut text ends with how many characters are left.",
+     {"type": "object", "properties": {
+         "name": {"type": "string", "default": ""},
+         "key": {"type": "string", "default": ""},
+         "last": {"type": "integer", "default": 0, "description": "Keep only the newest N phantoms (0 = all)."},
+         "html": {"type": "boolean", "default": True, "description": "false: leave out the HTML and empty phantoms."},
+         "max_chars": {"type": "integer", "default": 0, "description": "Cut each phantom's text to this length (0 = no cut)."},
+         "offset": {"type": "integer", "default": 0, "description": "Skip this many characters at the start of each phantom's text, then apply max_chars: reads a long phantom in slices."},
+     }},
+     _g("/view_phantoms")),
+    ("get_view_regions",
+     "Return the regions a plugin stored in a view under a region key (view.add_regions): begin, "
+     "end and the first 80 characters of each. Sublime cannot list the keys, so name them: one key "
+     "or several separated by commas (for example 'ifdef,ifdeferror' for the Simple Ifdef package). "
+     "Use it to check what a highlighting plugin drew without a screenshot. Omit name for the "
+     "active view.",
+     {"type": "object", "properties": {
+         "key": {"type": "string", "description": "Region key, or several separated by commas."},
+         "name": {"type": "string", "default": ""},
+     }, "required": ["key"]},
+     _g("/view_regions")),
+    ("get_output_panel",
+     "Return the text content of an output panel.\n"
+     "If name is omitted, read the active output panel. Use name='exec' for build output.\n"
+     "Use name='Console' to read Sublime's built-in console through the best available backend; "
+     "for the console, force_focus=true raises the window first (needed for a complete read "
+     "when the window is not in front; the raise can fail while the user is typing, and then "
+     "nothing is sent).",
+     {"type": "object", "properties": {
+         "name": {"type": "string", "default": ""},
+         "force_focus": {"type": "boolean", "default": False},
+     }},
+     _g("/output_panel")),
+    ("lookup_symbol",
+     "Find where a symbol is defined across all open files.",
+     {"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"]},
+     _g("/lookup_symbol")),
+    ("get_command_palette",
+     "List Command Palette entries from installed *.sublime-commands resources.\n"
+     "Optional filters: package, command id, or caption substring.",
+     {"type": "object", "properties": {
+         "package": {"type": "string", "default": ""},
+         "command": {"type": "string", "default": ""},
+         "caption": {"type": "string", "default": ""},
+     }},
+     _g("/command_palette")),
+    ("get_commands",
+     "List runnable Sublime command ids from loaded command classes, optionally enriched\n"
+     "with matching Command Palette entries from installed packages.",
+     {"type": "object", "properties": {
+         "package": {"type": "string", "default": ""},
+         "command": {"type": "string", "default": ""},
+         "include_palette": {"type": "boolean", "default": True},
+     }},
+     _g("/commands")),
+    ("get_menu_items",
+     "List installed menu items from *.sublime-menu resources.\n"
+     "Optional filters: menu filename, caption substring, or command id substring.",
+     {"type": "object", "properties": {
+         "menu": {"type": "string", "default": ""},
+         "caption": {"type": "string", "default": ""},
+         "command": {"type": "string", "default": ""},
+     }},
+     _g("/menu_items")),
+    ("click_menu_item",
+     "Run an installed menu item by its caption path, e.g. path='Tools > Command Palette...' "
+     "(the end of the path is enough if it is unique). Reads the *.sublime-menu resources and "
+     "runs the item's command and args, as a click would; the native menu is never opened. "
+     "Most built-in items have no caption in the menu file; address them by command name, e.g. "
+     "'Selection > select_all'. Errors with the candidates if several items match. The result names the scope used "
+     "(window, text or application); pass scope to override it for built-in commands.",
+     {"type": "object", "properties": {
+         "path": {"type": "string", "description": "Captions joined by '>', e.g. 'Tools > Command Palette...'."},
+         "scope": {"type": "string", "enum": ["window", "text", "application"]}},
+      "required": ["path"]},
+     _p("/click_menu_item")),
+    ("get_console",
+     "Read Sublime Text's built-in console. mode='auto' prefers a complete visible-console "
+     "capture and falls back to the reload-safe prospective capture; mode='visible' requires "
+     "a complete capture; mode='captured' is non-invasive but contains only messages observed "
+     "since capture began. Results include source and complete metadata. The visible capture "
+     "clicks in the console and copies it, so it only runs when this Sublime window is in front "
+     "(otherwise it fails at once and changes nothing); "
+     "force_focus=true raises it first (it takes the keyboard focus, and can fail while the "
+     "user is typing; the capture then sends no input and says so). A read takes about "
+     "150 ms. "
+     "tail=N keeps the last N entries (captured) or the last N lines (visible; the result then "
+     "has lines_total and truncated); tail=0 returns everything.",
+     {"type": "object", "properties": {
+         "mode": {"type": "string", "enum": ["auto", "visible", "captured"], "default": "auto"},
+         "tail": {"type": "integer", "default": 200},
+         "force_focus": {"type": "boolean", "default": False},
+     }},
+     _g("/console")),
+    ("get_console_log",
+     "Compatibility tool for reload-safe prospective console capture.\n"
+     "tail=N limits to the last N entries; tail=0 returns all retained entries.\n"
+     "Prefer get_console(mode='captured') for explicit completeness metadata.",
+     {"type": "object", "properties": {"tail": {"type": "integer", "default": 100}}},
+     _g("/console_log")),
+    ("get_console_full",
+     "Compatibility alias for a complete visible-console capture.\n"
+     "Currently supported on Windows; prefer get_console(mode='visible').",
+     {},
+     _g("/console_full")),
+    ("get_console_win",
+     "Windows complete-console backend using reversible UI automation. Restores the previous "
+     "panel, editor focus, pointer position, and text clipboard. Prefer get_console(mode='auto').",
+     {},
+     _g("/console_win")),
+    # ── parameterized POST tools ──────────────────────────────────────────────
+    ("add_folder",
+     "Add a folder to the current project.",
+     {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+     _mcp_add_folder),
+    ("remove_folder",
+     "Remove a folder from the current project by path.",
+     {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+     _mcp_remove_folder),
+    ("send_to_view",
+     "Send a string to any open tab by name (partial match, case-insensitive).\n"
+     "Inserts the text at the cursor of the resolved view using the standard insert command; returns an error if the view is read-only.\n"
+     "Use index (0-based, from get_open_files) to target a tab by position instead of name.\n"
+     "Omit both name and index to target the active view.",
+     {"type": "object", "properties": {
+         "text": {"type": "string"},
+         "name": {"type": "string", "default": ""},
+         "index": {"type": "integer", "default": -1},
+     }, "required": ["text"]},
+     _p("/send_to_view")),
+    ("select_sheets",
+     "Change native tab multi-selection across the window. Identify sheets by global indices or stable sheet IDs; optionally choose the focused sheet.",
+     {"type": "object", "properties": {
+         "indices": {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 1},
+         "ids": {"type": "array", "items": {"type": "integer"}, "minItems": 1},
+         "focus_index": {"type": "integer", "minimum": 0},
+         "focus_id": {"type": "integer"},
+     }},
+     _p("/select_sheets")),
+    ("focus_sheet",
+     "Move input focus to one sheet by global index or stable sheet ID without changing the selected sheet set.",
+     {"type": "object", "properties": {
+         "index": {"type": "integer", "minimum": 0},
+         "id": {"type": "integer"},
+         "settings": {"type": "boolean", "default": False,
+                      "description": "Include the sheet's view settings (about 7 KB) in the echo."},
+     }},
+     _p("/focus_sheet")),
+    ("set_sheet_index",
+     "Move one sheet to a group and position using Sublime's set_sheet_index API.",
+     {"type": "object", "properties": {
+         "index": {"type": "integer", "minimum": 0},
+         "id": {"type": "integer"},
+         "group": {"type": "integer", "minimum": 0},
+         "sheet_index": {"type": "integer", "minimum": 0},
+     }, "required": ["group", "sheet_index"]},
+     _p("/set_sheet_index")),
+    ("move_sheets_to_group",
+     "Move one or more sheets together to a group and optional insertion position, preserving native multi-selection when requested.",
+     {"type": "object", "properties": {
+         "indices": {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 1},
+         "ids": {"type": "array", "items": {"type": "integer"}, "minItems": 1},
+         "group": {"type": "integer", "minimum": 0},
+         "insertion_index": {"type": "integer", "minimum": -1, "default": -1},
+         "select": {"type": "boolean", "default": True},
+     }, "required": ["group"]},
+     _p("/move_sheets_to_group")),
+    ("open_file",
+     "Open a file in Sublime Text, optionally jumping to a specific line and column. Returns once the "
+     "file is loaded and is the active tab (active: true); if that takes longer than 3 s the answer is "
+     "pending: true with a note, so check get_sheets before typing into it.",
+     {"type": "object", "properties": {
+         "path": {"type": "string"},
+         "line": {"type": "integer", "default": 0},
+         "col": {"type": "integer", "default": 0},
+     }, "required": ["path"]},
+     _p("/open_file")),
+    ("goto_line",
+     "Move the cursor to a line (and optional column) in the active file.",
+     {"type": "object", "properties": {
+         "line": {"type": "integer"},
+         "col": {"type": "integer", "default": 1},
+     }, "required": ["line"]},
+     _p("/goto_line")),
+    ("show_panel",
+     "Bring an output panel to the front. Use name='exec' for the build panel.",
+     {"type": "object", "properties": {"name": {"type": "string", "default": "exec"}}},
+     _p("/show_panel")),
+    ("replace_selection",
+     "Replace the current selection(s) with text.",
+     {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+     _p("/replace_selection")),
+    ("replace_lines",
+     "Replace lines begin through end (inclusive, 1-based) in the active file with text.\n"
+     "Pass path to target a specific open file regardless of which tab is focused.\n"
+     "Use index (0-based, from get_open_files) to target a nameless tab by position.",
+     {"type": "object", "properties": {
+         "begin": {"type": "integer"},
+         "end": {"type": "integer"},
+         "text": {"type": "string"},
+         "path": {"type": "string", "default": ""},
+         "index": {"type": "integer", "default": -1},
+     }, "required": ["begin", "end", "text"]},
+     _p("/replace_lines")),
+    ("run_command",
+     "Run any Sublime Text command. scope='window' (default) or 'view'.\n"
+     "For scope='view'/'text', optionally target a specific tab with name "
+     "(partial, case-insensitive) or index (0-based, from get_open_files) "
+     "instead of whatever tab happens to be globally focused -- important "
+     "when another agent/session may be sharing this Sublime instance.\n"
+     "ok means the command was dispatched, not that it did anything: a command that "
+     "opens a dialog often does so a moment after this returns. Pass settle_ms "
+     "(for example 300) to wait up to that long and get any dialog that appeared in "
+     "the result as 'dialogs' (Windows; same fields as list_native_windows).",
+     {"type": "object", "properties": {
+         "command": {"type": "string"},
+         "args": {"type": "object"},
+         "scope": {"type": "string", "default": "window"},
+         "name": {"type": "string", "default": ""},
+         "index": {"type": "integer", "default": -1},
+         "settle_ms": {"type": "integer", "default": 0},
+     }, "required": ["command"]},
+     _p("/run_command")),
+    ("run_build",
+     "Trigger the current build system, or pass cmd/shell_cmd to run a specific command.",
+     {"type": "object", "properties": {
+         "cmd": {"type": "array", "items": {"type": "string"}},
+         "shell_cmd": {"type": "string"},
+         "working_dir": {"type": "string", "default": ""},
+     }},
+     _p("/run_build")),
+    ("set_status",
+     "Write a message to Sublime Text's status bar.",
+     {"type": "object", "properties": {
+         "value": {"type": "string"},
+         "key": {"type": "string", "default": "sublime_mcp"},
+     }, "required": ["value"]},
+     _p("/set_status")),
+    ("save_file",
+     "Save a file. Pass path to save a specific open file; omit path to save the active file. "
+     "Refuses with an error when the file's folder does not exist (nothing is created; make the folder "
+     "first). The result says saved: true once the tab is clean; saved: false with pending: true means "
+     "it is still modified after 1.5 s (a Save As dialog for an untitled tab, an 'Unable to save' "
+     "dialog, or a read-only file): look before repeating.",
+     {"type": "object", "properties": {"path": {"type": "string", "default": ""}}},
+     _p("/save_file")),
+    ("close_file",
+     "Close a tab: pass path (a saved file), name or index (a tab with no path). With none of the "
+     "three it refuses and lists the open tabs; it never closes the active tab, because the active "
+     "tab is whatever the person clicked last. "
+     "Routed through Sublime's real close command (not a direct API call), "
+     "so a host-side close-blocking hook gets a chance to run -- e.g. "
+     "GhostShell's ai_terminal package refuses this outright (no dialog, "
+     "just a no-op) for any ai_terminal tab, so calling this on one does "
+     "nothing rather than closing it. Only ever targets an already-open "
+     "view found by path, by name or by index. "
+     "For a tab with no path (unsaved buffer, scratch "
+     "view) pass name (partial, case-insensitive match on the tab's title) or "
+     "index (0-based, from get_open_files). "
+     "A name or index that matches nothing is an error and closes nothing; a name that fits several tabs is also refused "
+     "(the error lists them with their indexes) unless exactly one has that exact name. "
+     "A tab with unsaved edits normally raises Sublime's native \"Save Changes?\" dialog, which "
+     "blocks the main thread until someone answers it; pass discard=true to throw the unsaved "
+     "edits away and close at once (the result then says discarded). "
+     "The result says closed: true once the tab is gone; closed: false with pending: true means the tab "
+     "is still open after 1.5 s (a Save Changes dialog, even when get_sheets says is_dirty false, or a "
+     "host hook refused): do not repeat the call, each repeat raises another dialog. "
+     "(run_command 'close' with scope='view' does not close a tab: use this tool.)",
+     {"type": "object", "properties": {
+         "path": {"type": "string", "default": ""},
+         "name": {"type": "string", "default": ""},
+         "index": {"type": "integer", "default": -1},
+         "discard": {"type": "boolean", "default": False, "description": "Close without saving: unsaved edits are lost. Default false (Sublime asks)."},
+     }},
+     _p("/close_file")),
+    ("toggle_comment",
+     "Toggle line comment (or block comment if block=true) on the current selection.",
+     {"type": "object", "properties": {"block": {"type": "boolean", "default": False}}},
+     _p("/toggle_comment")),
+    ("sort_lines",
+     "Sort the selected lines (or all lines if nothing is selected).",
+     {"type": "object", "properties": {"case_sensitive": {"type": "boolean", "default": False}}},
+     _p("/sort_lines")),
+    ("select_lines",
+     "Select lines begin through end (1-based, inclusive). end defaults to begin.",
+     {"type": "object", "properties": {
+         "begin": {"type": "integer"},
+         "end": {"type": "integer", "default": 0},
+     }, "required": ["begin"]},
+     _p("/select_lines")),
+    ("fold_lines",
+     "Fold (collapse) lines begin through end (1-based) in the active file.",
+     {"type": "object", "properties": {
+         "begin": {"type": "integer"},
+         "end": {"type": "integer"},
+     }, "required": ["begin", "end"]},
+     _p("/fold_lines")),
+    ("insert_snippet",
+     "Insert a snippet at the cursor using Sublime Text's snippet syntax (e.g. $1 for tab stops).",
+     {"type": "object", "properties": {"contents": {"type": "string"}}, "required": ["contents"]},
+     _p("/insert_snippet")),
+    ("find_in_file",
+     "Find all occurrences of pattern in the active file. Returns list of {line, col, text}. "
+     "Does NOT open a panel — for Sublime's Find/Replace panels use run_command with show_panel (see the guide). "
+     "Use case_sensitive=True for case-sensitive match, regex=True to treat pattern as a "
+     "regular expression (Python re syntax).",
+     {"type": "object", "properties": {
+         "pattern": {"type": "string", "description": "Search string or regex pattern"},
+         "case_sensitive": {"type": "boolean", "default": False},
+         "regex": {"type": "boolean", "default": False},
+     }, "required": ["pattern"]},
+     _p("/find_in_file")),
+    ("next_result",
+     "Jump to the next find-in-files or build result. Visible in the view (cursor moves).",
+     {"type": "object", "properties": {}},
+     _p("/next_result")),
+    ("prev_result",
+     "Jump to the previous find-in-files or build result. Visible in the view (cursor moves).",
+     {"type": "object", "properties": {}},
+     _p("/prev_result")),
+    ("toggle_bookmark",
+     "Toggle a bookmark on the current line of the active view.",
+     {"type": "object", "properties": {}},
+     _p("/toggle_bookmark")),
+    ("next_bookmark",
+     "Move the cursor to the next bookmark in the active view.",
+     {"type": "object", "properties": {}},
+     _p("/next_bookmark")),
+    ("prev_bookmark",
+     "Move the cursor to the previous bookmark in the active view.",
+     {"type": "object", "properties": {}},
+     _p("/prev_bookmark")),
+    ("clear_bookmarks",
+     "Clear all bookmarks in the active view.",
+     {"type": "object", "properties": {}},
+     _p("/clear_bookmarks")),
+    ("select_all_bookmarks",
+     "Select every line containing a bookmark in the active view.",
+     {"type": "object", "properties": {}},
+     _p("/select_all_bookmarks")),
+    ("drive_input_panel",
+     "Fill and/or submit or cancel Sublime's currently open input panel "
+     "(window.show_input_panel), e.g. a package's 'Enter a path...' prompt.\n"
+     "Input panels have no reachable View through normal APIs and Enter is a "
+     "native keybinding, not a scriptable insert -- this reaches both, and "
+     "works even when the panel belongs to a legacy Python 3.3-hosted "
+     "package in a different plugin_host process, since it drives the panel "
+     "through Sublime's own built-in commands rather than that package's code.\n"
+     "text (optional): replace the panel's current content before acting. "
+     "action: 'submit' (default, fires on_done) or 'cancel' (fires on_cancel). "
+     "Errors if no input panel is currently open.\n"
+     "If several agents share this Sublime Text, call claim_resource with "
+     "resource='input_panel' before opening the panel and release_resource when "
+     "you are done, so another agent does not take the panel in between.",
+     {"type": "object", "properties": {
+         "text": {"type": "string"},
+         "action": {"type": "string", "default": "submit"},
+     }},
+     _p("/drive_input_panel")),
+    ("get_quick_panel",
+     "List the items of the quick panel that a package opened with window.show_quick_panel "
+     "(e.g. the Install Package picker), plus its flags and preselected index. Big pickers hold "
+     "thousands of items, so the result is a page: pass text to keep only items whose first line "
+     "contains it, limit (default 100, at most 1000) and offset; the result gives total, matched "
+     "and the original indexes of the items returned. Only sees panels opened by packages in "
+     "sublime-mcp's own plugin host (Python 3.8, 3.14 on builds 4213+); panels opened by packages "
+     "in the Python 3.3 host need \"install_py33_helper\": true in MCP Commander.sublime-settings "
+     "and a restart (the helper package loads at startup), and builds 4213+ also need "
+     "\"disable_plugin_host_3.3\": false. The command palette, Goto Anything and panels from a "
+     "host that cannot be read are not visible and give an error that says which case it is.",
+     {"type": "object", "properties": {
+         "text": {"type": "string", "description": "Keep only items whose first line contains this."},
+         "limit": {"type": "integer", "description": "Page size (default 100, at most 1000)."},
+         "offset": {"type": "integer", "description": "Skip this many matching items (default 0)."},
+         "wait_ms": {"type": "integer", "description": "Wait up to this long (at most 60000) for the panel to appear; "
+                                                       "use 15000 for Package Control's Install Package list, which "
+                                                       "loads for a while after Enter (default 0 = no waiting)."}}},
+     _p("/get_quick_panel")),
+    ("pick_quick_panel",
+     "Pick an item of the quick panel shown by get_quick_panel: by index, or by text (case-"
+     "insensitive match on the item's first line; must match exactly one item). index -1 cancels. "
+     "Closes the panel and runs the package's own selection callback. That callback runs after this "
+     "answers, so one that opens a native dialog cannot hold the request: the answer is pending: true "
+     "after 1 s (2 s for a panel from the Python 3.3 host) with a note, meaning the pick went through "
+     "and a dialog is blocking Sublime -- answer it with list_native_windows and "
+     "dismiss_native_window. A fast callback returns its real result.",
+     {"type": "object", "properties": {
+         "index": {"type": "integer", "description": "Item index, or -1 to cancel."},
+         "text": {"type": "string", "description": "Text of the item to pick."},
+         "wait_ms": {"type": "integer", "description": "Wait up to this long (at most 60000) for the panel to appear "
+                                                       "(15000 for the Install Package list); default 0."}}},
+     _p("/pick_quick_panel")),
+    ("set_syntax",
+     "Set the syntax of the active file by name (case-insensitive partial match is fine).",
+     {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+     _p("/set_syntax")),
+    ("set_encoding",
+     "Set the character encoding of the active file (e.g. 'UTF-8', 'Western (Windows 1252)').",
+     {"type": "object", "properties": {"encoding": {"type": "string"}}, "required": ["encoding"]},
+     _p("/set_encoding")),
+    ("get_setting",
+     "Get a Sublime Text setting by key. scope='view' (default) or 'window'.",
+     {"type": "object", "properties": {
+         "key": {"type": "string"},
+         "scope": {"type": "string", "default": "view"},
+     }, "required": ["key"]},
+     _p("/get_setting")),
+    ("set_setting",
+     "Set a Sublime Text setting by key. scope='view' (default) or 'window'. A view setting goes to "
+     "the tab given by name (partial, refused if it fits several tabs) or index (0-based, from "
+     "get_open_files); with neither it goes to the ACTIVE tab, so name the tab you mean.",
+     {"type": "object", "properties": {
+         "key": {"type": "string"},
+         "value": {},
+         "scope": {"type": "string", "default": "view"},
+         "name": {"type": "string", "default": ""},
+         "index": {"type": "integer", "default": -1},
+     }, "required": ["key", "value"]},
+     _p("/set_setting")),
+    ("focus_group",
+     "Move focus to a pane group by 0-based index.",
+     {"type": "object", "properties": {"group": {"type": "integer"}}, "required": ["group"]},
+     _p("/focus_group")),
+    ("set_layout",
+     "Set the window pane layout. layout must be a ST layout dict with cols, rows, cells keys.",
+     {"type": "object", "properties": {"layout": {"type": "object"}}, "required": ["layout"]},
+     _p("/set_layout")),
+    ("eval_python",
+     "Execute arbitrary Python in Sublime Text's main thread.\n"
+     "Locals: sublime, window, view, print. Returns captured stdout in 'output'.",
+     {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]},
+     _p("/eval_python")),
+    ("eval_python_latest",
+     "Execute Python code using the system Python interpreter outside Sublime Text's embedded sandbox.\n"
+     "Returns stdout, stderr, and returncode.",
+     {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]},
+     _p("/eval_python_latest")),
+    ("open_control_panel",
+     "Open (or focus) the Claude MCP Control Panel: an interactive minihtml dashboard "
+     "in a dedicated Sublime view, listing MCP servers with clickable Enable/Disable "
+     "toggle links. State persists on the view and the status line reflects changes.",
+     {"type": "object", "properties": {}},
+     _p("/open_control_panel")),
+    ("str_replace_based_edit_tool",
+     "ST-native file editor implementing the standard str_replace_based_edit_tool interface.\n"
+     "Edits appear live in Sublime Text with full undo (Ctrl+Z), gutter diff markers,\n"
+     "and 30-second highlight annotations showing what changed.\n\n"
+     "command='str_replace': replace old_str with new_str in path.\n"
+     "  old_str must match exactly once (whitespace-sensitive).\n"
+     "  Returns error if 0 or 2+ matches, listing ambiguous line numbers.\n\n"
+     "command='insert': insert insert_text after line insert_line (1-based).\n"
+     "  insert_line=0 inserts at the very start of the file.\n\n"
+     "command='create': create a new file at path with file_text content.\n"
+     "  Syntax is auto-detected from the file extension. Errors if path exists.\n\n"
+     "command='view': return file content with 1-based line numbers prepended.\n"
+     "  Optional view_range=[start, end] to read a slice (end=-1 for EOF).\n\n"
+     "All commands auto-open the file in ST if not already open.",
+     {"type": "object", "properties": {
+         "command": {"type": "string"},
+         "path": {"type": "string", "default": ""},
+         "old_str": {"type": "string"},
+         "new_str": {"type": "string"},
+         "insert_line": {"type": "integer"},
+         "insert_text": {"type": "string"},
+         "file_text": {"type": "string"},
+         "view_range": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
+     }, "required": ["command"]},
+     _p("/edit_file")),
+    ("get_package_mcp_info",
+     "Discover what an installed Sublime package can do, then just control it directly --\n"
+     "no separate MCP server needed. Primary workflow: call this for the package name, Read\n"
+     "the files it lists under python_files to find the package's real command-dispatch table\n"
+     "and settings (this tool's own commands/settings_keys are a starting point, not the full\n"
+     "picture -- a package that routes many actions through one command with an 'action' arg,\n"
+     "for example, only shows up here as that one wrapper command), then call the real thing\n"
+     "with run_command or eval_python. That loop -- discover, read source, call directly -- is\n"
+     "almost always enough on its own.\n"
+     "Returns: path, commands (with captions and args), settings_keys, python_files,\n"
+     "python_version_file (the package's .python-version, or null), loaded_in_this_host and\n"
+     "this_host_python (whether its commands/listeners are loaded in the same Python host as\n"
+     "sublime-mcp; false means another plugin host, no Python plugins, or still loading) and\n"
+     "host_note, plus\n"
+     "output_file/extension_template for the rare theoretical case where a standing,\n"
+     "independently-reachable MCP server is needed (e.g. a client with no eval_python-\n"
+     "equivalent of its own) -- write the extension to output_file following extension_template\n"
+     "and ST loads it automatically. A full audit of the real, current, popular Package Control\n"
+     "catalog (2026-09-14) found zero packages that actually needed this path -- treat it as a\n"
+     "documented escape hatch, not something to reach for by default.",
+     {"type": "object", "properties": {"package": {"type": "string"}}, "required": ["package"]},
+     _get_package_mcp_info),
+    ("get_help",
+     "Return the Agent Guide (AGENT_GUIDE.md) with detailed instructions on how to use sublime-mcp tools correctly. "
+     "Call this first if you are unsure how to save files, close tabs, or use eval_python. "
+     "The full guide is about 12 KB; section=<words from a heading> returns only the matching "
+     "section(s), and every result lists the section headings.",
+     {"type": "object", "properties": {"section": {
+         "type": "string",
+         "description": "Return only the sections whose heading contains this text, e.g. 'console'."}}},
+     _p("/get_help")),
+    ("list_native_windows",
+     "List the native OS windows, dialogs and menus of this Sublime Text process (Windows only): "
+     "kind (dialog, menu, editor_window, window), title, hwnd, and for dialogs their buttons and "
+     "message text. Works while a native dialog has BLOCKED Sublime's main thread (every other tool "
+     "then times out); the result says whether the main thread is blocked and which tool blocked it.",
+     {"type": "object", "properties": {}},
+     _p("/list_native_windows")),
+    ("dismiss_native_window",
+     "Dismiss a native dialog or menu of this Sublime Text process (Windows only), even while it "
+     "has blocked Sublime's main thread. action: 'cancel' (default; clicks Cancel/No or closes), "
+     "'ok' (clicks OK/Yes/the default button), 'button' (click the button named in 'button') or "
+     "'close'. hwnd defaults to the first dialog, then the first menu; take it from list_native_windows. "
+     "Acts only on windows of the Sublime Text process. 'ok' clicks OK/Yes/the default button, so "
+     "do not use it on a dialog whose labels you have not read: on a prompt it can mean "
+     "'Yes, enable telemetry'. Take the labels from list_native_windows and name one with "
+     "action 'button' when the choice matters; 'cancel' (the default) is the safe answer.",
+     {"type": "object", "properties": {
+         "hwnd": {"type": "integer", "description": "Window handle from list_native_windows (default: first dialog, then first menu)."},
+         "action": {"type": "string", "enum": ["cancel", "ok", "button", "close"], "description": "What to do (default: cancel, or button when 'button' is given)."},
+         "button": {"type": "string", "description": "Button label for action 'button' (ignores case and & mnemonics)."}}},
+     _p("/dismiss_native_window")),
+    ("ui_screenshot",
+     "Take a picture of one window of this Sublime Text process (Windows only). Returns the image "
+     "itself as an image block, first in the reply, followed by one text block with the size and "
+     "what was captured. Works for a window that is behind others or not focused, and for dialogs. "
+     "Choose the window with window_title (part of its title; an unmatched title lists the windows), "
+     "kind ('dialog' or 'menu' for an open native dialog or menu) or hwnd from list_native_windows; "
+     "default is the first editor window, and a dialog or menu open in front of it is then listed in "
+     "the reply as open_popups_not_in_picture. tab shows one tab for "
+     "the picture (part of its name, or its 0-based index in the active window) and puts the tab "
+     "that was in front back afterwards: use it to see a tab that is not in front. region crops, "
+     "scale zooms (2 doubles the size, to read small text) and max_width shrinks. save_dir (an "
+     "absolute folder) also keeps the PNG in a dated subfolder and reports saved_path. inline=false "
+     "returns only a file path. Only windows of Sublime Text itself can be captured, never another "
+     "program.",
+     {"type": "object", "properties": {
+         "hwnd": {"type": "integer", "description": "Window handle from list_native_windows (default: first editor window)."},
+         "window_title": {"type": "string", "description": "Capture the window whose title contains this text (case-insensitive), instead of giving hwnd."},
+         "kind": {"type": "string", "enum": ["editor_window", "dialog", "menu", "window", "other"], "description": "Capture the first window of this kind, for example 'dialog' for a native dialog that is open or 'menu' for an open menu (menus have no title). Combine with window_title to narrow it. When a dialog or menu is open and you name no window, the reply lists them as open_popups_not_in_picture."},
+         "tab": {"type": "string", "description": "Show this tab for the picture: part of its name, or digits for its 0-based index in the active window (for example '1'). The tab that was in front is restored."},
+         "min_idle_s": {"type": "number", "description": "With tab: required seconds since the person last used the keyboard or mouse (default 3), because switching tabs moves their focus."},
+         "wait_idle_s": {"type": "number", "description": "With tab: wait up to this many seconds (max 120) for the person to stop typing before giving up (default 10)."},
+         "scale": {"type": "number", "description": "Resize factor: 2 doubles the picture so small text is easier to read, 0.5 halves it (nearest-neighbour; the longest side is capped at 4096 pixels)."},
+         "max_width": {"type": "integer", "description": "Shrink the picture to at most this many pixels wide (never enlarges)."},
+         "save_dir": {"type": "string", "description": "Absolute folder: also save the PNG in a subfolder named by date and return saved_path."},
+         "inline": {"type": "boolean", "description": "Return the image itself (default true); false returns only a file path (temp file, or in save_dir when given)."},
+         "region": {"type": "object", "description": "Only this part of the window: {x, y, width, height} in pixels of the full window picture (top-left is 0, 0). Omit for the whole window.",
+                    "properties": {"x": {"type": "integer"}, "y": {"type": "integer"},
+                                   "width": {"type": "integer"}, "height": {"type": "integer"}}},
+         "settle_ms": {"type": "integer", "description": "Milliseconds to wait before the picture so earlier input has been handled (default 200, max 5000)."},}},
+     _p("/ui_screenshot")),
+    ("ui_press_key",
+     "Send one key press to one window of this Sublime Text process (Windows only), for example "
+     "Return in the command palette or Down in a quick panel. key: Return, Escape, Tab, Up, Down, "
+     "Left, Right, Home, End, PageUp, PageDown, Delete, Backspace, Space, F1-F24, or a single "
+     "character. mods: any of ctrl, shift, alt. method 'post' (default) posts the key to the window "
+     "without moving focus; 'input' brings the window to the front, sends real input, then restores "
+     "the previous foreground window. Only windows of Sublime Text itself accept input.",
+     {"type": "object", "properties": {
+         "key": {"type": "string", "description": "Key name or single character."},
+         "mods": {"type": "array", "items": {"type": "string", "enum": ["ctrl", "shift", "alt"]}, "description": "Modifier keys held during the press."},
+         "hwnd": {"type": "integer", "description": "Window handle from list_native_windows (default: first editor window)."},
+         "method": {"type": "string", "enum": ["post", "input"], "description": "post (default, no focus change, no modifier keys) or input (real keys, carry modifiers; needs the window in front and activates it with a real title-bar click only when the person is idle)."},
+         "min_idle_s": {"type": "number", "description": "For method input: required seconds since the person last used the mouse or keyboard (default 8); real keys are never sent while they are typing."},
+         "wait_idle_s": {"type": "number", "description": "Wait up to this many seconds (max 120) for the person to stop typing or moving the mouse before giving up (default 0 = refuse at once). Use it instead of retrying when they are busy."},
+         "settle_ms": {"type": "integer", "description": "Milliseconds to wait after the key so it has been handled (default 150, max 5000)."},},
+      "required": ["key"]},
+     _p("/ui_press_key")),
+    ("ui_type_text",
+     "Type text into one window of this Sublime Text process (Windows only), for example into the "
+     "command palette's search box or a quick panel's filter, without moving focus. A newline is "
+     "sent as Return. At most 2000 characters per call. Only windows of Sublime Text itself accept input.",
+     {"type": "object", "properties": {
+         "text": {"type": "string", "description": "The text to type."},
+         "settle_ms": {"type": "integer", "description": "Milliseconds to wait after typing so it has been handled (default 150, max 5000)."},
+         "hwnd": {"type": "integer", "description": "Window handle from list_native_windows (default: first editor window)."}},
+      "required": ["text"]},
+     _p("/ui_type_text")),
+    ("ui_click",
+     "Click in one window of this Sublime Text process (Windows only) with the REAL mouse, because "
+     "Sublime draws its own editor, command palette and popups and ignores posted mouse messages. "
+     "x, y are pixels in the picture ui_screenshot returns for the same window (top-left is 0, 0). "
+     "Because it moves the pointer of the person at the computer for a moment, it is REFUSED unless "
+     "they have been idle for min_idle_s seconds (default 8), and refused unless the target window is "
+     "the one under that point (another window in front would take the click). The pointer is "
+     "restored afterwards. To click inside an open popup menu or other native popup, pass that menu's own hwnd from list_native_windows (x, y then count from the menu's top-left corner; ui_screenshot of the menu hwnd shows it). Pass wait_idle_s to wait for a busy person instead of refusing. button: left (default) or right; double=true double-clicks. Prefer keys "
+     "(ui_press_key), pick_quick_panel and editor commands when they can do the job.",
+     {"type": "object", "properties": {
+         "x": {"type": "integer", "description": "Pixels from the left edge of the window picture."},
+         "y": {"type": "integer", "description": "Pixels from the top edge of the window picture."},
+         "hwnd": {"type": "integer", "description": "Window handle from list_native_windows (default: first editor window)."},
+         "button": {"type": "string", "enum": ["left", "right"], "description": "Mouse button (default left)."},
+         "double": {"type": "boolean", "description": "Double-click (default false)."},
+         "min_idle_s": {"type": "number", "description": "Required seconds since the person last used the mouse or keyboard (default 8)."},
+         "wait_idle_s": {"type": "number", "description": "Wait up to this many seconds (max 120) for the person to stop typing or moving the mouse before giving up (default 0 = refuse at once). Use it instead of retrying when they are busy."},
+         "settle_ms": {"type": "integer", "description": "Milliseconds to wait after the click (default 250, max 5000)."}},
+      "required": ["x", "y"]},
+     _p("/ui_click")),
+    ("ui_hover",
+     "Hold the REAL mouse pointer over a point of one window of this Sublime Text process (Windows "
+     "only) so hover popups and tooltips appear, optionally taking a picture while it is there "
+     "(screenshot=true returns the picture itself, image first; inline=false saves it and returns "
+     "the path; region, scale and max_width work as in ui_screenshot, so a small popup can be "
+     "cropped and zoomed), then put the pointer back. x, y are pixels in "
+     "the picture ui_screenshot returns. Same safety gates as ui_click: refused unless the person at "
+     "the computer has been idle for min_idle_s seconds (default 8) and the target window is the one "
+     "under that point. dwell_ms (default 900, max 5000) is how long to wait before the picture; a "
+     "language-server hover (LSP) can take a few seconds to appear, so use 3000 to 5000 for those "
+     "(tried: a 4500 ms dwell over a Python symbol showed the pyright popup).",
+     {"type": "object", "properties": {
+         "x": {"type": "integer", "description": "Pixels from the left edge of the window picture."},
+         "y": {"type": "integer", "description": "Pixels from the top edge of the window picture."},
+         "hwnd": {"type": "integer", "description": "Window handle from list_native_windows (default: first editor window)."},
+         "screenshot": {"type": "boolean", "description": "Take a picture while the pointer is there and return it (the image itself unless inline=false)."},
+         "inline": {"type": "boolean", "description": "With screenshot: return the image itself (default true); false saves a file and returns its path."},
+         "region": {"type": "object", "description": "With screenshot: only this part of the window picture: {x, y, width, height} in pixels.",
+                    "properties": {"x": {"type": "integer"}, "y": {"type": "integer"},
+                                   "width": {"type": "integer"}, "height": {"type": "integer"}}},
+         "scale": {"type": "number", "description": "With screenshot: resize factor (2 doubles the picture)."},
+         "max_width": {"type": "integer", "description": "With screenshot: shrink the picture to at most this many pixels wide."},
+         "dwell_ms": {"type": "integer", "description": "Milliseconds the pointer rests before the picture (default 900)."},
+         "hold_ms": {"type": "integer", "description": "Extra milliseconds to keep the pointer there afterwards (default 0)."},
+         "min_idle_s": {"type": "number", "description": "Required seconds since the person last used the mouse or keyboard (default 8)."},
+         "wait_idle_s": {"type": "number", "description": "Wait up to this many seconds (max 120) for the person to stop typing or moving the mouse before giving up (default 0 = refuse at once). Use it instead of retrying when they are busy."},},
+      "required": ["x", "y"]},
+     _p("/ui_hover")),
+    # ── Phase B batch 1: view / tab / pane management ─────────────────────────
+    ("new_file",
+     "Create a new untitled file in the current window (File → New File).",
+     {"type": "object", "properties": {}},
+     _p("/new_file")),
+    ("close_all",
+     "Close all open files/views in the current window.",
+     {"type": "object", "properties": {}},
+     _p("/close_all")),
+    ("close_unmodified",
+     "Close Unmodified Tabs (WindowCommand close_unmodified, from the tab context menu). group and index name "
+     "the tab the menu was opened on; without them (Sublime's default -1, -1 means the right-clicked tab) "
+     "it does nothing. Get them from get_sheet_index.",
+     {"type": "object", "properties": {"group": {"type": "integer", "description": "The index of the target group."}, "index": {"type": "integer", "description": "The index within the target group."}}},
+     _p("/close_unmodified")),
+    ("close_pane",
+     "Close the current pane/group and all views inside it.",
+     {"type": "object", "properties": {}},
+     _p("/close_pane")),
+    ("close_transient",
+     "Close all transient views (preview tabs) in the current window.",
+     {"type": "object", "properties": {}},
+     _p("/close_transient")),
+    ("clone_file",
+     "Create a clone of the active view (opens the same file in a new tab, sharing the buffer).",
+     {"type": "object", "properties": {"add_to_selection": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}, "group": {"type": "integer", "description": "As in Sublime's own keymap/menu. -1 means the current group."}, "index": {"type": "integer", "description": "As in Sublime's own keymap/menu. -1 means the current position."}, "retain_viewport_position": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/clone_file")),
+    ("next_view",
+     "Switch to the next view/tab in the current group.",
+     {"type": "object", "properties": {"extend": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/next_view")),
+    ("prev_view",
+     "Switch to the previous view/tab in the current group.",
+     {"type": "object", "properties": {"extend": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/prev_view")),
+    ("next_view_in_stack",
+     "Switch to the next view in the view history stack (Ctrl+Tab equivalent).",
+     {"type": "object", "properties": {}},
+     _p("/next_view_in_stack")),
+    ("prev_view_in_stack",
+     "Switch to the previous view in the view history stack (Ctrl+Shift+Tab equivalent).",
+     {"type": "object", "properties": {}},
+     _p("/prev_view_in_stack")),
+    ("focus_neighboring_group",
+     "Move focus to the next pane group (View > Groups > Next), or to the previous one with forward=false "
+     "(Previous). Without forward it goes to the next group.",
+     {"type": "object", "properties": {"forward": {"type": "boolean", "description": "false = previous group."}}},
+     _p("/focus_neighboring_group")),
+    ("move_to_neighboring_group",
+     "Move the active view to the neighboring pane group.",
+     {"type": "object", "properties": {"forward": {"type": "boolean", "description": "As in Sublime's own keymap/menu. false moves to the previous group."}}},
+     _p("/move_to_neighboring_group")),
+    ("toggle_full_screen",
+     "Toggle Sublime Text full-screen mode.",
+     {"type": "object", "properties": {}},
+     _p("/toggle_full_screen")),
+    ("toggle_menu",
+     "Show or hide the top menu bar.",
+     {"type": "object", "properties": {}},
+     _p("/toggle_menu")),
+    ("toggle_side_bar",
+     "Show or hide the left side bar (folder tree). Distinct from toggle_sidebar which is the MCP control-panel toggle.",
+     {"type": "object", "properties": {}},
+     _p("/toggle_side_bar")),
+    ("toggle_minimap",
+     "Show or hide the minimap (the zoomed-out code overview on the right gutter).",
+     {"type": "object", "properties": {}},
+     _p("/toggle_minimap")),
+    ("toggle_status_bar",
+     "Show or hide the bottom status bar.",
+     {"type": "object", "properties": {}},
+     _p("/toggle_status_bar")),
+    ("toggle_tabs",
+     "Show or hide the tab bar at the top of the view area.",
+     {"type": "object", "properties": {}},
+     _p("/toggle_tabs")),
+    ("toggle_distraction_free",
+     "Toggle distraction-free mode (hides side bar, minimap, status bar, tabs, etc.).",
+     {"type": "object", "properties": {}},
+     _p("/toggle_distraction_free")),
+    # ── Phase B batch 1: edit ops (text scope) ────────────────────────────────
+    ("insert",
+     "Insert text at the cursor(s). Replacement for typing: characters are inserted into each selection.",
+     {"type": "object", "properties": {
+         "characters": {"type": "string", "description": "Text to insert at each cursor."},
+     }, "required": ["characters"]},
+     _p("/insert")),
+    ("paste",
+     "Paste the clipboard contents at the cursor(s), replacing any selection.",
+     {"type": "object", "properties": {"clipboard": {"type": "string", "description": "As in Sublime's own keymap/menu. The menu passes 'selection'."}}},
+     _p("/paste")),
+    ("paste_from_history",
+     "Open the paste-from-history panel so the user can pick a previously cut/copied snippet to paste.",
+     {"type": "object", "properties": {}},
+     _p("/paste_from_history")),
+    ("paste_and_indent",
+     "Paste and re-indent the pasted lines to match surrounding indentation.",
+     {"type": "object", "properties": {}},
+     _p("/paste_and_indent")),
+    ("cut",
+     "Cut the current selection(s) to the clipboard.",
+     {"type": "object", "properties": {}},
+     _p("/cut")),
+    ("copy",
+     "Copy the current selection(s) to the clipboard.",
+     {"type": "object", "properties": {}},
+     _p("/copy")),
+    ("select_all",
+     "Select the entire contents of the active view (Ctrl+A equivalent).",
+     {"type": "object", "properties": {}},
+     _p("/select_all")),
+    ("expand_selection",
+     "Expand each selection (Sublime's Selection > Expand menu). to is required: smart (Ctrl+Shift+A), line, "
+     "line_prev (line upward), scope, brackets, tag or indentation. Repeated calls keep expanding.",
+     {"type": "object", "properties": {"to": {"type": "string", "enum": ["smart", "line", "line_prev", "scope", "brackets", "tag", "indentation"]}},
+      "required": ["to"]},
+     _p("/expand_selection")),
+    ("expand_selection_to_paragraph",
+     "Expand the current selection to the surrounding paragraph.",
+     {"type": "object", "properties": {"markup_aware": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/expand_selection_to_paragraph")),
+    ("split_selection_into_lines",
+     "Split the current selection into one cursor per line (Ctrl+Shift+L).",
+     {"type": "object", "properties": {}},
+     _p("/split_selection_into_lines")),
+    ("single_selection",
+     "Collapse multiple selections/cursors down to a single selection (Escape equivalent).",
+     {"type": "object", "properties": {}},
+     _p("/single_selection")),
+    ("clear_fields",
+     "Clear the current snippet field highlights (used after inserting a snippet with $1/$2 tab stops).",
+     {"type": "object", "properties": {}},
+     _p("/clear_fields")),
+    ("join_lines",
+     "Join the selected lines into a single line (Ctrl+J).",
+     {"type": "object", "properties": {}},
+     _p("/join_lines")),
+    ("swap_line_up",
+     "Swap the current line(s) with the line above.",
+     {"type": "object", "properties": {}},
+     _p("/swap_line_up")),
+    ("swap_line_down",
+     "Swap the current line(s) with the line below.",
+     {"type": "object", "properties": {}},
+     _p("/swap_line_down")),
+    ("indent",
+     "Indent the current selection(s) by one indentation level (Tab when there is a selection).",
+     {"type": "object", "properties": {}},
+     _p("/indent")),
+    ("unindent",
+     "Unindent the current selection(s) by one indentation level (Shift+Tab when there is a selection).",
+     {"type": "object", "properties": {}},
+     _p("/unindent")),
+    ("reindent",
+     "Re-indent the current selection(s) so each line's indentation matches its nesting depth.",
+     {"type": "object", "properties": {"single_line": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/reindent")),
+    ("wrap_lines",
+     "Re-wrap the current selection(s) at the configured wrap width. Alt+Q equivalent.",
+     {"type": "object", "properties": {
+         "width": {"type": "integer", "default": 0, "description": "Optional wrap width in columns. 0 = use the view's wrap_width setting."},
+     }},
+     _p("/wrap_lines")),
+    ("transpose",
+     "Transpose characters at the cursor (swap the two characters on either side of the cursor). Ctrl+T equivalent.",
+     {"type": "object", "properties": {}},
+     _p("/transpose")),
+    ("upper_case",
+     "Convert the current selection(s) to UPPER CASE.",
+     {"type": "object", "properties": {}},
+     _p("/upper_case")),
+    ("lower_case",
+     "Convert the current selection(s) to lower case.",
+     {"type": "object", "properties": {}},
+     _p("/lower_case")),
+    ("title_case",
+     "Convert the current selection(s) to Title Case.",
+     {"type": "object", "properties": {}},
+     _p("/title_case")),
+    ("swap_case",
+     "Swap the case of each character in the current selection(s) (upper↔lower).",
+     {"type": "object", "properties": {}},
+     _p("/swap_case")),
+    ("invert_selection",
+     "Invert the selection: what was selected becomes unselected and vice versa (within the current line range).",
+     {"type": "object", "properties": {}},
+     _p("/invert_selection")),
+    ("sort_selection",
+     "Sort the contents of several selections among themselves (TextCommand): with the selections c, a, b "
+     "they become a, b, c. It does not sort lines; use sort_lines for that. Optional case_sensitive, reverse, "
+     "remove_duplicates.",
+     {"type": "object", "properties": {"case_sensitive": {"type": "boolean"}, "reverse": {"type": "boolean"},
+                                       "remove_duplicates": {"type": "boolean"}}},
+     _p("/sort_selection")),
+    ("permute_lines",
+     "Permute (shuffle) the lines in the current selection into a random order.",
+     {"type": "object", "properties": {"operation": {"type": "string", "enum": ["shuffle", "reverse", "unique"], "description": "Default shuffle."}}},
+     _p("/permute_lines")),
+    ("permute_selection",
+     "Permute (shuffle) the selections themselves into a random order.",
+     {"type": "object", "properties": {"operation": {"type": "string", "enum": ["shuffle", "reverse", "unique"], "description": "Default shuffle. Needs several non-empty selections."}}},
+     _p("/permute_selection")),
+    ("trim_trailing_white_space",
+     "Remove trailing whitespace from every line in the current selection (or the whole file if no selection).",
+     {"type": "object", "properties": {}},
+     _p("/trim_trailing_white_space")),
+    ("ensure_newline_at_eof",
+     "Ensure the file ends with a single trailing newline (add one if missing).",
+     {"type": "object", "properties": {}},
+     _p("/ensure_newline_at_eof")),
+    ("expand_tabs",
+     "Convert leading tabs in the current selection (or whole file) to spaces, using the view's tab_size.",
+     {"type": "object", "properties": {"set_translate_tabs": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/expand_tabs")),
+    ("unexpand_tabs",
+     "Convert leading spaces in the current selection (or whole file) to tabs, using the view's tab_size.",
+     {"type": "object", "properties": {"set_translate_tabs": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/unexpand_tabs")),
+    ("detect_indentation",
+     "Auto-detect the file's indentation style (tabs vs spaces, width) and set the view's indent settings accordingly.",
+     {"type": "object", "properties": {}},
+     _p("/detect_indentation")),
+    ("yank",
+     "Yank (paste) the most recently killed/deleted text at the cursor. Emacs-style kill-ring paste.",
+     {"type": "object", "properties": {}},
+     _p("/yank")),
+    ("scroll_to_bof",
+     "Scroll the active view so the beginning of the file is visible (does not move the cursor).",
+     {"type": "object", "properties": {}},
+     _p("/scroll_to_bof")),
+    ("scroll_to_eof",
+     "Scroll the active view so the end of the file is visible (does not move the cursor).",
+     {"type": "object", "properties": {}},
+     _p("/scroll_to_eof")),
+    ("show_at_center",
+     "Scroll the active view so the current cursor line is centered in the window.",
+     {"type": "object", "properties": {}},
+     _p("/show_at_center")),
+    ("toggle_record_macro",
+     "Start or stop recording a macro (keystrokes are captured until this is called again).",
+     {"type": "object", "properties": {}},
+     _p("/toggle_record_macro")),
+    ("run_macro",
+     "Play back the most recently recorded macro at the cursor.",
+     {"type": "object", "properties": {}},
+     _p("/run_macro")),
+
+    # ── Phase B batch 2: file/project operations ─────────────────────────
+    ("new_file_at",
+     "Create a new file inside the given folders (WindowCommand new_file_at, the sidebar's New File). It opens "
+     "an input panel for the file name: answer it with drive_input_panel (text=<name>, action='submit').",
+     {"type": "object", "properties": {"dirs": {"type": "array", "items": {"type": "string"}, "description": "Folder path(s) to create the file in."}},
+      "required": ["dirs"]},
+     _p("/new_file_at")),
+    ("new_folder",
+     "Create a new folder inside the given folders (WindowCommand new_folder, the sidebar's New Folder). It opens "
+     "an input panel for the folder name: answer it with drive_input_panel (text=<name>, action='submit').",
+     {"type": "object", "properties": {"dirs": {"type": "array", "items": {"type": "string"}, "description": "Folder path(s) to create the folder in."}},
+      "required": ["dirs"]},
+     _p("/new_folder")),
+    ("open_folder",
+     "Open a folder in a NEW window (makes the window and sets the folder as its project data; returns window_id and folders). Pass 'path' (an existing folder).",
+     {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+     _p("/open_folder")),
+    ("open_containing_folder",
+     "Open the OS file manager at the directory containing the active file (WindowCommand).",
+     {"type": "object", "properties": {"files": {"type": "array", "items": {"type": "string"}, "description": "As in Sublime's own keymap/menu. Paths of the files whose folders to open."}}},
+     _p("/open_containing_folder")),
+    ("rename_file",
+     "Open the File > Rename prompt for the active file (WindowCommand rename_file). The prompt is an input "
+     "panel: enter the new name with drive_input_panel (text=<new name>, action='submit').",
+     {"type": "object", "properties": {}},
+     _p("/rename_file")),
+    ("copy_path",
+     "Copy the active file's path to the clipboard (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/copy_path")),
+    ("switch_file",
+     "Switch between files with the same base name and different extensions (WindowCommand).",
+     {"type": "object", "properties": {"extensions": {"type": "array", "items": {"type": "string"}, "description": "As in Sublime's own keymap/menu. Extensions to switch between, e.g. cpp."}, "side_by_side": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/switch_file")),
+    ("open_file_settings",
+     "Open the syntax-specific settings file for the active view (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/open_file_settings")),
+    ("edit_settings",
+     "Open a settings file for editing in a split view: the package's settings on the left, your own on the right "
+     "(WindowCommand edit_settings). Arguments go to Sublime unchanged, as in its Preferences > Settings menu "
+     "entry: base_file is the settings file, e.g. ${packages}/Default/Preferences.sublime-settings (a package's "
+     "settings are ${packages}/<Package>/<Name>.sublime-settings); user_file is optional; default is the text "
+     "the new user file starts with, e.g. a comment and {\\n\\t$0\\n}.",
+     {"type": "object", "properties": {"base_file": {"type": "string", "description": "e.g. ${packages}/Default/Preferences.sublime-settings"},
+                                       "user_file": {"type": "string"},
+                                       "default": {"type": "string", "description": "Starting text for a new user file."}},
+      "required": ["base_file"]},
+     _p("/edit_settings")),
+    ("new_build_system",
+     "Create a new build system file (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/new_build_system")),
+    ("new_plugin",
+     "Create a new plugin file in Packages/User (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/new_plugin")),
+    ("new_snippet",
+     "Create a new snippet file in Packages/User (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/new_snippet")),
+    ("new_syntax",
+     "Create a new syntax definition file in Packages/User (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/new_syntax")),
+    ("new_pane",
+     "Create a new pane in the active window (WindowCommand).",
+     {"type": "object", "properties": {"move": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/new_pane")),
+    ("set_max_columns",
+     "Set the maximum number of columns the groups are laid out in (WindowCommand, Sublime's View > Layout > Max Columns). "
+     "It only matters when the window has more groups than columns.",
+     {"type": "object", "properties": {"columns": {"type": "integer", "description": "1 to 4."}}, "required": ["columns"]},
+     _p("/set_max_columns")),
+    ("view_resource",
+     "Open Sublime's View Package File picker (WindowCommand view_resource): pick a package, then a file in it. "
+     "It takes no arguments; answer the pickers with ui_type_text and ui_press_key.",
+     {"type": "object", "properties": {}},
+     _p("/view_resource")),
+    ("exec",
+     "Run a build system target via the exec command (WindowCommand). Pass 'cmd' (list) and optional 'working_dir', 'shell_cmd', 'env', etc.",
+     {"type": "object", "properties": {
+         "cmd": {"type": "array", "items": {"type": "string"}},
+         "working_dir": {"type": "string"},
+         "shell_cmd": {"type": "string"},
+         "env": {"type": "object"}
+     }},
+     _p("/exec")),
+    ("find_in_folder",
+     "Open the Find in Files panel with its Where box set to the given folders (WindowCommand find_in_folder, "
+     "the sidebar's Find in Folder). To search, use project_search.",
+     {"type": "object", "properties": {"dirs": {"type": "array", "items": {"type": "string"}, "description": "Folder path(s) to search."}},
+      "required": ["dirs"]},
+     _p("/find_in_folder")),
+    ("goto_definition",
+     "Goto definition for the symbol under the cursor (WindowCommand).",
+     {"type": "object", "properties": {"clear_to_right": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}, "side_by_side": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/goto_definition")),
+    ("goto_reference",
+     "Goto reference for the symbol under the cursor (WindowCommand).",
+     {"type": "object", "properties": {"clear_to_right": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}, "side_by_side": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/goto_reference")),
+    ("auto_complete_goto_definition",
+     "Auto-complete and goto the definition of the symbol under the cursor (TextCommand).",
+     {"type": "object", "properties": {}},
+     _p("/auto_complete_goto_definition")),
+    ("open_symbol_definition",
+     "Open the definition of a named symbol (WindowCommand). Pass 'symbol'.",
+     {"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"]},
+     _p("/open_symbol_definition")),
+    ("prompt_goto_line",
+     "Open the Goto Line prompt (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/prompt_goto_line")),
+    ("show_overlay",
+     "Open one of Sublime's overlays (WindowCommand show_overlay), as its menu and keymap do. overlay is required: "
+     "goto (Goto Anything; show_files=true is Ctrl+P, text=':' is Ctrl+G, text='@' is Ctrl+R, text='#' is Ctrl+;) "
+     "or command_palette (Ctrl+Shift+P). The overlay stays open waiting for input: answer it with ui_type_text "
+     "and ui_press_key, or close it with hide_overlay.",
+     {"type": "object", "properties": {
+         "overlay": {"type": "string", "enum": ["goto", "command_palette"]},
+         "show_files": {"type": "boolean"},
+         "text": {"type": "string", "description": "Text the overlay starts with."}
+     }, "required": ["overlay"]},
+     _p("/show_overlay")),
+    ("select_color_scheme",
+     "Open the color scheme picker (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/select_color_scheme")),
+    ("select_theme",
+     "Open the theme picker (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/select_theme")),
+    ("customize_color_scheme",
+     "Open the active color scheme for customization (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/customize_color_scheme")),
+    ("customize_theme",
+     "Open the active theme for customization (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/customize_theme")),
+    ("convert_color_scheme",
+     "Convert a .sublime-color-scheme file to JSON for editing (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/convert_color_scheme")),
+    ("convert_syntax",
+     "Convert a .tmLanguage syntax file to .sublime-syntax (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/convert_syntax")),
+    ("edit_syntax_settings",
+     "Open the syntax-specific settings file (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/edit_syntax_settings")),
+    ("run_syntax_tests",
+     "Run syntax tests on the active syntax file (WindowCommand).",
+     {"type": "object", "properties": {}},
+     _p("/run_syntax_tests")),
+    ("profile_plugins",
+     "Profile plugin load times (ApplicationCommand).",
+     {"type": "object", "properties": {}},
+     _p("/profile_plugins")),
+    ("profile_syntax_definition",
+     "Profile a syntax definition for performance issues (ApplicationCommand).",
+     {"type": "object", "properties": {}},
+     _p("/profile_syntax_definition")),
+    ("install_package_control",
+     "Install Package Control (ApplicationCommand).",
+     {"type": "object", "properties": {}},
+     _p("/install_package_control")),
+    ("echo",
+     "Print a debug message to the ST console (ApplicationCommand). Pass 'msg'.",
+     {"type": "object", "properties": {"msg": {"type": "string"}}, "required": ["msg"]},
+     _p("/echo")),
+    # Phase B batch 3: remaining text commands (marks, jumps, folds, transform, browser, scope)
+    ("set_mark",
+     "Set a mark at the current cursor position (TextCommand). Used with select_to_mark/swap_with_mark/delete_to_mark.",
+     {"type": "object", "properties": {}}, _p("/set_mark")),
+    ("select_to_mark",
+     "Select the text between the cursor and the previously set mark (TextCommand).",
+     {"type": "object", "properties": {}}, _p("/select_to_mark")),
+    ("swap_with_mark",
+     "Swap the cursor position with the previously set mark (TextCommand).",
+     {"type": "object", "properties": {}}, _p("/swap_with_mark")),
+    ("delete_to_mark",
+     "Delete the text between the cursor and the previously set mark (TextCommand).",
+     {"type": "object", "properties": {}}, _p("/delete_to_mark")),
+    ("add_to_kill_ring",
+     "Add the selected text to the kill ring, Sublime's Emacs-style clipboard (TextCommand). forward is required: "
+     "for a cursor with nothing selected, forward=true takes the character after it and forward=false the "
+     "character before it.",
+     {"type": "object", "properties": {"forward": {"type": "boolean", "description": "Direction for empty selections."}},
+      "required": ["forward"]}, _p("/add_to_kill_ring")),
+    ("jump_back",
+     "Jump back in the navigation history (TextCommand). Equivalent to Alt+- (jump back through edit/cursor history).",
+     {"type": "object", "properties": {}}, _p("/jump_back")),
+    ("jump_forward",
+     "Jump forward in the navigation history (TextCommand). Equivalent to Alt+Shift+- (jump forward through edit/cursor history).",
+     {"type": "object", "properties": {}}, _p("/jump_forward")),
+    ("fold_unfold",
+     "Sublime's own fold_unfold toggle (TextCommand, no arguments). Where a selection or the cursor touches a "
+     "fold it unfolds it; otherwise it folds the selected text. With only a bare cursor and no fold there it "
+     "does nothing: use fold to fold the block at the cursor.",
+     {"type": "object", "properties": {}}, _p("/fold_unfold")),
+    ("rot13",
+     "Apply the ROT13 cipher to the current selection (TextCommand). Useful for obscuring spoiler text or round-tripping text.",
+     {"type": "object", "properties": {}}, _p("/rot13")),
+    ("wrap_block",
+     "Wrap lines in the selection as a block comment using the active syntax's block comment markers (TextCommand).",
+     {"type": "object", "properties": {}}, _p("/wrap_block")),
+    ("open_context_url",
+     "Open the URL under the cursor in the default browser (TextCommand).",
+     {"type": "object", "properties": {}}, _p("/open_context_url")),
+    ("open_in_browser",
+     "Open the current file in the default browser (TextCommand).",
+     {"type": "object", "properties": {}}, _p("/open_in_browser")),
+    ("show_scope_name",
+     "Print the syntax scope at the cursor to the ST console (TextCommand). Useful for debugging syntax-highlighting or writing snippet scopes.",
+     {"type": "object", "properties": {}}, _p("/show_scope_name")),
+    ("html_print",
+     "Open the current file as HTML for printing (TextCommand). Equivalent to File > Print.",
+     {"type": "object", "properties": {}}, _p("/html_print")),
+    ("arithmetic",
+     "Replace each selection with the result of an expression (TextCommand). expr is evaluated once per "
+     "selection with x = the selection read as a number, s = its text, i = its index (0, 1, ...) and math; "
+     "for example expr='x*10' turns the selections 2 and 3 into 20 and 30, and expr='i + 1' numbers the cursors.",
+     {"type": "object", "properties": {"expr": {"type": "string", "description": "Python expression using x, s, i and math."}},
+      "required": ["expr"]}, _p("/arithmetic")),
+    ("auto_indent_tag",
+     "Re-indent the enclosing HTML/XML tag structure (TextCommand). Useful for fixing nested tag indentation.",
+     {"type": "object", "properties": {}}, _p("/auto_indent_tag")),
+    ("convert_ident_case",
+     "Convert the identifier under the cursor to a different case style (TextCommand). Args: 'case' (lower/title/upper), 'separator' (e.g. '_' for snake_case, '-' for kebab-case), 'first_case' (lower/upper for first letter in title case).",
+     {"type": "object", "properties": {"case": {"type": "string", "description": "Target case: 'lower', 'title', or 'upper'."}, "separator": {"type": "string", "description": "Word separator inserted between words, e.g. '_' for snake_case, '-' for kebab-case. Empty for camelCase."}, "first_case": {"type": "string", "description": "When case='title', the case of the first letter: 'lower' (lowerCamelCase) or 'upper' (UpperCamelCase)."}}}, _p("/convert_ident_case")),
+    ("old_expand_selection_to_paragraph",
+     "Expand the selection to the surrounding paragraph (legacy TextCommand, kept for compatibility).",
+     {"type": "object", "properties": {}}, _p("/old_expand_selection_to_paragraph")),
+    ("old_wrap_lines",
+     "Wrap the selection at the configured wrap width using the legacy paragraph algorithm (TextCommand, kept for compatibility).",
+     {"type": "object", "properties": {"width": {"type": "integer", "description": "Optional wrap width in columns. 0 = use the view's wrap_width setting."}}}, _p("/old_wrap_lines")),
+    ("transformer",
+     "Apply a transformer (case conversion, encoding, etc.) to the current selection (TextCommand). A general-purpose text-transform base command.",
+     {"type": "object", "properties": {}}, _p("/transformer")),
+    # BEGIN GENERATED ST COMMAND TOOLS (tools/generate_st_command_tools.py)
+    ("add_directory",
+     "Opens an OS dialog box to prompt for a folder to the 'Where' field in the 'Find in Files' panel. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/add_directory")),
+    ("add_jump_record",
+     "Allows packages/plugins to add a jump point without changing the selection. (TextCommand)",
+     {"type": "object", "properties": {"selection": {"description": "The selection to be added to the jump history. Can be an integer, a list of 2 integers or a list of list of 2 integers."}}},
+     _p("/add_jump_record")),
+    ("add_where_snippet",
+     "Adds a snippet to the 'Where' field in the 'Find in Files' panel. (WindowCommand)",
+     {"type": "object", "properties": {"snippet": {"type": "string", "description": "The string to be inserted into the 'Where' field in the 'Find in Files' panel. Supports snippet like variables."}}},
+     _p("/add_where_snippet")),
+    ("add_word",
+     "Adds the given word to the 'added_words' setting in the user preferences. (TextCommand) Observed on Sublime Text 4215: writes Sublime Text settings.",
+     {"type": "object", "properties": {"word": {"type": "string", "description": "The word to be added."}}},
+     _p("/add_word")),
+    ("append",
+     "Appends the given text string to the end of the buffer. (TextCommand)",
+     {"type": "object", "properties": {"characters": {"type": "string", "description": "The string to be appended to the end of the text buffer."}, "force": {"type": "boolean"}, "scroll_to_end": {"type": "boolean", "description": "Whether to scroll to the end of the buffer after appending."}, "disable_tab_translation": {"type": "boolean", "description": "Whether to disable translating tabs to spaces."}}},
+     _p("/append")),
+    ("auto_complete",
+     "Shows the auto completion popup. (TextCommand) Observed on Sublime Text 4215: shows an in-app panel, popup or overlay (dismiss with hide_overlay, hide_panel or hide_popup).",
+     {"type": "object", "properties": {"api_completions_only": {"type": "boolean", "description": "Whether to include completions from snippets/completions file in the AC panel."}, "disable_auto_insert": {"type": "boolean"}, "next_completion_if_showing": {"type": "boolean"}, "auto_complete_commit_on_tab": {"type": "boolean"}, "mini": {"type": "boolean"}, "default": {"type": "string"}, "commit_single": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}, "snippets_only": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/auto_complete")),
+    ("auto_complete_open_link",
+     "Opens the first link in the details pane of the AC panel, when the AC panel is visible. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/auto_complete_open_link")),
+    ("build",
+     "Executes the provided build system or prompt for selection (select: true) and choose a default. build_system should be a resource path to a build system file or the name of a project-specific build system. (WindowCommand) Observed on Sublime Text 4215: when given arguments: shows an in-app panel, popup or overlay (dismiss with hide_overlay, hide_panel or hide_popup).",
+     {"type": "object", "properties": {"select": {"type": "boolean", "description": "Whether to prompt for selecting a build system."}, "build_system": {"type": "string", "description": "A resource path to a .sublime-build file."}, "variant": {"type": "string", "description": "The name of the variant present in the build system as specified by the 'name' key."}, "choice_build_system": {"type": "boolean"}, "choice_variant": {"type": "boolean"}}},
+     _p("/build")),
+    ("cancel",
+     "Runs the Sublime Text 'cancel' command. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/cancel")),
+    ("cancel_build",
+     "Cancels the currently running build. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/cancel_build")),
+    ("cancel_find",
+     "Cancels the Find panel, closing it. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/cancel_find")),
+    ("chain",
+     "Runs a given set of command(s) sequentially, along with their argument(s) if any. (WindowCommand)",
+     {"type": "object", "properties": {"commands": {"description": "The list of commands and their respective arguments."}}},
+     _p("/chain")),
+    ("clear_location",
+     "Clears the 'Where' field in the Find in Files panel. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/clear_location")),
+    ("clear_missing_recent_projects_and_workspaces",
+     "Clears any deleted projects or workspaces from the session. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/clear_missing_recent_projects_and_workspaces")),
+    ("clear_recent_files",
+     "Clears the list of recently opened files. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/clear_recent_files")),
+    ("clear_recent_projects_and_workspaces",
+     "Clears the list of recently opened projects and workspaces. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/clear_recent_projects_and_workspaces")),
+    ("close",
+     "Closes the active view. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/close")),
+    ("close_by_index",
+     "Closes a view of the given group by it's index. (WindowCommand)",
+     {"type": "object", "properties": {"group": {"type": "integer", "description": "The index of the target group."}, "index": {"type": "integer", "description": "The index within the target group."}}},
+     _p("/close_by_index")),
+    ("close_deleted_files",
+     "Closes all views into deleted files. (WindowCommand)",
+     {"type": "object", "properties": {"group": {"type": "integer", "description": "The index of the target group."}}},
+     _p("/close_deleted_files")),
+    ("close_folder_list",
+     "Removes all the folder(s) from the sidebar and hides it. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/close_folder_list")),
+    ("close_others_by_index",
+     "Closes all views of a group but the one identified by group and index. (WindowCommand)",
+     {"type": "object", "properties": {"group": {"type": "integer", "description": "The index of the target group."}, "index": {"type": "integer", "description": "The index within the target group."}}},
+     _p("/close_others_by_index")),
+    ("close_selected",
+     "Closes all selected views in a group. (WindowCommand)",
+     {"type": "object", "properties": {"group": {"type": "integer", "description": "The index of the target group."}, "index": {"type": "integer", "description": "The index within the target group."}}},
+     _p("/close_selected")),
+    ("close_tag",
+     "Close an HTML/XML tag. (WindowCommand)",
+     {"type": "object", "properties": {"insert_slash": {"type": "boolean"}}},
+     _p("/close_tag")),
+    ("close_to_right_by_index",
+     "Closes all views of a group right of the one identified by index. (WindowCommand)",
+     {"type": "object", "properties": {"group": {"type": "integer", "description": "The index of the target group."}, "index": {"type": "integer", "description": "The index within the target group."}}},
+     _p("/close_to_right_by_index")),
+    ("close_unmodified_to_right_by_index",
+     "Closes all unmodified views of a group right of the one identified by index. (WindowCommand)",
+     {"type": "object", "properties": {"group": {"type": "integer", "description": "The index of the target group."}, "index": {"type": "integer", "description": "The index within the target group."}}},
+     _p("/close_unmodified_to_right_by_index")),
+    ("close_unselected",
+     "Closes all unselected views in a group. (WindowCommand)",
+     {"type": "object", "properties": {"group": {"type": "integer", "description": "The index of the target group."}, "index": {"type": "integer", "description": "The index within the target group."}}},
+     _p("/close_unselected")),
+    ("close_window",
+     "Closes the active window. (WindowCommand) Observed on Sublime Text 4215: quits Sublime Text (which also stops this MCP server).",
+     {"type": "object", "properties": {}},
+     _p("/close_window")),
+    ("close_workspace",
+     "Closes the active workspace. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/close_workspace")),
+    ("commit_completion",
+     "Inserts the selected completion into the text and closes the AC panel. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/commit_completion")),
+    ("console_python_version",
+     "Switches the python interpreter version in console input. (WindowCommand)",
+     {"type": "object", "properties": {"version": {"type": "string", "description": "The version of the python interpreter. Valid values are '3.3' or '3.8'."}}},
+     _p("/console_python_version")),
+    ("context_menu",
+     "Shows the context menu for the current view. (WindowCommand) Observed on Sublime Text 4215: opens a native OS window (\"native menu\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {}},
+     _p("/context_menu")),
+    ("copy_as_html",
+     "Copies the contents of the current view as rich HTML to the system clipboard. (TextCommand) Observed on Sublime Text 4215: changes the clipboard.",
+     {"type": "object", "properties": {"enclosing_tags": {"type": "boolean"}, "font_size": {"type": "boolean"}}},
+     _p("/copy_as_html")),
+    ("correct_spelling",
+     "Corrects the incorrectly spelled word based on the incorrect word's region and the correction. (TextCommand)",
+     {"type": "object", "properties": {"begin": {"type": "integer", "description": "The integer that represents the beginning of the region that spans the incorrect word."}, "end": {"type": "integer", "description": "The integer that represents the end of the region that spans the incorrect word."}, "correction": {"type": "string", "description": "The string to be placed as a correction for the incorrect word."}}},
+     _p("/correct_spelling")),
+    ("decrease_font_size",
+     "Increases the global font size. (ApplicationCommand) Observed on Sublime Text 4215: writes Sublime Text settings.",
+     {"type": "object", "properties": {}},
+     _p("/decrease_font_size")),
+    ("delete_file",
+     "Deletes the given file(s) by moving the file(s) to the system trash/recycle bin. (WindowCommand) Observed on Sublime Text 4215: when given arguments: opens a native OS window (\"Delete File\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {"files": {"type": "array", "description": "The absolute path(s) to the given file(s) on disk."}, "prompt": {"type": "boolean", "description": "Whether to prompt the user to confirm the deletion by showing a dialog box."}}},
+     _p("/delete_file")),
+    ("delete_folder",
+     "Deletes the given folder(s) by moving the folder(s) to the system trash bin. (WindowCommand) Observed on Sublime Text 4215: when given arguments: opens a native OS window (\"Delete Folder\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {"dirs": {"type": "array", "description": "The absolute path(s) to the given folder(s) on disk."}, "prompt": {"type": "boolean", "description": "Whether to prompt the user to confirm the deletion by showing a dialog box."}}},
+     _p("/delete_folder")),
+    ("delete_word",
+     "Deletes the (sub-)word in front of or after each caret. (TextCommand)",
+     {"type": "object", "properties": {"forward": {"type": "boolean", "description": "Whether the forward (sub-)word should be deleted."}, "sub_words": {"type": "boolean", "description": "Whether to delete subwords."}}},
+     _p("/delete_word")),
+    ("drag_select",
+     "Runs the Sublime Text 'drag_select' command. (TextCommand)",
+     {"type": "object", "properties": {"by": {"type": "string", "description": "The mode of selection. Valid values are 'words', 'columns' and 'lines'."}, "event": {"type": "object", "description": "An object that consists of the x & y window coordinates & the button detail via the button key."}, "additive": {"type": "boolean", "description": "Whether to add the selection to the existing selection(s)."}, "subtractive": {"type": "boolean", "description": "Whether to remove the existing selection(s) before adding the new selection."}}},
+     _p("/drag_select")),
+    ("encode_html_entities",
+     "Runs the Sublime Text 'encode_html_entities' command. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/encode_html_entities")),
+    ("exit",
+     "Closes all windows and exists the application. (ApplicationCommand) Observed on Sublime Text 4215: quits Sublime Text (which also stops this MCP server).",
+     {"type": "object", "properties": {}},
+     _p("/exit")),
+    ("expand_snippet",
+     "Expands the snippet under the cursor. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/expand_snippet")),
+    ("find_all",
+     "Finds all the tokens which match the find pattern. (WindowCommand)",
+     {"type": "object", "properties": {"close_panel": {"type": "boolean", "description": "Whether to close the Find panel after executing the Find All option. This argument holds good only for the Find & Replace panel."}}},
+     _p("/find_all")),
+    ("find_all_under",
+     "Searches and selects all text matches, which are the same as the selected text or the word under the caret. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/find_all_under")),
+    ("find_next",
+     "Jumps to the next occurrence of the text or pattern in the find buffer. (TextCommand)",
+     {"type": "object", "properties": {"select_text": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/find_next")),
+    ("find_prev",
+     "Jumps to the previous occurrence of the text or pattern in the find buffer. (TextCommand)",
+     {"type": "object", "properties": {"close_panel": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}, "select_text": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/find_prev")),
+    ("find_under",
+     "Finds the next occurrence of the current selection or the current word. (TextCommand)",
+     {"type": "object", "properties": {"select_text": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/find_under")),
+    ("find_under_expand",
+     "Adds a new selection based on the current selection or expands the selection to the current word. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/find_under_expand")),
+    ("find_under_expand_skip",
+     "Adds a new selection based on the current selection or expands the selection to the current word while removing the current selection. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/find_under_expand_skip")),
+    ("find_under_prev",
+     "Finds the previous occurrence of the current selection or the current word. (TextCommand)",
+     {"type": "object", "properties": {"select_text": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/find_under_prev")),
+    ("focus_by_index",
+     "Focus one of multiple selected views in the active group by its index. (WindowCommand)",
+     {"type": "object", "properties": {"index": {"type": "integer", "description": "The index number of the view to be focussed."}}},
+     _p("/focus_by_index")),
+    ("focus_side_bar",
+     "Focus the sidebar to enable navigation by keyboard. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/focus_side_bar")),
+    ("fold",
+     "Runs the Sublime Text 'fold' command. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/fold")),
+    ("fold_all",
+     "Runs the Sublime Text 'fold_all' command. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/fold_all")),
+    ("fold_by_level",
+     "Folds all the code at a given indentation level. (TextCommand)",
+     {"type": "object", "properties": {"level": {"type": "integer", "description": "The indentation level of the code."}}},
+     _p("/fold_by_level")),
+    ("fold_tag_attributes",
+     "Fold(s) the html/xml tag attributes. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/fold_tag_attributes")),
+    ("goto_symbol_in_project",
+     "Open the Goto Symbol In Project quick panel. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/goto_symbol_in_project")),
+    ("hide_auto_complete",
+     "Hides the AC popup, if visible. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/hide_auto_complete")),
+    ("hide_overlay",
+     "Hides the currently visible overlay. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/hide_overlay")),
+    ("hide_panel",
+     "Hides the currently visible panel. (WindowCommand)",
+     {"type": "object", "properties": {"cancel": {"type": "boolean"}}},
+     _p("/hide_panel")),
+    ("hide_popup",
+     "Hides the popup window, if visible. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/hide_popup")),
+    ("hot_exit",
+     "Saves the session and exits the application even if the 'hot_exit' setting is disabled in preferences. (ApplicationCommand) Observed on Sublime Text 4215: quits Sublime Text (which also stops this MCP server).",
+     {"type": "object", "properties": {}},
+     _p("/hot_exit")),
+    ("ignore_word",
+     "Adds the given word to the ignored_words setting. (TextCommand) Observed on Sublime Text 4215: writes Sublime Text settings.",
+     {"type": "object", "properties": {"word": {"type": "string", "description": "The word to be ignored."}}},
+     _p("/ignore_word")),
+    ("increase_font_size",
+     "Increases the global font size. (ApplicationCommand) Observed on Sublime Text 4215: writes Sublime Text settings.",
+     {"type": "object", "properties": {}},
+     _p("/increase_font_size")),
+    ("left_delete",
+     "Deletes the character(s) to the left of the text selection caret(s). (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/left_delete")),
+    ("move",
+     "Moves the selection caret(s) by the specified unit. (TextCommand)",
+     {"type": "object", "properties": {"by": {"type": "string", "description": "The unit name. Valid values are 'chars', 'pages', 'lines', 'characters', 'words', 'word_ends', 'subwords', 'subword_ends' and 'stops'."}, "empty_line": {"type": "boolean"}, "forward": {"type": "boolean", "description": "Whether to move in the forward direction."}, "extend": {"type": "boolean", "description": "Whether to extend the selection as the caret(s) move."}, "lines": {"type": "boolean"}, "ignore_auto_complete": {"type": "boolean", "description": "Whether to skip navigating the AC items when the AC is open."}}},
+     _p("/move")),
+    ("move_to",
+     "Moves the selection caret(s) to the specified relative location. (TextCommand)",
+     {"type": "object", "properties": {"to": {"type": "string", "description": "The relative location. Valid values are 'eol', 'bol', 'eof', 'bof' and 'brackets'."}, "extend": {"type": "boolean", "description": "Whether to extend the selection while moving to the specified relative location."}}},
+     _p("/move_to")),
+    ("move_to_group",
+     "Moves the active tab to the specified layout group. (WindowCommand)",
+     {"type": "object", "properties": {"group": {"type": "integer", "description": "The index of the target group."}}},
+     _p("/move_to_group")),
+    ("new_os_tab",
+     "Creates a new empty window in the os tab. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/new_os_tab")),
+    ("new_window",
+     "Opens a new ST window. (ApplicationCommand) Observed on Sublime Text 4215: opens a new Sublime Text window.",
+     {"type": "object", "properties": {}},
+     _p("/new_window")),
+    ("new_window_for_project",
+     "Clones the project into a new workspace. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/new_window_for_project")),
+    ("next_field",
+     "Navigate to the next field in the snippet. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/next_field")),
+    ("next_misspelling",
+     "Navigate to the next misspelling in the document. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/next_misspelling")),
+    ("next_modification",
+     "Navigate to the next modification in the document. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/next_modification")),
+    ("next_os_tab",
+     "Set the focus to the next window in the os tab. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/next_os_tab")),
+    ("noop",
+     "A non existent command. Use this if you want to unbind any particular key binding & release it to the OS (ST 4117+). (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/noop")),
+    ("open_dir",
+     "Opens the specified dir in the default file manager application, optionally highlighting the specified file. (WindowCommand)",
+     {"type": "object", "properties": {"dir": {"type": "string", "description": "The absolute path to the directory to be opened in the default file manager application."}, "file": {"type": "string", "description": "The name of the file that is to be highlighted when the file manager application is launched, relative to the path of the directory."}}},
+     _p("/open_dir")),
+    ("open_project_or_workspace",
+     "Opens the specified project or workspace file, in a new window by default. (WindowCommand) Observed on Sublime Text 4215: when given arguments: opens a native OS window (\"Sublime Text\") that blocks Sublime's main thread until a person dismisses it; writes files.",
+     {"type": "object", "properties": {"file": {"type": "string", "description": "The absolute path to the project or workspace file."}, "new_window": {"type": "boolean", "description": "Whether to open the specified project or workspace file in a new window."}}},
+     _p("/open_project_or_workspace")),
+    ("open_recent_file",
+     "Opens a recently opened file. (WindowCommand)",
+     {"type": "object", "properties": {"index": {"type": "integer", "description": "The index of the recent file to open, 0 being the most recent. Without it the command does nothing."}}},
+     _p("/open_recent_file")),
+    ("open_recent_folder",
+     "Opens a recently opened folder. (WindowCommand)",
+     {"type": "object", "properties": {"index": {"type": "integer", "description": "The index of recent folder to be opened as per the folder_history in the session file."}}},
+     _p("/open_recent_folder")),
+    ("open_recent_project_or_workspace",
+     "Opens a recently opened project or workspace. (WindowCommand)",
+     {"type": "object", "properties": {"index": {"type": "integer", "description": "The index of the workspace as per recent_workspaces in the session file."}}},
+     _p("/open_recent_project_or_workspace")),
+    ("open_url",
+     "Opens the web browser to display the URL or the default application associated with the file/folder represented by the URL. (ApplicationCommand)",
+     {"type": "object", "properties": {"url": {"type": "string", "description": "The URL to be opened."}}},
+     _p("/open_url")),
+    ("overwrite",
+     "Overwrites the selection(s) at the caret(s) location(s) with the given characters. (TextCommand)",
+     {"type": "object", "properties": {"characters": {"type": "string", "description": "The characters that will overwrite the selection(s)."}}},
+     _p("/overwrite")),
+    ("paste_selection_clipboard",
+     "Linux only. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/paste_selection_clipboard")),
+    ("prev_field",
+     "Navigates to the previous field in the snippet. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/prev_field")),
+    ("prev_misspelling",
+     "Navigates to the previous misspelling in the document. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/prev_misspelling")),
+    ("prev_modification",
+     "Navigates to the previous modification in the document. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/prev_modification")),
+    ("prev_os_tab",
+     "Sets the focus to the previous window in the os tab. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/prev_os_tab")),
+    ("primary_j_changed",
+     "Shows a dialog stating about the change of keybindings for the join_lines command. (WindowCommand) Observed on Sublime Text 4215: opens a native OS window (\"Sublime Text\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {}},
+     _p("/primary_j_changed")),
+    ("prompt_add_folder",
+     "Shows the OS native open dialog, so the user can choose what folder they want to add to the sidebar. (WindowCommand) Observed on Sublime Text 4215: opens a native OS window (\"Select Folder\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {"initial_directory": {"type": "string", "description": "An absolute folder path on disk, where the native dialog will initially open."}}},
+     _p("/prompt_add_folder")),
+    ("prompt_open",
+     "Shows the MacOS native open dialog, so that the user can choose what file they want to open. (WindowCommand) Observed on Sublime Text 4215: shows an in-app panel, popup or overlay (dismiss with hide_overlay, hide_panel or hide_popup).",
+     {"type": "object", "properties": {"initial_directory": {"type": "string", "description": "An absolute folder path on disk, where the native dialog will initially open."}}},
+     _p("/prompt_open")),
+    ("prompt_open_file",
+     "Shows the OS native open dialog, so that the user can choose what file they want to open. (WindowCommand) Observed on Sublime Text 4215: opens a native OS window (\"Open\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {"initial_directory": {"type": "string", "description": "An absolute folder path on disk, where the native dialog will initially open."}}},
+     _p("/prompt_open_file")),
+    ("prompt_open_folder",
+     "Shows the OS native open dialog, so that the user can choose what folder they want to open. (WindowCommand) Observed on Sublime Text 4215: opens a native OS window (\"Select Folder\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {"initial_directory": {"type": "string", "description": "An absolute folder path on disk, where the native dialog will initially open."}}},
+     _p("/prompt_open_folder")),
+    ("prompt_open_project_or_workspace",
+     "Show the OS' native open dialog, so the user can choose what project they want to open. (WindowCommand) Observed on Sublime Text 4215: opens a native OS window (\"Open\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {"initial_directory": {"type": "string", "description": "An absolute folder path on disk, where the native dialog will initially open."}}},
+     _p("/prompt_open_project_or_workspace")),
+    ("prompt_save_as",
+     "Show the OS native save as dialog, so the user can choose the path where they want the file to be saved. (WindowCommand) Observed on Sublime Text 4215: opens a native OS window (\"Save As\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {"initial_directory": {"type": "string", "description": "An absolute folder path on disk, where the native dialog will initially open."}}},
+     _p("/prompt_save_as")),
+    ("prompt_select_workspace",
+     "Opens the Quick Switch Project window. (WindowCommand) Observed on Sublime Text 4215: opens a separate window (\"Switch Project\").",
+     {"type": "object", "properties": {}},
+     _p("/prompt_select_workspace")),
+    ("prompt_switch_project_or_workspace",
+     "Show the OS native open dialog, so the user can choose what project they want to switch to. (WindowCommand) Observed on Sublime Text 4215: opens a native OS window (\"Open\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {"initial_directory": {"type": "string", "description": "An absolute folder path on disk, where the native dialog will initially open."}}},
+     _p("/prompt_switch_project_or_workspace")),
+    ("purchase_license",
+     "Navigates to the url https://www.sublimehq.com/store/text in the default browser to allow a user to purchase a license.. (ApplicationCommand) Observed on Sublime Text 4215: starts another program (msedge.exe).",
+     {"type": "object", "properties": {}},
+     _p("/purchase_license")),
+    ("redo_or_repeat",
+     "Redos the last undo or repeats the last action if there is no undo to revert. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/redo_or_repeat")),
+    ("refresh_folder_list",
+     "Refreshs the folder list in the sidebar from the filesystem. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/refresh_folder_list")),
+    ("remove_license",
+     "Removes the license. This will cause Sublime Text/Merge to go into an unregistered state. (ApplicationCommand) Observed on Sublime Text 4215: opens a native OS window (\"Remove license key?\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {}},
+     _p("/remove_license")),
+    ("rename_path",
+     "Renames the given file(s) on disk. (WindowCommand) Observed on Sublime Text 4215: when given arguments: shows an in-app panel, popup or overlay (dismiss with hide_overlay, hide_panel or hide_popup).",
+     {"type": "object", "properties": {"paths": {"type": "array", "description": "A list of absolute file paths to be renamed."}}},
+     _p("/rename_path")),
+    ("reopen",
+     "Reopens the file with a given encoding. (TextCommand)",
+     {"type": "object", "properties": {"encoding": {"type": "string", "description": "The encoding to be used when the file is reopened."}}},
+     _p("/reopen")),
+    ("reopen_last_file",
+     "Reopens the most recently closed file. (WindowCommand)",
+     {"type": "object", "properties": {"source": {"type": "string", "description": "As in Sublime's own keymap/menu. The keymap passes 'window'."}}},
+     _p("/reopen_last_file")),
+    ("replace_all",
+     "Replaces all tokens in the view, which matches the pattern in the Find input field. (WindowCommand)",
+     {"type": "object", "properties": {"close_panel": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/replace_all")),
+    ("replace_completion_with_auto_complete",
+     "Replaces the most recently inserted completion with the next result provided by the auto completion engine. (TextCommand) Observed on Sublime Text 4215: shows an in-app panel, popup or overlay (dismiss with hide_overlay, hide_panel or hide_popup).",
+     {"type": "object", "properties": {}},
+     _p("/replace_completion_with_auto_complete")),
+    ("replace_next",
+     "Replaces the next token in the view, which matches the pattern in the Find input field. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/replace_next")),
+    ("reset_font_size",
+     "Resets the font size to the default value. (ApplicationCommand) Observed on Sublime Text 4215: writes Sublime Text settings.",
+     {"type": "object", "properties": {}},
+     _p("/reset_font_size")),
+    ("resize_window",
+     "Resizes the window's external bounds to the specified width and height. (WindowCommand)",
+     {"type": "object", "properties": {"width": {"type": "integer", "description": "The external width of the window."}, "height": {"type": "integer", "description": "The external height of the window."}}},
+     _p("/resize_window")),
+    ("reveal_in_side_bar",
+     "Reveals the active view's file in the sidebar. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/reveal_in_side_bar")),
+    ("reveal_link_source",
+     "Resolves a symlink to expand the folder it represents. (WindowCommand)",
+     {"type": "object", "properties": {"dirs": {"type": "array", "description": "The list of symlink directorie(s) to be resolved."}}},
+     _p("/reveal_link_source")),
+    ("revert",
+     "Reloads the file. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/revert")),
+    ("revert_hunk",
+     "Reverts a diff hunk. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/revert_hunk")),
+    ("revert_modification",
+     "Reverts a single modification. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/revert_modification")),
+    ("right_delete",
+     "Deletes the character to the right of the text selection caret(s). (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/right_delete")),
+    ("run_macro_file",
+     "Runs a macro saved in a macro file. (TextCommand)",
+     {"type": "object", "properties": {"file": {"type": "string", "description": "The 'Packages/' relative path to the '.sublime-macro' file."}, "hide_from_menu": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/run_macro_file")),
+    ("save",
+     "Saves the active view/document. (TextCommand) Observed on Sublime Text 4215: writes files.",
+     {"type": "object", "properties": {"async": {"type": "boolean", "description": "Whether to save the file asynchronously."}, "encoding": {"type": "string", "description": "The encoding, to save the file as."}, "quiet": {"type": "boolean", "description": "Whether to suppress dialogs if the file save fails or requires elevated permissions on the host OS."}}},
+     _p("/save")),
+    ("save_macro",
+     "Save the recorded macro to a file. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/save_macro")),
+    ("save_project_and_workspace_as",
+     "Opens the OS dialog window to save the active project. (WindowCommand) Observed on Sublime Text 4215: opens a native OS window (\"Save As\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {}},
+     _p("/save_project_and_workspace_as")),
+    ("save_workspace_as",
+     "Opens the OS dialog window to save the active workspace. (WindowCommand) Observed on Sublime Text 4215: opens a native OS window (\"Save As\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {}},
+     _p("/save_workspace_as")),
+    ("scroll_lines",
+     "Scroll the active view by the specified number of lines. A negative number means to scroll in an upwards direction. (TextCommand)",
+     {"type": "object", "properties": {"amount": {"type": "number", "description": "The specified amount by which the view has to be scrolled."}}},
+     _p("/scroll_lines")),
+    ("select",
+     "Runs the Sublime Text 'select' command. (WindowCommand)",
+     {"type": "object", "properties": {"clear_to_right": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}, "extend": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}, "replace": {"type": "boolean", "description": "As in Sublime's own keymap/menu."}}},
+     _p("/select")),
+    ("select_bookmark",
+     "Select a specific bookmark (by index) in the current document. (TextCommand)",
+     {"type": "object", "properties": {"index": {"type": "integer"}}},
+     _p("/select_bookmark")),
+    ("select_by_index",
+     "Focus a view in the active group based on its index. (WindowCommand)",
+     {"type": "object", "properties": {"index": {"type": "integer", "description": "The index of the view to focus. The first view will have an index of 0 and so on."}}},
+     _p("/select_by_index")),
+    ("set_build_system",
+     "Sets the given build system based on the build file. (WindowCommand)",
+     {"type": "object", "properties": {"file": {"type": "string", "description": "Accepts a 'Packages/' relative path to a sublime build file to set as the current build system. An empty string will set it to the 'Automatic' option as seen in 'Tools -> Build System'."}, "index": {"type": "integer", "description": "As in Sublime's own menu, which passes 0, 1, 2, ... instead of file."}}},
+     _p("/set_build_system")),
+    ("set_file_type",
+     "Sets the syntax for the active view. (TextCommand) Observed on Sublime Text 4215: when given arguments: opens a separate window (\"Sublime Text\").",
+     {"type": "object", "properties": {"syntax": {"type": "string", "description": "The syntax to be set for the active view. Can either be a package relative path like 'Packages/Foo/Bar.sublime-syntax' or 'scope:' prefixed syntax name."}}},
+     _p("/set_file_type")),
+    ("set_line_ending",
+     "Sets the line endings for the files. (TextCommand)",
+     {"type": "object", "properties": {"type": {"type": "string", "description": "The platform type. Valid values are 'windows', 'unix' & 'cr'."}}},
+     _p("/set_line_ending")),
+    ("show_about_window",
+     "Displays the about dialog. (ApplicationCommand) Observed on Sublime Text 4215: opens a separate window (\"Sublime Text\").",
+     {"type": "object", "properties": {}},
+     _p("/show_about_window")),
+    ("show_changelog",
+     "Displays the changelog dialog. (ApplicationCommand) Observed on Sublime Text 4215: opens a separate window (\"Changelog\").",
+     {"type": "object", "properties": {}},
+     _p("/show_changelog")),
+    ("show_license_window",
+     "Displays the license dialog. This will only work if you are running an unregistered copy of Sublime Text. (ApplicationCommand) Observed on Sublime Text 4215: opens a separate window (\"Enter License\").",
+     {"type": "object", "properties": {}},
+     _p("/show_license_window")),
+    ("show_progress_window",
+     "Displays the indexing status dialog. (ApplicationCommand) Observed on Sublime Text 4215: opens a separate window (\"Indexing Status\").",
+     {"type": "object", "properties": {}},
+     _p("/show_progress_window")),
+    ("slurp_find_string",
+     "Uses the current selection as the find string. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/slurp_find_string")),
+    ("slurp_replace_string",
+     "Uses the current selection as the replacement string. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/slurp_replace_string")),
+    ("soft_redo",
+     "Redos the last move or action, which has been undone. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/soft_redo")),
+    ("soft_undo",
+     "Undos the last move or action. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/soft_undo")),
+    ("sublime_merge_blame_file",
+     "Git blame selected file(s) with Sublime Merge. (WindowCommand) Observed on Sublime Text 4215: opens a native OS window (\"Sublime Merge Not Found\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {"files": {"type": "array"}}},
+     _p("/sublime_merge_blame_file")),
+    ("sublime_merge_file_history",
+     "Show the history of the selected file(s) in Sublime Merge. (WindowCommand) Observed on Sublime Text 4215: opens a native OS window (\"Sublime Merge Not Found\") that blocks Sublime's main thread until a person dismisses it.",
+     {"type": "object", "properties": {"files": {"type": "array"}}},
+     _p("/sublime_merge_file_history")),
+    ("sublime_merge_folder_history",
+     "Show the history of the selected folder(s) in Sublime Merge. (WindowCommand)",
+     {"type": "object", "properties": {"paths": {"type": "array"}}},
+     _p("/sublime_merge_folder_history")),
+    ("sublime_merge_line_history",
+     "Shows the history of the selected line(s) in Sublime Merge. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/sublime_merge_line_history")),
+    ("sublime_merge_open_repo",
+     "Open the repository of the selected file/folder in Sublime Merge. (WindowCommand)",
+     {"type": "object", "properties": {"paths": {"type": "array", "items": {"type": "string"}, "description": "As in Sublime's own keymap/menu. Repository folders."}}},
+     _p("/sublime_merge_open_repo")),
+    ("toggle_case_sensitive",
+     "Toggles the 'Case sensitive' flag in the Find/Replace/Incremental Find/Find in Files panel. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/toggle_case_sensitive")),
+    ("toggle_highlight",
+     "Toggles the 'Highlight matches' flag in the Find/Replace/Incremental Find panel. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/toggle_highlight")),
+    ("toggle_in_selection",
+     "Toggles the 'In selection' flag in the Find/Replace/Incremental Find panel. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/toggle_in_selection")),
+    ("toggle_inline_diff",
+     "Toggles whether the inline diff of the modifications under the cursor location(s) is displayed. (TextCommand)",
+     {"type": "object", "properties": {"prefer_hide": {"type": "boolean", "description": "Whether to hide the other visible diffs, while showing the ones under the cursor location(s)."}}},
+     _p("/toggle_inline_diff")),
+    ("toggle_overwrite",
+     "Toggles whether the caret is in insert mode or overwrite mode. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/toggle_overwrite")),
+    ("toggle_preserve_case",
+     "Toggles the 'Preserve case' flag in the Replace panel. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/toggle_preserve_case")),
+    ("toggle_regex",
+     "Toggles the 'Regular expression' flag in the Find/Replace/Incremental Find/Find in Files panel. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/toggle_regex")),
+    ("toggle_save_all_on_build",
+     "Enables/Disables saving all open files before running a build command. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/toggle_save_all_on_build")),
+    ("toggle_setting",
+     "Toggles the specified boolean setting. (TextCommand)",
+     {"type": "object", "properties": {"setting": {"type": "string", "description": "The boolean setting to toggle."}}},
+     _p("/toggle_setting")),
+    ("toggle_show_context",
+     "Toggles the 'Show Context' flag in the Find in Files panel. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/toggle_show_context")),
+    ("toggle_show_open_files",
+     "Toggles the visibility of the list of open files in the sidebar. (WindowCommand) Observed on Sublime Text 4215: shows an in-app panel, popup or overlay (dismiss with hide_overlay, hide_panel or hide_popup).",
+     {"type": "object", "properties": {}},
+     _p("/toggle_show_open_files")),
+    ("toggle_use_buffer",
+     "Toggles the 'Use Buffer' flag in the Find in Files panel. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/toggle_use_buffer")),
+    ("toggle_use_gitignore",
+     "Toggles the 'Use gitignore' flag in the Find in Files panel. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/toggle_use_gitignore")),
+    ("toggle_whole_word",
+     "Toggles the 'Whole word' flag in the Find/Replace/Incremental Find/Find in Files panel. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/toggle_whole_word")),
+    ("toggle_wrap",
+     "Toggles the 'Wrap' flag in Find/Replace/Incremental Find panel. (WindowCommand)",
+     {"type": "object", "properties": {}},
+     _p("/toggle_wrap")),
+    ("unfold",
+     "Unfolds all folded region(s) at the given caret location(s). (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/unfold")),
+    ("unfold_all",
+     "Unfolds all folded region(s) in the given buffer. (TextCommand)",
+     {"type": "object", "properties": {}},
+     _p("/unfold_all")),
+    ("update_check",
+     "Opens the update dialog box of Sublime Text. (ApplicationCommand) Observed on Sublime Text 4215: opens a separate window (\"Update\").",
+     {"type": "object", "properties": {}},
+     _p("/update_check")),
+    ("upgrade_license",
+     "Navigates to https://www.sublimehq.com/store/upgrade, where you can upgrade an expired license. (ApplicationCommand)",
+     {"type": "object", "properties": {}},
+     _p("/upgrade_license")),
+    # END GENERATED ST COMMAND TOOLS
+]
+
+_mcp_tools_lock = threading.Lock()
+_mcp_tools_builtin_names = frozenset(t[0] for t in _MCP_TOOLS)
+_MCP_DEFAULT_TOOL_NAMES = frozenset({
+    "get_help",
+    "batch",
+    "get_active_file",
+    "project_search",
+    "str_replace_based_edit_tool",
+    "save_file",
+    "discover_tools",
+    "ui_screenshot",
+})
+
+# MCP tool-name HTTP aliases for node-proxy dynamic discovery (POST /{tool.name}).
+# Only paths that were not already REST routes — overwriting would break
+# _p("/save_all")-style wrappers that look up the real handler in _POST.
+_POST_MCP_ALIASES = set()
+for _name, _desc, _schema, _handler in _MCP_TOOLS:
+    _path = "/" + _name
+    if _path not in _POST:
+        _POST[_path] = _handler
+        _POST_MCP_ALIASES.add(_path)
+del _name, _desc, _schema, _handler, _path
+
+
+def register_mcp_tools(tools):
+    """Register additional MCP tools from an extension plugin.
+
+    Call from plugin_loaded(). tools is a list of
+    (name, description, input_schema, handler) tuples, the same format
+    as _MCP_TOOLS.  Built-in tool names are protected: a collision logs
+    a warning and keeps the built-in.  Also installs POST /{name} for
+    node-proxy dynamic discovery when that path is free.
+    """
+    with _mcp_tools_lock:
+        existing = {t[0] for t in _MCP_TOOLS}
+        for entry in tools:
+            name = entry[0]
+            if name in _mcp_tools_builtin_names:
+                print("sublime-mcp: register_mcp_tools: '{}' is a built-in tool — skipped".format(name))
+                continue
+            if name in existing:
+                print("sublime-mcp: register_mcp_tools: '{}' already registered — skipped".format(name))
+                continue
+            _MCP_TOOLS.append(entry)
+            existing.add(name)
+            path = "/" + name
+            if path not in _POST:
+                _POST[path] = entry[3]
+                _POST_MCP_ALIASES.add(path)
+
+
+def unregister_mcp_tools(tools):
+    """Remove tools previously registered with register_mcp_tools.
+
+    Call from plugin_unloaded(). Built-in tools are never removed.
+    Also removes any POST /{name} aliases installed by register_mcp_tools.
+    """
+    names = {entry[0] for entry in tools} - _mcp_tools_builtin_names
+    with _mcp_tools_lock:
+        for i in range(len(_MCP_TOOLS) - 1, -1, -1):
+            if _MCP_TOOLS[i][0] in names:
+                name = _MCP_TOOLS[i][0]
+                _MCP_TOOLS.pop(i)
+                path = "/" + name
+                if path in _POST_MCP_ALIASES:
+                    _POST.pop(path, None)
+                    _POST_MCP_ALIASES.discard(path)
+
+
+def run_st_command(command, args=None, scope="window"):
+    """Run a Sublime Text command via the internal bridge.
+
+    Convenience function for use in extension tool handlers.
+    scope: 'text'/'view' (TextCommand), 'window' (WindowCommand), 'application' (ApplicationCommand).
+    Returns {"ok": True} on success or {"error": "..."} on failure.
+    """
+    return _run_command({"command": command, "args": args or {}, "scope": scope})
+
+
+class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        import sys
+        if isinstance(sys.exc_info()[1], (ConnectionResetError, ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
+
+class _MCPHandler(BaseHTTPRequestHandler):
+    # HTTP/1.1 keeps the TCP connection open across requests. Without this,
+    # BaseHTTPRequestHandler defaults to HTTP/1.0 and every POST /messages
+    # (i.e. every single tool call) pays a fresh TCP handshake + teardown.
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_OPTIONS(self):
+        # No Access-Control-Allow-Origin here or anywhere else in this
+        # handler: MCP clients are CLI/desktop processes making direct HTTP
+        # requests, not browser fetch() calls, so CORS isn't needed for the
+        # intended use -- and CORS governs whether a browser lets a
+        # webpage's JS *read* the response, not whether the request reaches
+        # the server at all, so a wildcard here would let any webpage's JS
+        # read tool-call responses (including from eval_python -- arbitrary
+        # code execution) with zero authentication. See MCP Commander
+        # .sublime-settings' allow_lan_access comment for the related
+        # bind-address tradeoff.
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if is_oauth_discovery_path(self.path):
+            send_no_authorization(self)
+            return
+        if not _check_auth(self):
+            _deny_auth_json(self)
+            return
+        if path == "/sse":
+            self._handle_sse()
+        elif path == "/mcp":
+            # Streamable HTTP allows an optional GET to open a server-push
+            # SSE stream; we don't support it (nothing to push -- see
+            # _handle_streamable_http). 405 tells compliant clients that's
+            # fine and to proceed POST-only, instead of a bare 404 which
+            # some clients (e.g. qwen-code) treat as a fatal connect error.
+            self.send_error(405)
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if not _check_auth(self):
+            _deny_auth_json(self)
+            return
+        path = urlparse(self.path).path
+        if path == "/messages":
+            self._handle_message()
+        elif path == "/mcp":
+            self._handle_streamable_http()
+        else:
+            self.send_error(404)
+
+    def _handle_sse(self):
+        session_id = str(_uuid.uuid4())
+        q = _queue.Queue()
+        _mcp_sessions[session_id] = q
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        try:
+            endpoint = "/messages?sessionId=" + session_id
+            self.wfile.write(("event: endpoint\ndata: " + endpoint + "\n\n").encode())
+            self.wfile.flush()
+            while True:
+                try:
+                    msg = q.get(timeout=30)
+                except _queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    continue
+                if msg is None:
+                    break
+                self.wfile.write(("data: " + json.dumps(msg) + "\n\n").encode())
+                self.wfile.flush()
+        except Exception:
+            pass
+        finally:
+            _mcp_sessions.pop(session_id, None)
+            _mcp_session_caps.pop(session_id, None)
+
+    def _handle_message(self):
+        params = parse_qs(urlparse(self.path).query)
+        session_id = params.get("sessionId", [None])[0]
+        body, problem = _read_json_body(self)
+        if problem:
+            payload = json.dumps({"jsonrpc": "2.0", "id": None,
+                                  "error": {"code": -32700, "message": problem}}).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        self.send_response(202)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+        if (isinstance(body, dict) and "method" not in body and isinstance(body.get("id"), str)
+                and body["id"] in _mcp_pending_asks):
+            # the client's answer to an elicitation/create this server sent (see _mcp_ask)
+            slot = _mcp_pending_asks.get(body.get("id"))
+            if slot:
+                slot[1] = body.get("result")
+                slot[0].set()
+            return
+        if isinstance(body, dict) and body.get("method") == "initialize":
+            caps = (body.get("params") or {}).get("capabilities")
+            _mcp_session_caps[session_id] = caps if isinstance(caps, dict) else {}
+
+        def _dispatch_and_push():
+            resp = _mcp_dispatch(body, None, session_id)[1]
+            if resp is not None:
+                _mcp_send(session_id, resp)
+
+        threading.Thread(target=_dispatch_and_push, daemon=True).start()
+
+    def _handle_streamable_http(self):
+        # Streamable HTTP (spec 2025-03-26): single POST, no session id, no
+        # second connection. One JSON-RPC request in, one response out on the
+        # same connection. Reuses the same dispatch logic as the legacy SSE
+        # path (/sse + /messages) so both transports share one implementation.
+        body, problem = _read_json_body(self)
+        if problem:
+            payload = json.dumps({"jsonrpc": "2.0", "id": None,
+                                  "error": {"code": -32700, "message": problem}}).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        status, resp = _mcp_dispatch(body, self.headers)
+
+        if resp is None:
+            # Notification (no "id"): no JSON-RPC response body per spec.
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        payload = json.dumps(resp).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_DELETE(self):
+        # Sessions ended with DELETE in 2025-03-26..2025-11-25; 2026-07-28 has none and this
+        # server never minted one. 405 is the answer the spec gives for it.
+        self.send_error(405)
+
+
+# Modern (2026-07-28 and later): stateless, no `initialize`; version, client identity and
+# capabilities ride in every request's `_meta`. Legacy: `initialize` handshake. This server is
+# dual-era on the same endpoint: a request with the version in `_meta` is served as modern,
+# anything else as legacy. Newest first. `initialize` echoes the client's legacy version when it is
+# listed here, otherwise the newest legacy one.
+_MCP_MODERN_VERSIONS = ("2026-07-28",)
+_MCP_LEGACY_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+_MCP_PROTOCOL_VERSIONS = _MCP_MODERN_VERSIONS + _MCP_LEGACY_VERSIONS
+_MCP_META_VERSION = "io.modelcontextprotocol/protocolVersion"
+_MCP_META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+_MCP_ERR_HEADER_MISMATCH = -32020
+_MCP_ERR_UNSUPPORTED_VERSION = -32022
+_MCP_INSTRUCTIONS = ("Use get_help first. Prefer project_search for project text search, "
+                     "batch for independent calls, and discover_tools for advanced capabilities.")
+
+
+class _UnknownTool(Exception):
+    pass
+
+
+def _mcp_error(msg_id, code, message, data=None):
+    if msg_id is None:
+        return None
+    error = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": msg_id, "error": error}
+
+
+def _mcp_send(session_id, msg):
+    q = _mcp_sessions.get(session_id)
+    if q:
+        q.put(msg)
+
+
+_mcp_session_caps = {}  # session_id -> the capabilities the client declared in initialize
+_mcp_pending_asks = {}  # request id -> [threading.Event, the client's result or None]
+_MCP_ASK_WAIT = 300     # seconds the person has to answer, as long as a modern token lives
+
+
+def _mcp_ask(session_id, message):
+    """Ask the person through the client (2025-11-25 elicitation/create sent over this session's
+    SSE stream) and wait for the answer. Returns "accept", "decline", "cancel", or None when the
+    session is gone or nobody answered in time."""
+    if session_id not in _mcp_sessions:
+        return None
+    ask_id = "sublime-mcp-ask-" + str(_uuid.uuid4())
+    slot = [threading.Event(), None]
+    _mcp_pending_asks[ask_id] = slot
+    try:
+        _mcp_send(session_id, {"jsonrpc": "2.0", "id": ask_id, "method": "elicitation/create",
+                               "params": {"mode": "form", "message": message,
+                                          "requestedSchema": {"type": "object", "properties": {}}}})
+        if not slot[0].wait(_MCP_ASK_WAIT):
+            return None
+        result = slot[1]
+        return result.get("action") if isinstance(result, dict) else None
+    finally:
+        _mcp_pending_asks.pop(ask_id, None)
+
+
+def _mcp_list_tools():
+    with _mcp_tools_lock:
+        snapshot = [tool for tool in _MCP_TOOLS
+                    if tool[0] in _MCP_DEFAULT_TOOL_NAMES
+                    and tool[0] not in _DISABLED_TOOLS]
+    tools = []
+    for name, desc, schema, _ in snapshot:
+        input_schema = dict(schema) if schema else {}
+        if "type" not in input_schema:
+            input_schema["type"] = "object"
+        if "properties" not in input_schema:
+            input_schema["properties"] = {}
+        tools.append({"name": name, "description": desc, "inputSchema": input_schema})
+    return tools
+
+
+def _bridge_consent_denial(tool_name, body):
+    """Why a direct HTTP bridge POST is refused, or None.
+
+    The bridge cannot ask the person, so a plainly destructive route (delete_file, delete_folder,
+    revert_file, exit, close_window, close_workspace, remove_folder, a close_file with discard, a
+    run_command of those commands, also inside a batch) is refused here instead of run. eval_python
+    stays open on the bridge: local tools drive the editor through it."""
+    if not _consent_required():
+        return None
+    items = [i for i in consent.destructive_items(tool_name, body) if not i.startswith("eval_python")]
+    if not items:
+        return None
+    print("sublime-mcp: consent: denied on the HTTP bridge, it cannot ask: " + "; ".join(items))
+    return ("Denied, nothing was changed: the HTTP bridge cannot ask the person for approval. "
+            "Use the MCP connection of a client that can, or set require_consent_for_destructive to "
+            "false. Held back: " + "; ".join(items))
+
+
+def _consent_gate_result(params, modern, session_id=None):
+    """None when this tools/call may run; otherwise the result to send instead.
+
+    A destructive call is answered with a question on a 2026-07-28 connection (the client asks
+    the person and repeats the call). On a 2025-11-25 SSE session whose client declared
+    elicitation in initialize, the question is sent to the client as elicitation/create and the
+    call waits for the answer. Any connection that cannot be asked is denied. An error here
+    refuses the call. See lib/consent.py. Reached only through tools/call, so the HTTP bridge
+    routes are not covered."""
+    if not _consent_required():
+        return None
+    if (not modern and session_id in _mcp_sessions
+            and consent.caps_can_elicit(_mcp_session_caps.get(session_id))):
+        return _CONSENT_GATE.check_legacy(params.get("name"), params.get("arguments") or {},
+                                          lambda message: _mcp_ask(session_id, message))
+    can_ask = modern and consent.client_can_elicit(params.get("_meta"))
+    return _CONSENT_GATE.check(params.get("name"), params.get("arguments") or {},
+                               params if modern else {}, can_ask)
+
+
+def _mcp_call_tool(params):
+    """The result of a tools/call. A tool that fails is reported in the result with isError
+    (all protocol versions); only a tool that does not exist raises _UnknownTool (-32602)."""
+    tool_name = params.get("name")
+    tool_args = params.get("arguments") or {}
+    try:
+        if tool_name in _DISABLED_TOOLS:
+            raise ValueError(_tool_disabled_error(tool_name)["error"])
+        with _mcp_tools_lock:
+            entry = next((t for t in _MCP_TOOLS if t[0] == tool_name), None)
+        if entry is None:
+            raise _UnknownTool(tool_name)
+        data = _with_arg_warning(entry[3](tool_args), entry[2], tool_args)
+    except _UnknownTool:
+        raise
+    except Exception as e:
+        return {"content": [{"type": "text", "text": str(e)}], "isError": True}
+    if isinstance(data, list):
+        return {"content": data}
+    return {"content": [{"type": "text", "text": json.dumps(data)}]}
+
+
+def _decode_mcp_header(value):
+    """A header value that may use the `=?base64?...?=` sentinel (Mcp-Name, Mcp-Param-*)."""
+    if value.startswith("=?base64?") and value.endswith("?=") and len(value) >= 11:
+        import base64
+        try:
+            return base64.b64decode(value[9:-2]).decode("utf-8")
+        except Exception:
+            return None
+    return value
+
+
+def _mcp_header_problem(headers, method, params, version):
+    """Why the mirrored HTTP headers do not match the request body, or None."""
+    if headers.get("MCP-Protocol-Version") != version:
+        return "MCP-Protocol-Version header is missing or differs from _meta"
+    if headers.get("Mcp-Method") != method:
+        return "Mcp-Method header is missing or differs from the method"
+    if method == "tools/call" and _decode_mcp_header(headers.get("Mcp-Name") or "") != params.get("name"):
+        return "Mcp-Name header is missing or differs from params.name"
+    return None
+
+
+_client_decl_seen = set()
+
+
+def _note_client_declaration(method, params):
+    """Print once per distinct client what it declares (capabilities, client info, _meta).
+
+    Read-only diagnostic: it answers whether a client can be asked a question mid-call
+    (MCP elicitation). It never changes a response and never raises."""
+    try:
+        if not isinstance(params, dict) or len(_client_decl_seen) >= 20:
+            return
+        meta = params.get("_meta")
+        shown = {}
+        if method == "initialize":
+            shown = {"protocolVersion": params.get("protocolVersion"),
+                     "clientInfo": params.get("clientInfo"),
+                     "capabilities": params.get("capabilities")}
+        elif isinstance(meta, dict):
+            shown = {k: v for k, v in meta.items()
+                     if k != "progressToken" and not k.endswith("toolUseId")}
+        if not shown:
+            return
+        text = json.dumps(shown, sort_keys=True, default=str)
+        if text in _client_decl_seen:
+            return
+        _client_decl_seen.add(text)
+        print("sublime-mcp: client declares ({}): {}".format(method, text[:700]))
+    except Exception:
+        pass
+
+
+def _mcp_dispatch(msg, headers=None, session_id=None):
+    """Run one JSON-RPC message; return (http_status, response dict or None).
+
+    `headers` are the HTTP request headers on Streamable HTTP (checked against the body for
+    modern requests); None on the legacy SSE transport, which passes its `session_id` so a
+    destructive call can ask the person over that session. A notification has no response."""
+    method = msg.get("method", "")
+    msg_id = msg.get("id")
+    params = msg.get("params") or {}
+    _note_client_declaration(method, params)
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    version = meta.get(_MCP_META_VERSION) if isinstance(meta, dict) else None
+    if version is None and headers is not None and headers.get("MCP-Protocol-Version") in _MCP_MODERN_VERSIONS:
+        return 400, _mcp_error(msg_id, _MCP_ERR_HEADER_MISMATCH,
+                               "Header mismatch: params._meta lacks " + _MCP_META_VERSION)
+    if version is not None:
+        return _mcp_dispatch_modern(msg_id, method, params, version, headers)
+    resp = _mcp_dispatch_legacy(msg, session_id)
+    return (202 if resp is None else 200), resp
+
+
+def _mcp_dispatch_modern(msg_id, method, params, version, headers):
+    if msg_id is None:
+        return 202, None
+    if version not in _MCP_MODERN_VERSIONS:
+        return 400, _mcp_error(msg_id, _MCP_ERR_UNSUPPORTED_VERSION, "Unsupported protocol version",
+                               {"supported": list(_MCP_PROTOCOL_VERSIONS), "requested": version})
+    if headers is not None:
+        problem = _mcp_header_problem(headers, method, params, version)
+        if problem:
+            return 400, _mcp_error(msg_id, _MCP_ERR_HEADER_MISMATCH, "Header mismatch: " + problem)
+    try:
+        if method == "server/discover":
+            result = {"supportedVersions": list(_MCP_PROTOCOL_VERSIONS),
+                      "capabilities": {"tools": {}},
+                      "instructions": _MCP_INSTRUCTIONS,
+                      "ttlMs": 60000, "cacheScope": "private"}
+        elif method == "tools/list":
+            # ttlMs 0: tools can be registered or disabled while the plugin runs.
+            result = {"tools": _mcp_list_tools(), "ttlMs": 0, "cacheScope": "private"}
+        elif method == "tools/call":
+            result = _consent_gate_result(params, True)
+            if result is None:
+                result = _mcp_call_tool(params)
+        else:
+            return 404, _mcp_error(msg_id, -32601, "Method not found: " + method)
+    except _UnknownTool as e:
+        return 200, _mcp_error(msg_id, -32602, "Unknown tool: " + str(e))
+    except Exception as e:
+        return 200, _mcp_error(msg_id, -32603, str(e))
+    result.setdefault("resultType", "complete")
+    result["_meta"] = {_MCP_META_SERVER_INFO: {"name": "sublime-mcp", "version": __version__}}
+    return 200, {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+
+def _mcp_dispatch_legacy(msg, session_id=None):
+    """The `initialize`-handshake era (2025-11-25 and earlier); the response dict, or None."""
+    method = msg.get("method", "")
+    msg_id = msg.get("id")
+    params = msg.get("params") or {}
+
+    try:
+        if method == "initialize":
+            requested = params.get("protocolVersion")
+            result = {
+                "protocolVersion": requested if requested in _MCP_LEGACY_VERSIONS
+                                   else _MCP_LEGACY_VERSIONS[0],
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "sublime-mcp", "version": __version__},
+                "instructions": _MCP_INSTRUCTIONS,
+            }
+        elif method in ("notifications/initialized", "notifications/cancelled"):
+            return
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            result = {"tools": _mcp_list_tools()}
+        elif method == "tools/call":
+            result = _consent_gate_result(params, False, session_id)
+            if result is None:
+                result = _mcp_call_tool(params)
+        else:
+            return _mcp_error(msg_id, -32601, "Method not found: " + method)
+
+        if msg_id is not None:
+            return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+        return None
+    except _UnknownTool as e:
+        return _mcp_error(msg_id, -32602, "Unknown tool: " + str(e))
+    except Exception as e:
+        return _mcp_error(msg_id, -32603, str(e))
+
+
+# ── plugin lifecycle ──────────────────────────────────────────────────────────
+
+_server = None
+_mcp_server = None
+
+
+def _start_servers():
+    global _server, _mcp_server
+    _load_ports()
+    _install_console_capture()
+    if not _server:
+        try:
+            _server = _ThreadingHTTPServer((_BIND_HOST, _PORT), _Handler)
+            threading.Thread(target=_server.serve_forever, daemon=True).start()
+        except OSError as e:
+            print("sublime-mcp: could not bind HTTP bridge on port {}: {}".format(_PORT, e))
+            _server = None
+    if not _mcp_server:
+        try:
+            _mcp_server = _ThreadingHTTPServer((_BIND_HOST, _MCP_PORT), _MCPHandler)
+            threading.Thread(target=_mcp_server.serve_forever, daemon=True).start()
+        except OSError as e:
+            print("sublime-mcp: could not bind MCP SSE on port {}: {}".format(_MCP_PORT, e))
+            _mcp_server = None
+    print("sublime-mcp: MCP SSE on {0}:{1}, HTTP bridge on {0}:{2}".format(_BIND_HOST, _MCP_PORT, _PORT))
+
+
+def _stop_servers():
+    global _server, _mcp_server
+    # shutdown() only ends the accept loop; server_close() releases the listening socket. Without it
+    # the old module keeps the port open after a reload (HTTPServer sets SO_REUSEADDR, so the new
+    # server can bind it too on Windows) and connections can queue on a socket nobody accepts from.
+    if _server:
+        _server.shutdown()
+        _server.server_close()
+        _server = None
+    if _mcp_server:
+        _mcp_server.shutdown()
+        _mcp_server.server_close()
+        _mcp_server = None
+    for q in list(_mcp_sessions.values()):
+        q.put(None)
+    _mcp_sessions.clear()
+    print("sublime-mcp: stopped")
+
+
+def plugin_loaded():
+    _install_quick_panel_recorder()
+    _sweep_py33_answers()
+    _ensure_py33_companion()
+    _start_servers()
+
+
+def plugin_unloaded():
+    _stop_servers()
+    _remove_quick_panel_recorder()
+
+
+# ── helper text commands ──────────────────────────────────────────────────────
+
+
+class McpReplaceRegionCommand(sublime_plugin.TextCommand):
+    """Internal helper: replace an arbitrary character-offset region with new text.
+
+    Called by _replace_lines() which converts line numbers to character offsets
+    before dispatching here.  TextCommand is required because view.replace()
+    needs an edit token.
+    """
+
+    def run(self, edit, begin, end, text):
+        self.view.replace(edit, sublime.Region(begin, end), text)
+
+
+class McpStrReplaceCommand(sublime_plugin.TextCommand):
+    """Internal helper: replace a region and show a green underline highlight.
+
+    Called by _edit_file(command='str_replace') after the unique match is found.
+    Steps:
+      1. Replace the matched region with new_str.
+      2. Add a green 'mcp_edit' region with an annotation showing line number.
+      3. Scroll the view to centre on the change.
+      4. Schedule the region to be erased after _EDIT_HIGHLIGHT_MS milliseconds.
+
+    Also sets the view's reference document to the pre-edit content so the
+    ST gutter shows the diff markers.
+    """
+
+    def run(self, edit, begin, end, new_str):
+        region = sublime.Region(begin, end)
+        self.view.replace(edit, region, new_str)
+        new_end = begin + len(new_str)
+        new_region = sublime.Region(begin, new_end)
+        row, _ = self.view.rowcol(begin)
+        self.view.add_regions(
+            "mcp_edit",
+            [new_region],
+            "region.greenish",
+            "circle",
+            sublime.DRAW_NO_FILL | sublime.DRAW_SOLID_UNDERLINE,
+            annotations=[
+                ('<div style="font-size:0.9em; padding:1px 4px;">'
+                 "&#x270F; Claude &mdash; line {}</div>").format(row + 1)
+            ],
+            annotation_color="#4CAF50",
+        )
+        self.view.show_at_center(new_region)
+        sublime.set_timeout(
+            lambda: self.view.erase_regions("mcp_edit"), _EDIT_HIGHLIGHT_MS
+        )
+
+
+class McpInsertTextCommand(sublime_plugin.TextCommand):
+    """Internal helper: insert text at a character offset and show a cyan underline.
+
+    Same highlight pattern as McpStrReplaceCommand but cyan/blue to
+    distinguish insertions from replacements.
+    """
+
+    def run(self, edit, insert_pt, insert_text):
+        self.view.insert(edit, insert_pt, insert_text)
+        new_region = sublime.Region(insert_pt, insert_pt + len(insert_text))
+        row, _ = self.view.rowcol(insert_pt)
+        self.view.add_regions(
+            "mcp_edit",
+            [new_region],
+            "region.cyanish",
+            "dot",
+            sublime.DRAW_NO_FILL | sublime.DRAW_SOLID_UNDERLINE,
+            annotations=[
+                ('<div style="font-size:0.9em; padding:1px 4px;">'
+                 "&#x2795; Claude inserted &mdash; line {}</div>").format(row + 1)
+            ],
+            annotation_color="#2196F3",
+        )
+        self.view.show_at_center(new_region)
+        sublime.set_timeout(
+            lambda: self.view.erase_regions("mcp_edit"), _EDIT_HIGHLIGHT_MS
+        )
+
+
+class McpCreateFileCommand(sublime_plugin.TextCommand):
+    """Internal helper: populate a newly created (empty, retargeted) view with content."""
+
+    def run(self, edit, file_text):
+        self.view.insert(edit, 0, file_text)
+        self.view.show_at_center(0)
+
+
+# ── Command Palette: server status / start / stop ────────────────────────────
+
+
+class McpServerStatusCommand(sublime_plugin.WindowCommand):
+    """Show MCP server status and toggle it on/off from the Command Palette."""
+
+    def run(self, action):
+        if action == "stop":
+            _stop_servers()
+            sublime.status_message("MCP Commander: server stopped")
+        elif action == "start":
+            _start_servers()
+            sublime.status_message(
+                "MCP Commander: server started  —  SSE on :{}".format(_MCP_PORT)
+            )
+
+    def input(self, args):
+        return _McpServerStatusInputHandler()
+
+
+class McpConnectionDoctorCommand(sublime_plugin.WindowCommand):
+    """Show the exact local endpoints and catalog state without external tools."""
+
+    def run(self):
+        report = _health({})
+        report["http_bridge_running"] = _server is not None
+        report["mcp_server_running"] = _mcp_server is not None
+        report["streamable_http_url"] = "http://127.0.0.1:{}/mcp".format(_MCP_PORT)
+        report["legacy_sse_url"] = "http://127.0.0.1:{}/sse".format(_MCP_PORT)
+        view = self.window.new_file()
+        view.set_name("sublime-mcp doctor")
+        view.set_scratch(True)
+        view.run_command("append", {"characters": json.dumps(report, indent=2) + "\n"})
+
+
+class _McpServerStatusInputHandler(sublime_plugin.ListInputHandler):
+    def name(self):
+        return "action"
+
+    def placeholder(self):
+        return "MCP Commander"
+
+    def list_items(self):
+        if _mcp_server:
+            return [sublime.ListInputItem(
+                "Stop server",
+                "stop",
+                details="MCP SSE on :{}  ·  HTTP bridge on :{}".format(_MCP_PORT, _PORT),
+                annotation="● running",
+            )]
+        else:
+            return [sublime.ListInputItem(
+                "Start server",
+                "start",
+                details="Both servers are currently stopped",
+                annotation="○ stopped",
+            )]
+
+
+# 2026-09-06: test edit made via the edit-sublime-mcp procedure -- a
+# direct disk write (Bash/Edit tool), not through sublime-mcp's own
+# live-edit tools, to verify a comment-only change to this file.

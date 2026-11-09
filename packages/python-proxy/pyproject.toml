@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sublime-commander"
+version = "0.0.0"
+description = "MCP server for Sublime Text 4 — lets Claude Code read and control a running ST instance"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+# mcp 2.0.0 renamed FastMCP to MCPServer; mcp_server.py imports either
+# one depending on what's installed, so both major versions work.
+dependencies = ["mcp>=1.2", "httpx"]
+keywords = ["mcp", "sublime-text", "claude", "ai", "editor"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Text Editors",
+]
+
+[[project.authors]]
+name = "Donald Chitester"
+email = "donaldchitester@gmail.com"
+
+[project.urls]
+Homepage = "https://github.com/dpc00/sublime-commander"
+Repository = "https://github.com/dpc00/sublime-commander"
+
+[project.scripts]
+sublime-commander = "mcp_server:main"
+
+[tool.setuptools]
+# tool_catalog is generated from the backend _MCP_TOOLS by
+# tools/generate_fallback_catalog.py and imported by mcp_server at
+# startup, so it must ship with the package.
+py-modules = ["mcp_server", "tool_catalog"]

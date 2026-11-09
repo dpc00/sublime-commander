@@ -1,0 +1,914 @@
+# Changelog
+
+## Unreleased
+
+`get_sheets` and `get_open_files` said nothing was open while a tab was on screen.
+
+A new window's untouched untitled buffer is a view the window shows but that `window.sheets()` and
+`window.views()` leave out, while `window.selected_sheets_in_group()` does return it. The reply
+therefore carried `selected_sheet_ids: [16]` and `active_sheet_id: 16` with `sheets: []` and
+`windows[].sheets: 0` — an answer that contradicted itself, and `get_open_files` returned `files: []`
+for the same window.
+
+Measured 2026-11-08 on the 4215 portable through the MCP tools only: `run_command new_window`, then
+`get_sheets` gave `sheets: []` with active id 16, and `ui_type_text "x"` — one character, making the
+buffer dirty and giving it a name — made the same sheet appear. The screenshot of that window showed
+one tab throughout.
+
+Both tools now add any selected sheet the iterated lists omit, marked `"placeholder": true`, and the
+described window's `sheets` count is what the list actually holds. Verified after `reload_plugins`:
+`get_sheets {"window": 3}` listed the placeholder sheet with ids agreeing (28), `windows[].sheets`
+said 1, and the person's own five-tab window was unchanged.
+
+## 1.18.7
+
+`list_native_windows` and `dismiss_native_window` could not see a dialog that a **package** opened.
+A command of Sublime's own raises its dialog in `sublime_text.exe`, but a package that calls
+`sublime.ok_cancel_dialog`, or drives a native dialog through ctypes, creates it in the
+plugin-host process — and the tools walked only `sublime_text.exe`. Found by retesting
+ColorHelper's OS colour picker (fork branch `native-picker-off-main-thread`, PR #285): the picker
+was running off the main thread and waiting for a person, and `list_native_windows` reported no
+dialog at all. Measured on the portable 4215: five `#32770 "Color"` dialogs sat unlisted in
+`plugin_host-3.14` (visible instantly with `native_windows.list_windows(os.getpid())`), so none
+could be read or dismissed, and a callback blocked in one looked like a hang.
+
+`list_windows`/`dismiss` now take a pid or a set of pids, and `_native_window_pids()` gives both
+`sublime_text.exe` and this plugin host. Verified live: the picker's dialog showed as
+`dialog "Color"` with `OK`/`Cancel` within 2 s, `dismiss_native_window {"action": "cancel"}`
+answered `{ok: true, closed: true}`, ColorHelper's `_native_picker_busy` went false (its worker
+thread returned), and `get_sheets` answered in 0.02 s while the dialog was up — the off-main-thread
+picker behaving exactly as its PR claims. Not covered: dialogs raised by the *other* plugin host
+(Python 3.3); nothing is known to raise one, and the 3.3 companion would have to report its own pid.
+
+## 1.18.6
+
+`pick_quick_panel` no longer hangs when the item it picks opens a native dialog. The package's
+callback ran inside the main-thread dispatch, so Jekyll's "Delete this Jekyll file? / Confirm Delete"
+(the 4.0.0 wording; 3.1.7 and the guide call it "Confirm Delete") blocked the main thread for as long
+as the dialog stayed up — and the answer never arrived at all: `curl -m 12` on
+`/pick_quick_panel` returned `status=000` after 12.0 s, and a `40 s` client read the same nothing,
+while `list_native_windows` meanwhile reported `main_thread_blocked: true`,
+`blocked_by: "sublime_mcp.py:3150"`, `dispatch_running_seconds` already 2.2 s. The 5 s main-thread
+timeout the guide promises never surfaced: the caller got silence where it needed "a dialog is open,
+dismiss it". Found while exercising the released Jekyll 3.1.7 and the upstream 4.0.0 against 1.18.5.
+
+The callback is now scheduled with `sublime.set_timeout` after the validation and the panel close, so
+the request never waits inside it: a fast callback still returns its real `{ok, picked, item}`
+(measured 0.02 s), and one that opens a dialog answers `{ok, picked, item, pending: true, note}` after
+`_PICK_CALLBACK_WAIT_SECONDS` (1 s), the same shape the Python 3.3 host's pick has always used (2 s
+there). Nothing else changed: cancel (`index -1`), "give index or text, not both", the index bounds
+and the "text matched N items" error answer exactly as before, and a callback that raises is still
+reported as `error` with its exception.
+
+Verified on the portable 4215 with Jekyll 4.0.0 built from `main` (no `imghdr`, `.python-version`
+3.8) and its own remove flow: panel recorded as a `QuickPanelItem`, pick answered `pending: true` in
+1.0 s, the "Delete this Jekyll file?" dialog was read by `list_native_windows` (both buttons named),
+`dismiss_native_window` cancelled it, the post file survived and the record cleared. The same panel
+recorded from Jekyll 3.1.7 in the Python 3.3 host still answers `pending` after 2 s. Not tested: a
+callback that blocks the main thread for a non-dialog reason (a long job) — it now answers `pending`
+and the work continues; the note names `list_native_windows` either way.
+
+**A preview is a tab, and the tools could not see one.** Chasing why Jekyll 4.0's edit-config
+"opened no view" turned up the real behaviour on 4215: `open_file(path, sublime.TRANSIENT)` returns a
+view that is valid, active and holds the file's text, but neither `window.views()` nor
+`window.sheets()` lists it — only `selected_sheets_in_group()` and `find_open_file(path)` do. So
+`get_sheets` and `get_open_files` reported nothing open while a preview was in front of the person,
+`_resolve_view` could not find it by name, and `close_file` by name answered `{ok: true, closed:
+true}` **without closing it** (its dispatch used `get_view_index`, which returns index `-1` for a
+preview, so `close_by_index` closed nothing; the "still open" check iterated `views()` and agreed).
+All of them now go through `_preview_views(window)`: previews are listed with `type:
+"PreviewSheet"` / `preview: true`, resolvable by name and index, and closed through Sublime's own
+`close_file` command after focusing, so host hooks still run. Measured: preview opened → sheets
+`[PreviewSheet target.yml, preview true]`, `get_open_files` lists it, `close_file name=target.yml` →
+`{ok, closed: true}`, sheets `[]`, `find_open_file` false. The window's own empty preview slot is
+skipped, so an idle window still reports `sheets: []`.
+
+## 1.18.5
+
+The Python 3.3 quick panel helper was tested end to end on the portable 4215 (Python 3.14 host, plus
+`plugin_host-3.3` with `"disable_plugin_host_3.3": false`), and four things it got wrong are fixed.
+
+**`pick_quick_panel` could answer `{ok: true, pending: true}` when no pick was ever sent.** The 3.3
+route sent the pick without asking the host whether a panel was recorded there; the 2 s timeout then
+produced the "the package's callback has not finished, a dialog may be open" answer. With
+`install_py33_helper` on and the helper package absent (its source unreadable, or the package not yet
+loaded) that answer was a lie: reproduced on 4215 with the helper deleted, pick returned `pending` with
+no command run and no dialog open. It now asks the 3.3 host for the panel first and only then sends the
+pick, so the same state answers "no recorded quick panel" with a note saying whether the helper is in
+Packages and whether it could not be written; `pending` is reported only when that host answered, which
+means a callback really is running. Cost: one extra round trip (a few tens of ms) on every 3.3 pick.
+
+**The helper could be loaded into the host it exists to complement.** On 4213+ Python 3.3 is disabled by
+default and Sublime runs a package that asks for 3.3 in the default host instead. Measured on the
+portable: with the marker-less package, the 3.14 host had `show_quick_panel` wrapped twice, the helper's
+frame on top, so `_sublime_mcp_orig` was hidden — after any plugin reload `_remove_quick_panel_recorder`
+would have been a no-op and the recorder would have kept writing into the unloaded module. sublime-mcp
+now writes a `.python-version` file holding `3.3` next to the helper, and the helper does nothing at all
+unless it is in the 3.3 host (`sys.version_info`), printing one line to the console when it is not.
+
+**Turning `install_py33_helper` on did nothing until Sublime restarted, and turning it off was never
+noticed.** The value was read once, at plugin load. A settings listener (`add_on_change`) now runs the
+same function on a change, so the bridge starts and stops with the setting; `_PY33_INSTALLED` records
+whether the files could be written, and the "no recorded quick panel" note says when a restart is still
+needed to load a freshly written package, and that 4213+ needs `"disable_plugin_host_3.3": false` for
+the 3.3 host to exist at all.
+
+Also: the quick panel tools resolve the window whose id they captured before asking, instead of
+re-reading `active_window()` after the answer (a pick could otherwise land in a window the caller never
+saw); answer files that a timed-out reader left behind are swept at plugin load (one was left by a pick
+whose callback raised the file-open dialog: the helper wrote its answer after the 2 s deadline and
+nothing read it); and the helper's `os.makedirs` no longer fails if the 3.8 host made the same folder.
+
+Verified on 4215 with a throwaway 3.3-host package: a 3.3 panel listed, picked by text and by index,
+cancelled with index -1 (callback gets -1), its callback's index recorded in both directions; a pick
+whose callback opened the native Open file dialog answered `pending` and the dialog was then read by
+`list_native_windows` and closed by `dismiss_native_window`; setting the flag off in a running Sublime
+turned the bridge off at once and a 3.3 panel became invisible, and turning it back on restored it
+without a restart; panels from the default host still list and pick, and a panel in a second window is
+not picked from the first. The dialog path was exercised twice by a startup Package Control dialog,
+which `list_native_windows` reported (message text included) and `dismiss_native_window` closed while
+Sublime's main thread was blocked. Not tested: a build before 4213, where the default host is 3.3
+itself; the code path there is unchanged.
+
+## 1.18.4
+
+Documentation only: no code changed. The 1.18.3 tag was cut while 170 lines of guide and skill text were
+still uncommitted, so anyone reading the repo or the release page at that tag got the previous guide —
+the walls about what a call costs and why batching is the lever, the Find in Files rules (where entries
+are separate from patterns, and a toggle is a no-op unless the caret is in the Find box), and the
+`ui_screenshot` deadline and screen fallback that 1.18.2 had shipped. That text is in this commit, along
+with `skills/release/SKILL.md`, which states the invariant that ended the run of incomplete releases: the
+tagged commit contains everything the release claims, proved with `git status --short` and
+`git log --oneline <tag>..HEAD` both empty.
+
+Nothing to re-verify at runtime beyond the server starting and `get_help` serving the new sections; the
+two fixes in 1.18.3 keep their own tested accounts below. The PyPI wheel and the npm tarball contain no
+markdown, so registry users see no difference in the installed files — this release exists so the
+repository, the tag and the GitHub release page carry the guide that matches the code.
+
+## 1.18.3
+
+A `batch` no longer dies as a whole when one of its calls cannot reach Sublime's main thread. Each nested call already had a 5 s main-thread timeout, but the batch ran every call regardless: six calls against a blocked main thread, which is what closing a tab whose file had been deleted leaves behind ("Save Deleted File?"), meant 30 s of waiting — exactly the client's limit — so the reply was a transport timeout rather than an answer, and the work it had done was invisible. Now the first `main-thread timeout` ends the loop: that error is returned, a following entry says how many calls were not run and that dismissing the dialog and re-running them is the cure, and the reply arrives in about 5 s.
+
+Tested on the portable 4215: opened a file, deleted it on disk, then batched `close_file` + `get_open_files` + `goto_line`. The reply came back in about 5 s with the dialog error and `not run: the remaining 2 call(s) …`; before the change the same batch reached the client's 30 s limit. With the dialog dismissed the same calls ran normally, and an ordinary batch (six `close_file` calls) still returns one result per call.
+
+## 1.18.2
+
+`ui_screenshot` no longer freezes the editor when the window it captures is not answering. It rendered with `PrintWindow(hwnd, mdc, PW_RENDERFULLCONTENT)`, which sends WM_PRINT to the target window and waits for that window's thread; while Sublime's UI thread was busy or blocked the call simply waited, so the editor looked hung and the keyboard did nothing (reported 2026-11-07: "your use of sublime-mcp screenshot tool hangs ui, stops keyboard input"), and nothing bounded the wait. Now the window is asked for a `WM_NULL` first (`SendMessageTimeoutW` with `SMTO_ABORTIFHUNG`, 1500 ms) and an unresponsive window is refused with an explanation rather than asked to render; the render runs on a worker thread with a 2.5 s deadline, and if it overruns, the picture is copied off the desktop with `BitBlt`, which never involves the target thread at all. That fallback marks itself: the result carries `fallback: "screen"` and a note that anything covering the window is in the picture, and if neither path works the error is `could not capture hwnd …` instead of a dead call.
+
+Tested on the portable 4215 (Python 3.14 host): the module compiles, the package was restarted, `ui_screenshot` returned the editor's picture quickly, and `goto_line` and `get_word_at_cursor` answered immediately afterwards — the editor stayed responsive, which is the whole point; a `window_title` that matches nothing returns the window list instantly instead of hanging. Not tested: the screen-fallback branch against a genuinely stuck UI thread, because forcing one would have hung the editor again, so that branch is covered by its code path only.
+
+## 1.18.1
+
+The "main-thread timeout" message now says where the main thread is stuck: when a call to the main thread times out, the message names the plugin file and line the plugin host's main thread is in (found while a package, SublimeAnarchy, looped forever in a path walk on Windows and froze the editor for a tool call that gave no cause). The AGENT_GUIDE terminal-tab section was rewritten: always send the Return, one batch, read the tab first; the prompt at the end is the test; end a launched console with `ai_terminal_end_session`, never just close it.
+
+## 1.18.0
+
+Two breaking changes: the `install_package` and `search_packages` tools are removed (Package Control's job), and `close_file` with none of `path`, `name`, `index` refuses instead of closing the active tab. Fixes found by the package audit and by a sweep of every tool on a portable 4215: a task dialog's message is returned (UI Automation), tool calls no longer hang while a dialog blocks Sublime's main thread (the consent setting is read by a settings listener), `dismiss_native_window` clicks again when the first click is dropped and can cancel the Windows file-operation progress window, and the main-thread timeout message names the real blocker. The sweep script no longer hangs Sublime at its end. Tool count 379. Each change below says how it was tested.
+
+`dismiss_native_window` clicks a button a second time when the dialog is still open after the first click. The first `BM_CLICK` on a dialog that is not yet active was dropped: on Package Control's real "needs to be restarted for installed or updated libraries" message (its OK button was not yet the default) the first click left the dialog open (`closed: false`, still listed) and the second closed it. Seen twice on build 4215 with that dialog (bug log B14: the first time while a hang, B13, was also present, which I wrongly blamed; the second time after B13 was fixed). A message dialog raised by a plugin closed on the first click both times it was tried. Now the result says `retried: true` and one call closes it: tested with a fresh start of the portable that raised the real dialog, `dismiss_native_window` `action="button"` `button="OK"` returned `closed: true, retried: true`. The retry only clicks the same button of the same window handle, so a dialog that closed meanwhile is not clicked again.
+
+The "main-thread timeout" message named the wrong windows. It listed every plain Sublime window that was open (Switch Project, Indexing Status, About, a settings editor) as a blocker, and left out the real one when it was the Windows file-operation progress window (class `OperationStatusWindow`, kind `other`). Now `dialog`, `menu` and `other` windows are named, and a plain `window` only when it is modal, which Windows shows by the editor window that owns it being disabled. Found while testing the progress window the guide called untouchable: `delete_folder` on a 150,000-file folder opened "Discovered 44,417 items (86.6 MB)...", the error named "Sublime Text", "Switch Project" and "Indexing Status" (all only open) and not the progress window; after the fix it names `"Discovered 44,417 items (86.6 MB)..." (other)`. The same test showed `list_native_windows` lists the progress window, `ui_screenshot` with its `hwnd` shows it, and `dismiss_native_window` with `close` cancels the operation (title "Canceling - 0% complete"); AGENT_GUIDE said `dismiss_native_window` could not see it, which was wrong, and now says what works.
+
+The `install_package` and `search_packages` tools are removed. Installing and searching packages is Package Control's job, and sublime-mcp must work without Package Control: both reached into Package Control's `PackageManager` (and `install_package` installed the package without its libraries, so a package that needs one failed to load). Package Control's own commands are not touched: open its Install Package picker with `run_command` (`show_overlay` with `command_palette` and the text "Package Control: Install Package", or the command `install_package` itself), filter it with `get_quick_panel` and answer with `pick_quick_panel`, as before. Removed from the tool list, both proxies (`http.js`, `mcp_server.py`, the fallback tool lists), `tool_tree.json` and its builder, both copies of `AGENT_GUIDE.md` and `skills/sublime-mcp/SKILL.md`. A client that called either tool now gets "unknown tool". Tested on a portable 4215: both tools are unknown, and `run_command` `install_package` still opens Package Control's picker (`get_quick_panel` listed 4,728 packages; closed with Escape). Kept: `install_package_control`, a Sublime command (it exists without Package Control; it installs it).
+
+`close_file` with none of `path`, `name` and `index` no longer closes the active tab: it refuses and lists the open tabs. The active tab is whatever the person clicked last, so a call meant for a test tab closed the tab the person was using (found in the package audit on 2026-10-20, bug log B1: a Claude tab closed under someone typing in it). Every named form (`path`, `name`, `index`, with or without `discard`) works as before. This changes a tool's behaviour: a client that relied on the no-name form must now pass `name` or `index` (both are in `get_open_files`). Tested on a portable 4215: no arguments refused and the tab stayed open; `index` closed an untitled tab (`closed: true`); a name that fits nothing closed nothing. Not tested: a name that fits several tabs after this edit (unchanged code path).
+
+`list_native_windows` and `dismiss_native_window` answer again while a dialog blocks Sublime's main thread. Since the commit "Consent: read require_consent_for_destructive on every call", every call read that setting with `sublime.load_settings` on its request thread, and that call waits for the main thread. With a modal dialog open (Package Control's "needs to be restarted for installed or updated libraries" message, raised on the main thread), the next tool call hung until the client timed out (30 s "Legacy SSE response timeout"), so the tools meant to answer the dialog could not be reached. The setting is now copied into `_REQUIRE_CONSENT` by a settings listener (`add_on_change`), so a change still needs no restart and no request thread touches the sublime API. Found while testing the task-dialog fix on a portable 4215: before, `list_native_windows` timed out with the dialog open (reproduced twice with Package Control's own dialog and once with a `sublime.message_dialog` call on the main thread); after, it answered with `main_thread_blocked: true`, the dialog text and `blocked_by`, and `dismiss_native_window` with `action="button"`, `button="OK"` closed it (`closed: true`). Not tested: changing the setting while Sublime runs (the listener) on a real edit of the settings file.
+
+`list_native_windows` (and `run_command` with `settle_ms`, which returns the dialogs a command raised) now reports the message of a Windows task dialog. A task dialog, the kind with custom button text such as "Install" / "Cancel" that Package Control and `sublime.ok_cancel_dialog` raise, draws its text without child windows of class `Static`, so `messages` was always `[]` and only a computer-use client could read the dialog. `lib/native_windows.py` now falls back to UI Automation (`IUIAutomation` called through ctypes vtables, no helper process, no extra package): the names of the dialog's Text elements. Found while comparing the tools with computer-use for the package audit; tested on a portable 4215 with a dialog from a Python plugin (`messages` was `["dlgtest: choose Install or Cancel"]`, before the change `[]`), once with the function called directly from a separate Python process and once through the restarted plugin (`run_command` with `settle_ms`, then `list_native_windows` with the dialog open). Not tested: the Windows progress window, and dialogs on other Windows builds.
+
+## 1.17.6
+
+Destructive tools could never be approved on a 2025-11-25 SSE connection. The approval question was only built for the 2026-07-28 connection, so a client on the older connection (Claude Code 2.1.312 on a portable's `/sse` endpoint) always got "this client cannot be asked for approval (no elicitation support)", although its `initialize` declared `elicitation`. `close_file` with `discard`, `eval_python`, `delete_file` and the other gated calls were refused outright. Now, when the client declared elicitation in `initialize`, the server sends `elicitation/create` to it over the session's SSE stream, waits up to five minutes for the answer, and runs the call only on "accept"; a decline, a cancel, no answer or a lost session is "denied, nothing was changed". Streamable HTTP without the 2026-07-28 header and the HTTP bridge are unchanged (still refused). Found as B11 in the audit; read in `lib/consent.py` and `sublime_mcp.py` (`_consent_gate_result`), then tested on the audit portable 4215 with Claude Code 2.1.312: `close_file` with `discard` logged "consent: asking" and "consent: approved" and closed the tab. The decline and timeout answers were not tested (the client answered accept at once).
+
+## 1.17.5
+
+`get_view_phantoms` can read one long phantom in slices. New `offset` argument: characters to skip at the start of each phantom's text, applied before `max_chars`, so `offset` plus `max_chars` pages through a phantom. A phantom whose text is cut, or read with an offset, now carries `text_length`, its full length. The tool had only a cut at the start (`max_chars`), so the end of a long phantom could not be read: omp's `/changelog` in a GhostShell tab is one phantom of 59,788 characters. Found reading that changelog on the main Sublime, then tested there: the whole phantom reads in slices, offset 58,500 with `max_chars` 1,000 leaves 288 characters, exactly the 59,788 total. Behaviour without `offset` is unchanged apart from `text_length`. The proxy fallback catalogs are regenerated.
+
+## 1.17.4
+
+Corrects 1.17.3: the approval prompt for `eval_python` still hid most of the code in Claude Code, which folds a prompt to about three short lines (`import sublime … (+3 more lines)`, and a long single line is cut at the screen width), so the person approved a program they could not read. When the gate asks, it now also opens a panel at the bottom of Sublime's window with the whole code (every `eval_python` in a `batch`, Python highlighting), and the prompt says to read all of it there and shows the first line and the line count. The panel closes when the question is answered; if the question is cancelled with Esc it stays until the next question or until closed by hand. If no window is open to show the panel, the prompt falls back to the whole code on one line (`\n` marks a line break); code over 6000 characters is still refused. Found by looking at the real prompt on the main Sublime (screenshots of the old and new prompt), then tested live there: the panel shows all five lines, the prompt names it, the panel is gone after Accept.
+
+## 1.17.3
+
+The approval prompt for `eval_python` now shows all of the code. It used to show only the first line, cut at 120 characters, so a person could approve a harmless first line and have the lines after it run unseen. The prompt carries the whole code, and code longer than 6000 characters is refused with a request to send it in smaller pieces, since an approval of lines nobody saw is no approval. The console log lines for consent stay short. Tested on a portable with the 1.17.2 plugin over the 2026-07-28 connection: ask (all lines shown), decline (nothing runs), accept (runs), a used approval is refused and asked again, an approval for different code is asked again, 11,999 characters are refused, a client that cannot be asked is refused with the code shown. Not changed: `eval_python` stays open on the HTTP bridge (local tools drive the editor through it), and without an `auth_token` any local program can reach the bridge.
+
+## 1.17.2
+
+Three fixes for calls that answered `ok` while Sublime had not done the thing, all found in the WSL Sublime during the package audit and tested there. `save_file` refuses with an error when the file's folder does not exist (it used to answer ok while Sublime showed an "Unable to save" dialog and left the tab modified), and its result says `saved: true`, or `saved: false` with `pending: true` and a note when the tab is still modified after 1.5 s (a Save As dialog for an untitled tab, an error dialog, a read-only file). `get_sheets` and `get_open_files` add `disk_differs: true` to a tab that reads as clean (`is_dirty: false`) but holds an empty buffer for a file that has content on disk, which is the case that made Sublime count the buffer as modified and ask "Save changes?" on every close (reproduced on demand: open a path that does not exist yet, then write the file). Off Windows, the "main-thread timeout" message and the errors of `list_native_windows` and `dismiss_native_window` now say that no tool can list or dismiss a dialog there, to look at the screen, and that under WSL (WSLg) a computer-use client can read the dialog (window titled " (Ubuntu)") and click its button; the guide has a section for it. And:
+
+`close_file` now says whether the tab really closed. It only asks Sublime to close the tab, and the tab stays open when Sublime shows "Save changes before closing?" (this also happens for a tab that `get_sheets` reports as `is_dirty: false`, for example a file created after its tab was opened: the title bar shows the modified dot) or when a host hook refuses. Before, the call answered `ok` either way, and each retry raised another dialog (five retries on a `config.py` tab raised five). The result now carries `closed: true`, or `closed: false` with `pending: true` and a note when the tab is still open after 1.5 s. Found in the WSL Sublime during the package audit; tested there with a dirty tab (pending, dialog answered on screen) and with `discard` (`closed: true`).
+
+## 1.17.1
+
+Guides only, no code change. `AGENT_GUIDE.md` (served by `get_help`), `docs/AGENT_GUIDE.md`, `docs/agents.md` and `skills/sublime-mcp/SKILL.md` said things that 1.17.0 made false: the quick-start closed a tab through `eval_python` (which now asks the person every time; it uses `close_file` with `name` and `discard`), the terminal-typing guard used `eval_python` (it uses `get_sheets` `is_focused`), and the sections on closing tabs, `revert_file`, `delete_file`/`delete_folder`, `get_active_file` (content cut at 20000 characters) and `open_file` (returns once the file is loaded and active) lacked the new behavior. Every guide now says to name the tab, that a name fitting several tabs is refused, and that "Denied, nothing was changed" is a no to respect. `docs/AGENT_GUIDE.md` was an older copy that had drifted; it is now the same text as the root guide.
+
+## 1.17.0
+
+- **Destructive tool calls now ask the person first, the way computer-use-mcp does.** A tools/call that deletes a file or folder, reverts a tab, closes a window or workspace, removes a project folder, quits Sublime (`exit`), runs `eval_python`, or closes a tab with `discard`, and a `run_command` of any of those commands, is no longer run at once. On a `2026-07-28` connection the server answers `resultType: "input_required"` with an `elicitation/create` form question; the client shows it (Claude Code draws an Accept / Decline prompt in the terminal, whatever the allow list says) and repeats the call with the answer. The action runs only on `accept`. A `batch` is read call by call and asks once, before any call of it runs. A client that did not declare elicitation, and every pre-2026-07-28 connection, gets "Denied, nothing was changed". The pending question lives in the server (`lib/consent.py`): the `requestState` token is a random key, valid once, for the same tool and arguments, for 5 minutes, so a client cannot invent one. Decisions are printed in the console (`consent: asking / approved / declined`). The setting `require_consent_for_destructive` (default true) turns it off. Not covered: tools that are not on the list. (The direct HTTP bridge is covered by the next entry.) This replaces the "no elicitation" line in the 1.16.2 note below for the server-to-client direction. Tested with POSTs to `/mcp` (ask, accept, decline, reused token, forged token, changed arguments, no elicitation capability, pre-2026-07-28 request, batch, safe call) and once end to end with Claude Code 2.1.312, which showed the prompt and ran the action after Accept.
+
+- **`close_file` and `revert_file` refuse a name that fits several tabs, and `revert_file`, `get_view_size` and `get_view_chars` can name their tab.** `close_file name="rep"` used to take the first tab whose title contains "rep" and, with `discard`, throw its edits away. Now a name that fits more than one tab is refused with the candidates and their indexes, unless exactly one tab has exactly that name. `revert_file` took no argument and always reverted the active tab; it now takes `name` or `index` (with neither it still reverts the active tab). `get_view_chars` silently dropped an `index` argument and read the active tab; it and `get_view_size` now accept `index`. The proxies' copy of these schemas is regenerated at the next release. Tested on the portable with two tabs ("report", "report extended"): the shared prefix was refused by both tools with nothing changed, the exact name closed only its tab, a unique partial name worked, and index reads returned the right tab.
+
+- **`get_active_file` cuts its content at 20000 characters by default, and `set_setting` can name its tab.** A whole tab can be tens of kilobytes (the agent's own terminal tab came back as 28 KB), and all of it stays in the conversation. The reply now always carries `size` (the full length); when the content is cut it also has `truncated: true`, `returned_chars` and a note saying how to read the rest (`get_view_chars begin/end`, or `max_chars=0` for everything). New argument `max_chars` (0 = no limit). Callers that read whole files from `get_active_file` must pass `max_chars=0` or check `truncated`. `set_setting` with `scope: "view"` always went to the active tab; it now takes `name` or `index` like the other tab tools (a name that fits several tabs is refused). Tested on the portable: a 25000-character tab was cut at 20000 by default, `max_chars=100` and `max_chars=0` behaved, a short tab was not marked truncated, and `set_setting index=0` changed only tab 0 while tab 1 was active. The proxies' copy of these schemas is regenerated at the next release.
+
+- **The direct HTTP bridge refuses the destructive routes.** The bridge (port 9500 by default) cannot ask the person, so with `require_consent_for_destructive` on it answers `403` "Denied, nothing was changed" to `delete_file`, `delete_folder`, `revert_file`, `revert`, `close_window`, `close_workspace`, `remove_folder`, `exit`, a `close_file` with `discard`, a `run_command` of those commands, and a `batch` containing any of them. `eval_python` stays open on the bridge, because local tools drive the editor through it. **The `sublime-mcp` Python and Node proxy packages reach Sublime through this bridge, so a client that connects through them gets the refusal for these tools and cannot be asked;** use the direct `http://127.0.0.1:9502/mcp` connection with a client that supports elicitation, or set `require_consent_for_destructive` to `false`. None of the projects under `C:\Users\donal\projects` calls these routes. The setting is read only when the plugin starts, so a change needs a Sublime restart (a plugin reload right after editing the file did not pick it up). Tested on the portable with the setting on: reads, a plain `close_file` and `eval_python` passed; every destructive route and `run_command exit` was refused and Sublime stayed up. Before the setting was loaded, the same calls ran: `delete_file` returned ok and `run_command exit` quit the portable.
+
+- **`get_package_mcp_info` says which Python host a package is in.** New fields: `python_version_file` (the package's `.python-version`, read from the folder or the `.sublime-package`, or null), `loaded_in_this_host` (true when a command or listener of the package is loaded in the same Python host as sublime-mcp), `this_host_python` and a `host_note`. A package whose classes are not in this host (another plugin host, no Python plugins, or still loading) used to show an empty command list with no explanation, and nothing said whether its plugin host was up. On build 4215 the declared version does not decide the host (MCP Commander and Package Control declare 3.8 and run in the 3.14.6 host), so `loaded_in_this_host` is the field to trust. Checked on the portable with MCP Commander, Package Control, Default, a theme with no Python and a missing package. Sublime has no call that lists plugin hosts, so the processes themselves are not enumerated.
+
+- **`open_file` returns only once the file is loaded and is the active tab.** It used to hand the path to Sublime and return at once; until Sublime had made the new tab active, the previous tab still was, so a `ui_type_text` or any active-tab tool sent next landed in the wrong tab (seen with an untitled buffer as the previous tab). The result now says `active: true`; if that takes longer than 3 s it says `pending: true` with a note to check `get_sheets` first. Reproduced on the portable before the change (the typed text went to the untitled tab in 1 of 3 runs) and 8 of 8 runs typed into the right tab after it.
+
+- **`AGENT_GUIDE.md` has a section "Destructive tools ask the person first"**: what the prompt is, that "Denied, nothing was changed" is not to be retried or worked around, and that vague names can ask about the wrong tab.
+
+- **The console prints, once per client, what it declares** (`sublime-mcp: client declares (...)`): protocol version, client name and capabilities. It showed that Claude Code 2.1.312 declares `elicitation: {form, url}` on the 2026-07-28 revision.
+
+## 1.16.2
+
+- **`initialize` now negotiates the protocol version, and unknown methods and tools get the standard JSON-RPC errors.** The server always answered `2024-11-05`, whatever the client asked for, so clients that start with `2025-11-25` (for example oh-my-pi) were told they had the legacy revision. It now echoes the client's version when it is one of `2025-11-25`, `2025-06-18`, `2025-03-26` or `2024-11-05`, and otherwise answers `2025-11-25`. An unknown method returns `-32601` (was `-32603`), an unknown tool `-32602`. `notifications/cancelled` is still accepted and ignored: a running Sublime command cannot be interrupted. Tested against the running plugin with POSTs to `/mcp` (`initialize` with `2025-11-25` answered `2025-11-25`; a bogus method gave `-32601`, an unknown tool `-32602`); not run with oh-my-pi itself.
+
+- **`tools/check_mcp_compat.py` warns when the MCP side needs an upgrade.** It exits 1 and prints what to look at when (1) the MCP specification has a revision newer than the newest one in `_MCP_MODERN_VERSIONS` / `_MCP_LEGACY_VERSIONS`, (2) the oh-my-pi changelog has MCP-related entries newer than the version in `tools/mcp_compat_state.json` (`--ack` records the current one as reviewed), or (3) with `--url http://127.0.0.1:9502/mcp`, the running server fails its protocol probes (legacy `initialize` for each legacy version; modern `server/discover`, `tools/list`, header mismatch, unknown method and unsupported version). Run it on a schedule.
+
+- **The MCP endpoint now speaks protocol revision `2026-07-28` as well as `2025-11-25` and older.** A request with `io.modelcontextprotocol/protocolVersion` in `params._meta` is served the 2026-07-28 way, with no `initialize` and no session; anything else is served as before. Added: `server/discover` (supported versions, capabilities, instructions, `ttlMs`, `cacheScope`); `resultType: "complete"` and `_meta` `serverInfo` on every modern result; `ttlMs: 0` and `cacheScope: "private"` on `tools/list`; HTTP checks that `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` (including the `=?base64?…?=` form) match the body (`400`, `-32020` `HeaderMismatch`); `400` with `-32022` `UnsupportedProtocolVersion` and the supported list for an unknown version; `404` with `-32601` for an unknown method; `405` for `GET` and `DELETE` on `/mcp`. Not in the modern era: `ping` and `initialize` (unknown methods), `subscriptions/listen` and the `listChanged` capability (the server advertises none), sampling and elicitation. Tool failures are now reported as `isError: true` results in every protocol version instead of a `-32603` error; a tool that does not exist is still `-32602`. Tested by running the handler with `tools/check_mcp_compat.py`, which covers each case above, and by a modern `tools/call` with plain and base64 `Mcp-Name`; the plugin running in Sublime was not reloaded for that test.
+
+- **The visible console read waits longer on each retry and says where it clicked when it fails.** The 5 ms gaps between the click, Ctrl+A and Ctrl+C failed two reads in a row on build 4200 under the Numix theme (it copied only an empty line). Each retry now waits 6 times, then 20 times, as long, and the error names the click point, the window size and the number of reads. Checked once on 4200 (a visible read succeeded); the failing path was not reproduced again.
+
+## 1.16.1
+
+- **`get_active_file` and `get_sheets` now report the syntax of a view whose syntax was set through a legacy path.** Old Python 3.3 packages set `Packages/CSS/CSS.tmLanguage`; Sublime shows the syntax in the status bar, but `view.syntax()` returns None, so both tools said `syntax: null`. They now fall back to the view's `syntax` setting (`syntax: "CSS"`, `syntax_path: "Packages/CSS/CSS.tmLanguage"`). Found with eCSStractor; tested on build 4200 with a view set to `Packages/CSS/CSS.tmLanguage`.
+
+- **A pick whose Python 3.3 package callback raises a modal dialog no longer fails with a timeout.** `pick_quick_panel` waited for the callback inside a 5-second main-thread call, so Jekyll's remove commands ("Confirm Delete") gave `main-thread timeout after 5s` although the pick had gone through. The pick is now sent without waiting; if the callback has not finished after 2 s the answer is `{ok: true, pending: true, note: ...}` telling the caller to check `list_native_windows` and answer the dialog. The helper is no longer switched off for 10 s after such a pick. Also: a transient `[Errno 13] Permission denied` when reading the helper's answer file lost the answer of a pick that had already run; the read is now retried. Tested on build 4200 with a 3.3 test package whose callback opens a dialog.
+
+- **`focus_sheet` no longer echoes the 100+ view settings (about 7 KB) on every call.** Pass `settings: true` to get them, as `get_sheets` does. The proxies' copy of the schema is regenerated at the next release.
+
+## 1.16.0
+
+- **The first overlay after a visible console read is no longer lost.** After `get_console(mode="visible", force_focus=true)` the window is sent back behind the user's window, and on build 4200 the first overlay a command opened (`show_overlay`, or a package's quick panel such as Bower's `install`) closed again at once; the second one stayed. The read now opens and closes one overlay (Goto Anything) in that window once it is no longer in front, so the caller's first overlay stays. Found with Bower; tested with Goto Anything, the command palette and Bower's picker.
+
+- **Two visible console reads in a row no longer alternate with a failure.** Every second read copied only an empty line (`the console did not have the focus`, panel open, 2 characters copied): the click had not given the console output the keyboard focus. The read now clicks and copies once more when the capture marker is missing, and the error shows what was copied. Tested on build 4200: six reads in a row, all complete (before: every second one failed).
+
+- **Quick panels opened by Python 3.3 packages can now be read and picked.** `get_quick_panel` and `pick_quick_panel` only saw panels from sublime-mcp's own plugin host (3.8), so packages such as Bower (3.3) gave "no recorded quick panel" while the panel was on screen. With the new setting `"install_py33_helper": true` (default false, so nothing is written to Packages unless the user asks), sublime-mcp copies `py33/mcp_commander_py33.py` into a small package `MCP Commander Py33` in Packages, which Sublime loads in the 3.3 host, and prints one console line saying so. With the setting off, `get_quick_panel` says in a `note` how to turn it on. It records the panel and answers a command, `mcp_py33_quick_panel`, through a JSON file in the cache folder. Tested on build 4200 with Bower's 71,028-item list: text filter, pick by text, cancel (index -1), and the package's callback ran. Not covered: panels opened by Sublime itself (command palette, Goto Anything). If the package is installed as a zip the companion is not copied and a line is printed in the console.
+
+## 1.15.3
+
+- **The sublime-mcp skill now says how to type into a terminal tab.** `skills/sublime-mcp/SKILL.md` gained a short section, the same method as the guide: `get_sheets` for the target and your own sheet id, `focus_sheet` on the target, a check that it is the active tab before anything is typed, `ui_type_text`, `focus_sheet` back to your own tab, and `get_sheet_content` to read the target and quote it, because `ok` from a tool never proves the text arrived. No code changed.
+
+## 1.15.2
+
+- **The guide for typing into a terminal tab is corrected.** GhostShell no longer has a command that sends text into an ai_terminal tab (it removed `ai_terminal_send_string`, `ai_terminal_send_string_window`, `ai_terminal_queue_input` and `ai_terminal_queue_input_to` in 0.2.15). `get_help` and `AGENT_GUIDE.md` now describe doing it as a person does, with sublime-mcp tools only: `get_sheets` to find the tab, `focus_sheet` to select it, a check that it is the active tab, `ui_type_text` to type (a newline is sent as Return), `focus_sheet` back to your own tab, and `get_sheet_content` to read the target and quote it before saying the text was sent. Sheet ids change when Sublime restarts (the cmd tab went from 284 to 12), and a `focus_sheet` on a stale id returned an error and nothing was typed. Tested on a cmd.exe tab on build 4200; for a Claude Code tab it is untested. No code changed.
+
+## 1.15.1
+
+- **`get_console(mode="visible")` is about 12 times faster.** A read took about 2 s because the capture slept a fixed 150 to 400 ms after each of its steps; it now takes about 150 ms. The raise waits until Windows reports the window in front (`GetForegroundWindow`), then 20 ms for Sublime to handle its own activation; the copy waits until the clipboard counter stops changing, then reads once (looking at the clipboard while Sublime copies makes the copy fail). Measured on Windows 11 with the portable builds: 99 of 100 reads on 4215 and 92 of 100 on 4200 succeeded, the rest were focus refusals that sent no input, none returned wrong text. The gaps are in `_CAPTURE_WAITS_MS`; a `/console` request accepts `waits=click=0,...` to try other values.
+- **The "can crash a portable Sublime Text" warning is gone from the tool descriptions, the error messages and the guides.** It came from one test on 2026-10-04 (portable 4200 relaunched for each capture, 2 crashes in 12 for the raise used here) whose script and logs were not kept. About 1,000 raises on portables 4200 and 4215 on 2026-10-19 produced no crash and no new dump file. The two crash dumps on hand (4200 on 2026-10-16, 4215 on 2026-10-18) are access violations with every frame inside `sublime_text.exe` and none in user32, the clipboard, Python or a plugin, so nothing ties them to `force_focus`. The guides now say what was measured, and that Windows refuses the raise on a freshly started Sublime and while the user is typing (no input is sent then).
+
+## 1.15.0
+
+Every tool now passes Sublime's own command and arguments through unchanged: no second names for a real command, no arguments chosen inside the plugin, no tool that does nothing. That leaves 381 tools (was 411). This is a breaking change for anyone who called a removed name; before 1.14.4 most of them did nothing.
+
+- **Removed, because Sublime has no such command** (checked in Sublime's own packages and by running on build 4215): `shrink_selection` (it ran `single_selection`, which has its own tool), `split_line` (it ran `insert` with a newline; use `insert`), `tab` (an internal base class; it had been pointed at `indent`), `auto_complete_prev` (with the popup open it did nothing; move through the popup with `move`), and `syntax_definition_compatability` and `syntax_definition_compatibility` (no effect, no menu entry).
+- **Removed, second names for a real command that has its own tool:** `move_line_up`, `move_line_down` (`swap_line_up`, `swap_line_down`), `auto_indent` (`reindent`), `reopen_closed_file` (`reopen_last_file`), `next_pane`, `prev_pane` (`focus_neighboring_group`), `move_view` (`move_to_group`), `expand_selection_to_indentation`, `_to_scope`, `_to_brackets` (`expand_selection` with `to`), `set_indent_tabs`, `set_indent_spaces` (`set_setting`), `close_others`, `close_other_tabs` (`close_others_by_index`), `new_view` (`new_file`), `transpose_chars` (`transpose`), `toggle_case` (`swap_case`), `trim_whitespace`, `trim_whitespaces` (`trim_trailing_white_space`), `add_missing_newline` (`ensure_newline_at_eof`), `play_macro` (`run_macro`).
+- **Removed, bundles of several commands in an order the plugin chose:** `find_in_files`, `replace_in_files`, `find_and_replace`. Use `run_command` with Sublime's `show_panel` (`{"panel": "find_in_files", "pattern": ..., "replace_pattern": ..., "where": ...}`, or `"panel": "replace"` for one file) and then `replace_all`; `AGENT_GUIDE.md` has the details. `project_search` is unchanged.
+- **Replaced:** `quick_panel` is now `show_overlay` (`overlay` is `goto` or `command_palette`, with `show_files` and `text`), so the overlay is chosen by the caller.
+- **Now plain pass-throughs:** `fold_unfold` runs Sublime's own toggle (1.14.4 had replaced it with plugin logic); `edit_settings` takes `base_file`, `user_file` and `default` and no longer builds paths or default text; `close_unmodified` takes `group` and `index` like `close_others_by_index`; `add_to_kill_ring` requires `forward`; `focus_neighboring_group` takes `forward`; `expand_selection` requires `to` (`smart`, `line`, `line_prev`, `scope`, `brackets`, `tag`, `indentation`). The `_vc` and `_wc` helpers no longer add default arguments.
+- **Schemas completed:** 27 tools did not list arguments that Sublime's own keymaps and menus pass to the command, so an agent could not know about them: `auto_complete` (`commit_single`, `snippets_only`), `clone_file`, `expand_selection_to_paragraph`, `expand_tabs` and `unexpand_tabs`, `find_next`, `find_prev`, `find_under`, `find_under_prev`, `goto_definition`, `goto_reference`, `move_to_neighboring_group`, `new_pane`, `next_view` and `prev_view`, `open_containing_folder`, `paste`, `permute_lines` and `permute_selection` (`operation`), `reindent`, `reopen_last_file`, `replace_all`, `run_macro_file`, `select`, `set_build_system`, `sublime_merge_open_repo`, `switch_file`. The plugin already passed any argument it was given; only the schemas were incomplete.
+- Checked by running and kept: `append`, `fold_all`, `open_project_or_workspace`.
+
+## 1.14.5
+
+- `open_recent_file` takes an `index` (0 is the most recent file). Without it the command opens nothing; the argument was missing from the tool.
+- `AGENT_GUIDE.md`: the tools with side effects now list the dialogs, Sublime windows, pickers and prerequisites found by running every generated tool and checking its effect (build 4215): `close_folder_list`, `delete_file` and `delete_folder` prompts, `remove_license`, the `sublime_merge_*` dialog, `save_macro`, the Changelog, Update, About and Indexing windows, the build variant picker, and the tools that need state set first. `close_window` and `close_all` do not quit Sublime; `exit` and `hot_exit` do.
+- Guides and skills no longer name other authors' packages.
+
+## 1.14.4
+
+Bugs found by testing the tools with real arguments and checking their effects (build 4215):
+
+- `project_search` always ended in "native project search timed out", even though the results were there. It waited for a summary line of the form "N matches in M files"; this Sublime writes "N matches across M files", "1 match in 1 file" (singular) and a bare "0 matches" when nothing is found, and it opens the results in a Find Results tab instead of the output panel when Find's "Use Buffer" is on. It now accepts all of those summaries and asks for the output panel.
+- `lookup_symbol` failed with "'tuple' object has no attribute 'path'": the API returns `(path, display_name, (row, column))` tuples. It now returns them as locations, with the 1-based line and column the API gives.
+- `find_and_replace` ignored its replacement text. The Find panel's Replace box is filled by `replace_pattern`, not `replace`, so `replace_all` replaced with whatever an earlier search had left there (often nothing), the panel opened with the wrong text, and the silent single replace did nothing. All three now work, including regex back-references.
+- `find_in_files` and `replace_in_files` had the same wrong argument and now fill the Replace box.
+- `eval_python_latest` ran the Microsoft Store `python3` stub (exit code 9009, "Python was not found") on a machine that also has a real Python. It now skips interpreters under WindowsApps.
+
+- Tools that pointed at Sublime commands that do not exist (they answered `ok` and did nothing) now run the real command: `move_line_up` and `move_line_down` (`swap_line_up`, `swap_line_down`), `tab` (`indent`), `auto_indent` (`reindent`), `split_line` (inserts a newline), `expand_selection` and its `_to_indentation`, `_to_scope` and `_to_brackets` variants (`expand_selection` with `to`), `shrink_selection` (`single_selection`), `set_indent_tabs` and `set_indent_spaces` (`set_setting translate_tabs_to_spaces`), `next_pane` and `prev_pane` (`focus_neighboring_group`), `move_view` (`move_to_group`), `reopen_closed_file` (`reopen_last_file`).
+- `close_others`, `close_other_tabs` and `close_unmodified` did nothing: the real commands need the group and index of a tab (their default means "the tab that was right-clicked"). They now use the active tab's.
+- Argument names that did not match the Sublime command: `set_max_columns` takes `columns` (the tool said `cols`), `find_in_folder`, `new_file_at` and `new_folder` take `dirs`, `edit_settings` takes `base_file` (the tool's `resource` is now accepted as a shorthand), `add_to_kill_ring` needs `forward`, `arithmetic` needs `expr`, and `quick_panel` now opens Goto Anything (it ran `show_overlay` without saying which overlay). `rename_file` and `view_resource` take no arguments; their descriptions no longer say otherwise. `fold_unfold` now folds, or unfolds when the block is already folded.
+- Descriptions corrected for `sort_selection` (it sorts several selections among themselves, not lines) and `get_view_phantoms` (it sees only phantom sets that a plugin keeps in a module-level `_phantom_sets` dict).
+
+`replace_in_files` now presses the Find in Files panel's Replace button (the window command `replace_all`); Sublime asks "Confirm Replace", and on Replace the changes are made in the open buffers of the matching files. It used to run `replace_in_files`, which is not a Sublime command, and did nothing. Tried with the real mouse and with the tool: Replace gave "bar bar" in the buffer and, after `save_all`, on disk; Cancel left the file unchanged.
+
+## 1.14.3
+
+Back to a plain pass-through. The debugging code is out of the plugin: the `diagnostics` and `main_thread_stack` tools (and their `/diagnostics` and `/main_thread_stack` routes), the 200 ms heartbeat that fed them, the slow-dispatch and timeout console prints, and the GhostShell trace hooks. That leaves 411 tools (was 413). Nothing else about the commands changes. Tool lists, the tool tree and the fallback catalogs are regenerated. The debugging aids now live in a separate plugin, HangWatch, outside this project.
+
+## 1.14.2
+
+Pure pass-through again: sublime-mcp adds nothing around Sublime's commands. 1.14.0 and 1.14.1 added a freeze watchdog (a background thread that wrote Sublime's main-thread stack to `sublime-mcp-freeze.log`, opened that log in a tab at the next start, and added the `MCP Commander: Show Freeze Log` command); it is removed, with its README and guide text. How an agent handles dialogs, the Update window and freezes is now the `sublime-dialogs` skill (`skills/sublime-dialogs/SKILL.md`), not code. The heartbeat fix from 1.14.0 stays: the 200 ms heartbeat was never stopped, and a package reload reset its guard, so each reload left the old timer chain running and started another (a slowdown in long sessions); `plugin_unloaded` now stops it and starting it stops any earlier chain. 1.14.0 and 1.14.1 also changed the line endings of every file they touched to CRLF; 1.14.2 restores LF.
+
+## 1.14.1
+
+Documentation only: the README and both `AGENT_GUIDE.md` copies described the freeze log that 1.14.0 added (removed again in 1.14.2).
+
+## 1.14.0
+
+The heartbeat fix described under 1.14.2, and the freeze watchdog and freeze log (removed in 1.14.2).
+
+## 1.13.8
+
+`ui_hover` with `screenshot=true` returns the picture itself, image first, like `ui_screenshot`, instead of a temp file path (`inline=false` keeps the path). It also takes `region`, `scale` and `max_width`, so a small hover popup can be cropped and zoomed. A language-server (LSP) hover can take a few seconds to appear, so the tool description now says to use a `dwell_ms` of 3000 to 5000 for those; tried with a 4500 ms dwell over a Python symbol, which showed the pyright popup.
+
+## 1.13.7
+
+`ui_screenshot` takes `kind` (`dialog`, `menu`, `editor_window`, `window` or `other`) and captures the first Sublime window of that kind, so one call shows an open native dialog or menu; menus have no title, so `window_title` could not find them. It combines with `window_title`. A plain screenshot, which shows the editor window, now lists any open dialog or menu as `open_popups_not_in_picture` (with its `hwnd`) instead of silently showing the greyed editor. Works while a native dialog has blocked Sublime's main thread. Tried with the File > Open dialog and the File menu.
+
+## 1.13.6
+
+`ui_screenshot` can be aimed and tuned. `window_title` picks the window whose title contains the text (an unmatched title lists the Sublime windows, so a dialog can be captured by its title); `tab` shows a tab that is not in front for the picture, by part of its name or by 0-based index in the active window, and puts the tab that was in front back afterwards. Because that moves the person's focus for a moment, `tab` first waits for their keyboard and mouse to be idle (`min_idle_s` default 3, `wait_idle_s` default 10) and refuses otherwise, like `ui_click`. `scale` zooms (2 doubles the picture so small text is readable; nearest-neighbour, longest side capped at 4096 pixels) and `max_width` shrinks. `save_dir` (an absolute folder) also keeps the PNG in a dated subfolder and returns `saved_path`. The reply is the image first, then one text block with the size and what was captured.
+
+## 1.13.5
+
+`ui_screenshot` is now one of the default tools, so eight tools are listed instead of seven and a screenshot is called directly (`batch` still runs it by name). When `batch` runs a tool that returns images it now puts the image blocks first and the JSON text block after them, like a plain screenshot tool's reply; with the text first the Claude phone app showed no picture. `ui_screenshot` takes an optional `region` (`{x, y, width, height}` in pixels of the window picture) and returns only that part. The Node and Python proxies list `ui_screenshot` in their default tools; `discover_tools` no longer returns it (405 hidden tools).
+
+## 1.13.4
+
+`ui_screenshot` now reaches the client as a real image, also through `batch`, and returns the image itself by default (`inline=false` still saves a PNG and returns its path). Before, `batch` put every result into one `{"results": [...]}` object and the Node and Python proxies wrapped every reply as JSON text, so an image block arrived as base64 text. `batch` now returns a content list when a nested tool returns image blocks: one text block with the JSON results (each image replaced by `[image N below]`), then the image blocks. Both proxies pass a list of image and text blocks through unchanged, and the Python proxy no longer declares a `dict` return type, so it sends no structured-output schema that would conflict with image content. Some clients still flatten or drop MCP images (Continue, Cline CLI, Antigravity ACP, jcode, Copilot CLI); for those use `inline=false`. Tested after a reload in Claude Code and in omp.
+
+## 1.13.3
+
+`get_view_phantoms` takes `last` (newest N phantoms), `html` (false leaves out the HTML and the empty spacer phantoms) and `max_chars` (cuts each text), and reports `total`. A view with hundreds of phantoms, such as a GhostShell omp tab, returned about 290 KB; `html=false, last=20` returns a few kilobytes. Defaults are unchanged.
+
+## 1.13.2
+
+`close_file` takes `discard` (default false): with it, a tab that has unsaved edits is closed at once and the edits are thrown away, instead of raising Sublime's native "Save Changes?" dialog, which blocks the main thread until someone answers it. The result says `discarded` when it did so. Tried on build 4200: an unsaved tab with 17 characters closed immediately, no dialog, `"discarded": true`. Tool count stays 413; the tool lists were regenerated for the new option.
+
+## 1.13.1
+
+Window tools no longer give up when the person at the computer is busy, and the real-key path no longer types over them. `ui_click`, `ui_hover` and `ui_press_key` take `wait_idle_s` (up to 120): the call waits that long for the person to stop typing or moving the mouse (they must have been idle for `min_idle_s`, default 8) before it refuses, instead of failing at once and leaving the agent to retry. `ui_press_key` with `method: input` now always checks that idle time first; before, it sent real key events without a check whenever the target window was already in front, so the keys could land in the middle of something the person was typing. The refusal message says how long they have been idle and points at `wait_idle_s`. A popup menu or other native popup of Sublime Text (the `#32768` windows in `list_native_windows`) can be read and operated by passing its own `hwnd` to `ui_screenshot`, `ui_hover` and `ui_click` (x, y count from the menu's top-left corner); tried for real on build 4200: a screenshot of an open Preferences menu, a hover inside it, and a click that waited for idle. The guide (AGENT_GUIDE.md, docs/AGENT_GUIDE.md) says so. Tool count stays 413; the tool lists were regenerated for the new option.
+
+## 1.13.0
+
+Window tools for Sublime Text's own windows (Windows only), so an agent can see and operate the editor, palettes, quick panels and dialogs without a general computer-use tool (whose OS permission prompt does not appear in a remote session and whose Escape-key lock stops it). `ui_screenshot` saves a PNG of one window of the Sublime process (it works for a window behind others) and returns the path, or the image itself with `inline=true`. `ui_press_key` and `ui_type_text` post keys and characters to a window without moving focus or the pointer; each waits `settle_ms` afterwards because Sublime handles posted input asynchronously. Sublime draws its own editor, palette and popups, so it ignores posted mouse messages and posted keys carry no Ctrl/Shift/Alt state; for those cases `ui_click`, `ui_hover` (with an optional picture while the pointer rests) and `ui_press_key(method="input")` use the real mouse and keyboard, and are therefore gated: refused unless the person at the computer has been idle for `min_idle_s` seconds (default 8) and the target window is the one under the point at that moment, with the pointer restored afterwards. Real keys are never sent unless the target window is in front (an earlier draft sent a shortcut to the wrong window when Windows refused to raise the target; that is guarded). Only windows of the Sublime Text process can be captured or sent input. The tools use `PostMessage` only; sending a message synchronously from a plugin to a Sublime window can deadlock Sublime. The tool tree and fallback catalogs were regenerated (413 tools) and the agent guides have a section on the new tools and their limits.
+
+## 1.12.5
+
+Found while auditing packages through the tools themselves. `pick_quick_panel` and `get_quick_panel` take `wait_ms` (up to 60000) and poll for a quick panel that is still loading, so one call right after opening Package Control's Install Package list works instead of needing retries; without it the error now explains that the picker may still be loading. `get_active_file` and `get_sheets` no longer report an empty syntax name for syntax files that have no `name:` key (Bicep): the label falls back to the file stem and `syntax_path` is returned too, and `set_syntax` matches by label. New tool `get_view_regions(key[, name])` returns the regions a plugin has drawn under a region key, so highlights can be checked without a screenshot. `get_sheets(settings=false)` returns a compact list without each tab's roughly one hundred settings (the default is unchanged). The `exit` tool now replies first and closes Sublime a moment later, instead of reporting an error while Sublime closes. The agent guides cover these, how syntax scope names differ between builds 4200 and 4215, and the PowerShell BOM that breaks linters reading stdin. Tool tree and fallback catalogs were regenerated (408 tools).
+
+## 1.12.4
+
+Bug fixes found while auditing packages. `open_folder` called a Sublime command that does not exist, so it reported ok and did nothing; it now opens the folder in a new window and returns the `window_id` and folders. `install_package` never saved Package Control's installed-packages list (the Package Control call records the name without persisting it), so the package, and any libraries it needed, vanished at the next restart; it now saves the settings after a successful install. `close_file` accepts `name` and `index` like `run_command` does, so it can close a tab that has no path; closing an unnamed tab by index had closed the wrong one. `run_command` accepts `settle_ms` (up to 5000) to wait for a dialog that a command opens a moment after it returns, and a tool that times out because a native dialog blocks Sublime now says so and names the dialog. Tool descriptions and the fallback catalogs were regenerated (407 tools), and the agent guides document the dialog helpers.
+
+## 1.12.3
+
+`get_output_panel(name="console")` now accepts `force_focus`, passed to the visible-console read, so it can give a complete console read when the window is not in front (without it the call still falls back to the captured text with `complete: false` and a warning). `eval_python` no longer lets `sys.exit()`, `KeyboardInterrupt` or `GeneratorExit` raised by user code take down the plugin host: they come back as an error, and errors now include a traceback with the failing line of the user's code. A malformed or missing JSON body now returns HTTP 400 (or JSON-RPC -32700) with a message instead of dropping the connection. The agent guides and skills now say how to read the console completely: `get_console(mode="visible", force_focus=true)` on every call, tested on Sublime Text 4200 and 4215.
+
+## 1.12.2
+
+Console capture is safer: the visible-console read refuses to click unless the console panel is actually open (the click lands at a fixed spot near the bottom of the window, and in a terminal tab it can select a line of the prompt), and it restores the previous view's selection when it finishes. This is a guard only; it is not the fix for the frozen-tab report, which was traced to AgentIDE reacting to an instruction from Claude.
+
+`skills/sublime-debugger` rewritten: it described the removed `debugger-mcp` server. It now holds the tested recipe for driving the Debugger package with the generic tools (setup without palettes, the `eval_python` route, the generic-tools route and its limits, gotchas), and `docs/agents.md` points to it instead of a global skill. `skills/sublime-lsp` is likewise replaced by the former user-level `lsp-control` text (the LSP bridge and the standard request table), no longer tied to the removed `lsp-mcp`.
+
+New tools: `get_quick_panel` and `pick_quick_panel` read and answer a quick panel that a package opened with `show_quick_panel` in the same plugin host (the command palette, Goto Anything and panels from the other host are not visible); `click_menu_item` runs an installed menu item by caption path without opening the native menu. `dismiss_native_window` now clicks the named button when `button` is given without `action` (it used to cancel silently).
+
+Browser-origin requests are refused. Without an `auth_token`, a web page could send a text/plain JSON POST to the loopback servers (no CORS preflight is needed for that) and reach every tool, including `eval_python`. Both servers now reject a request whose `Origin` is not localhost, 127.0.0.1 or `[::1]` (or is `null`), and, while bound to loopback only, a request whose `Host` is not loopback (DNS rebinding). MCP clients that are not browsers send no `Origin` and are unaffected. "No CORS headers" alone does not protect the servers; set `auth_token` for real protection. Reported by kaste in the package_control_channel review.
+
+## 1.12.1
+
+Safety fix for reading the visible console on Windows (`get_console(mode='visible')`, `get_console_full`, `get_console_win`). Sublime Text has no API for the console text, so the capture clicks into the console, sends Ctrl+A and Ctrl+C with `SendInput`, and reads the clipboard. Those keystrokes are global, and the old code looked for any visible window titled "Sublime Text" anywhere on the machine and took whichever was in front, so with another Sublime window or a terminal tab in front the Ctrl+A and Ctrl+C could land there (Ctrl+C cancels whatever a terminal tab is running). The capture now only considers windows of its own process (the plugin host's parent process owns them), checks that this window is the foreground window and that its title matches the active tab before every click and key, and aborts with an error and no input sent if not. A unique marker line is printed to the console first and the copied text is rejected unless it contains it, so a copy that came from an editor or an input panel can no longer be reported as the console. Raising a background window is now opt-in through a new `force_focus` parameter (minimize then restore, run on a worker thread because focus calls on the plugin-host main thread could deadlock it): measured on builds 4200 and 4215, every way of raising a background Sublime window crashed it in `CoreMessaging.dll` some of the time (about one capture in six for minimize and restore, 25 to 67 per cent for the attach-input route), so without `force_focus` an unfocused window now returns a clear error with a hint instead. Panel, clipboard, cursor and previous focus are restored in every case. Set `SUBLIME_MCP_CAPTURE_TRACE` to a file path to log each step. Details and measurements: https://gist.github.com/dpc00/899e257d4eb79575c1be2d6e354f2950
+
+## 1.12.0
+
+Resource claims, so several agents can share one Sublime Text without taking the native input panel or the Control Panel from each other in the gap between two requests. Each request is already atomic, but a multi-step task (open the input panel, fill it, submit it) is not, and nothing can lock a panel that any command or a person may open. Three new tools make it cooperative: `claim_resource(resource, holder, note, ttl_seconds, force)` announces that `holder` is about to use `resource` (by convention `input_panel` or `control_panel`) and answers `{error: "busy", holder, note, expires_in}` when someone else has it; `release_resource(resource, holder)` gives it back (only the holder can; releasing something nobody holds is not an error); `list_claims` shows the live claims. A claim expires by itself after `ttl_seconds` (default 60, between 1 and 600), so an agent that crashed cannot block the others for long, and `force` takes a claim over for recovery. This is advisory: nothing stops a tool call that never checks, the same trust level as every other tool here. The `drive_input_panel` description now tells agents to claim `input_panel` first. The code was written by the jcode agent while it shared this Sublime Text with other agents and has been used in the maintainer's own Sublime Text; `test/test_resource_claims.py` checks the behaviour (busy, force, expiry with a fake clock, wrong-holder release, the TTL limits, required parameters) and that the tools and routes are registered. The tools are in the `app/coordination` category of `discover_tools`, and the catalog count is now 404 (`tool_tree.json`, the proxy fallback catalogs and the docs were regenerated).
+
+## 1.11.2
+
+Windows-only tools are now gated off on other platforms. `get_console_full`, `get_console_win`, `list_native_windows` and `dismiss_native_window` use Win32 and cannot work on Linux or macOS; until now they were still listed there and only failed when called. Off Windows they are handled like a tool named in `disabled_tools`: not listed by `tools/list` or the tool endpoint, not found by `discover_tools`, and refused with "only available on Windows" on every call path (`tools/call`, `batch`, and the direct GET/POST routes `/console_full`, `/console_win`, `/list_native_windows`, `/dismiss_native_window`). The gate survives a settings reload, and on Windows nothing changes. Found while putting the current plugin into a Linux Sublime Text (WSL). `test/test_platform_gating.py` checks the gate is applied everywhere.
+
+## 1.11.1
+
+Bug fix: `get_console_win` (and its `get_console_full`/`get_console(mode='visible'/'auto')` aliases) captures the visible console by temporarily changing the panel, editor focus, cursor position, and clipboard, then restoring them -- all through raw Win32 calls that are not safe to run concurrently. An agent issuing several of these calls at once from separate threads raced on clipboard access and hard-crashed Sublime Text. `_get_console_win` now serializes through a module-level lock (10s timeout, clean error on contention) before entering the capture; `test/console_surface.test.js` checks the lock/release calls are present in source.
+
+Also fixed `server.json`: it declared a `pypi` package with no `repository.subfolder`, so registries building from source (Glama's automated build check, in this case) looked for `pyproject.toml` at the repo root and found nothing -- the real package lives in `packages/python-proxy/`. Added `"subfolder": "packages/python-proxy"`.
+
+## 1.11.0
+
+`discover_tools` walks a tree of categories: with no arguments it lists the 12 top-level categories, `category="editing"` lists that category's subcategories and `category="editing/lines"` lists the tools in it with their schemas; `query=` still searches all tools. The tree is `tool_tree.json` (built by `tools/build_tool_tree.py`; `test/test_tool_tree.py` checks that every hidden tool is in exactly one leaf).
+
+`AGENT_GUIDE.md` (served by `get_help`) was restructured from about 350 to 178 lines: a quick start with `batch` examples for a new text tab and for a file on disk, and the material about the generated command tools, known issues and developer notes moved to `docs/COMMAND_TOOLS.md`. Measured with a fresh omp agent (Grok Build) against the real sublime-mcp: the untitled-tab task went from 17+ `discover_tools` calls before any edit (first run, interrupted) to 4-5 calls in total, $0.02-0.05 a run; the file-on-disk task from about 6 `discover_tools` calls and reading `sublime_mcp.py` (interrupted) to 5 calls, $0.04-0.10 a run.
+
+## 1.10.0
+
+Two tools that work while a native dialog has blocked Sublime's main thread
+(Windows only): `list_native_windows` lists the dialogs, menus and windows of the
+Sublime Text process (title, buttons, message text, whether the main thread is
+blocked and which tool blocked it) and `dismiss_native_window` clicks Cancel / OK /
+a named button or closes the window. They run on the HTTP request thread and use
+Win32 through `lib/native_windows.py`, and act only on windows of the Sublime Text
+process. The "main-thread timeout" error now mentions them. Checked on a bare
+Sublime Text 4215 with `tools/verify_native_dialogs.py`: all 16 commands observed
+to block the main thread were opened through their tool, froze Sublime, were
+listed and dismissed with these tools, and Sublime answered again. The hand-written
+tools were probed like the command tools in 1.9.1 (`tools/st_hand_written_behavior.json`).
+The probe harness has no skip lists: every tool is run.
+
+## 1.9.1
+
+The 160 Sublime Text command tools added in 1.9.0 were only warned about by
+keyword, which missed most of what they do. Every one has now been run on a
+disposable bare Sublime Text 4215 (no arguments, then sandbox arguments for the
+59 that take any) with `tools/probe_st_commands.py`; the results are in
+`tools/st_commands_behavior.json` and 44 tool descriptions now begin their
+"Observed on Sublime Text 4215:" note with what was seen: 16 commands block the
+main thread behind a native window (including `context_menu`, `delete_file`,
+`delete_folder`, `remove_license`, the `prompt_*` family), 3 quit Sublime
+(`exit`, `hot_exit`, `close_window`), 7 open a non-blocking window, 6 leave an
+in-app panel or popup open, `upgrade_license` opens the browser, and some
+write settings, files or the clipboard. `AGENT_GUIDE.md`, `docs/AGENT_GUIDE.md`
+and `docs/AGENTS.md` describe this. The 239 hand-written tools were not probed.
+
+## 1.9.0
+
+Typed tools for every Sublime Text command in CommandsBrowser's command list.
+160 commands that had no typed tool (for example `add_word`, `fold_all`,
+`invert_selection`, `scroll_to_eof`, `chain`, `build`, `close_others_by_index`)
+now have one, so the catalog goes from 239 to 399 tools. They are generated by
+`tools/generate_st_command_tools.py` from `tools/st_commands_metadata.json`, a
+snapshot of the Sublime Text command metadata of CommandsBrowser (MIT, Copyright
+2021 Ashwin Shenoy), into marked blocks in `sublime_mcp.py`; the proxy fallback
+catalogs were regenerated. Commands that open a native OS dialog (the `prompt_*`
+family, `add_directory`) or that quit Sublime, delete files or discard changes
+(`exit`, `hot_exit`, `close_window`, `delete_file`, `delete_folder`, `revert`,
+...) say so in their description; add any of them to `disabled_tools` to refuse
+them. The stale `close_file` description in the fallback catalogs is refreshed.
+
+## 1.8.9
+
+Adds a Command Palette entry, "Preferences: MCP Commander Settings", so the
+settings file can be opened without going through the Preferences menu
+(the Package Control reviewer asked for it). README now states the correct
+size of the typed catalog: 239 tools, matching `_MCP_TOOLS` and both proxy
+fallback catalogs.
+
+## 1.8.8
+
+Both bundled proxies (node-proxy, python-proxy) no longer advertise tools
+from a backend that isn't actually there. Until now, a failed
+`/mcp_tools` discovery fell back to a generated catalog of the same 7
+default tools regardless -- so a client whose config still pointed a
+proxy at a server that had been removed (a stale port, an old name) saw
+it listed as connected with 7 working tools, and every call to it
+failed. A proxy with no backend now advertises no tools and logs why;
+it keeps retrying in the background and registers the real tools once
+the backend answers, so an agent started before Sublime still gets its
+tools once Sublime is up (node-proxy pushes `notifications/tools/
+list_changed`; python-proxy's MCP library version can't push that, so a
+client sees the new tools on its next `tools/list`).
+
+## 1.8.7
+
+`get_sheets` now returns each view's full `settings().to_dict()` plus
+`is_scratch`/`is_read_only`/`size`/`syntax`, instead of a hand-picked
+subset of fields. Any package can tag a view with its own settings (a
+detachable terminal package identifying which agent session a tab is,
+for example) -- this surfaces all of it generically, so a caller can
+always tell what a tab actually is without sublime-mcp needing to know
+that package exists. Also fixes `_sheet_summary` (used by
+`get_selected_sheets`/`move_sheets_to_group`) the same way -- it turned
+out `get_sheets` itself had a separate, duplicated field list that never
+called it.
+
+## 1.8.6
+
+Fixes a gap in 1.8.5's `auth_token`: the bundled Node/Python proxies had
+no way to send it, so setting a token broke any client using them (stdio
+clients, not a direct SSE/HTTP URL). Both proxies now send
+`Authorization: Bearer <token>` when a `SUBLIME_MCP_TOKEN` environment
+variable is set on the proxy process, matching the server's `auth_token`
+setting. Unset by default on both sides -- no-op unless you already opted
+into `auth_token`.
+
+## 1.8.5
+
+Two new opt-in access controls, following up on 1.8.4's network-exposure
+fix with the access-control angle: loopback-only + no CORS closes remote
+and drive-by-webpage access, but there was still no way to restrict
+*local* access or reduce the tool surface for a shared/less-trusted
+deployment.
+
+- **`auth_token`** (default unset) — require a matching
+  `Authorization: Bearer <token>` header on every request to either
+  server. Works regardless of bind address, since loopback-only doesn't
+  protect against another process, or another user on a shared/multi-user
+  machine, reaching `127.0.0.1` on the same host.
+- **`disabled_tools`** (default `[]`) — block specific tools by name
+  (e.g. `eval_python`, `run_command`) at every call path that can reach a
+  tool's handler: `tools/call`, `batch`, and the direct `POST
+  /<tool_name>` routes served for node-proxy/dynamic-registration
+  compatibility -- all three call the tool's handler function
+  independently, so a check added to only one of them would not be a real
+  restriction. Disabled tools are also hidden from `tools/list`.
+
+Both default to today's existing behavior (no auth, no restrictions) --
+purely additive, nothing changes for an existing setup that doesn't set
+either key. See the new **Security** section in README.md.
+
+## 1.8.4
+
+Security hardening. Both local HTTP servers (the MCP endpoint and the
+internal HTTP bridge) now bind `127.0.0.1` by default instead of
+`0.0.0.0`, and no longer send `Access-Control-Allow-Origin: *` on any
+real tool-call endpoint.
+
+Neither server has ever had authentication -- by design, since a
+loopback-only server doesn't need it -- but the implementation didn't
+actually enforce loopback-only: `0.0.0.0` made both reachable from
+every other device on the same network, and the CORS wildcard meant
+any webpage's JavaScript running in a browser on the same machine
+(a malicious site, a compromised ad, a tracking script on an
+otherwise-trusted page) could reach them too and read the response,
+no network access needed at all. Combined with `eval_python` --
+arbitrary code execution in Sublime's process, by design -- this was
+a real, currently-exploitable-if-found vulnerability, not a
+theoretical one.
+
+New setting: `"allow_lan_access"` (default `false`) in `MCP Commander
+.sublime-settings` opts back into the `0.0.0.0` bind for setups that
+specifically need it -- e.g. a WSL client that can't reach
+`127.0.0.1` on the Windows host without either this or switching WSL
+to mirrored networking mode. The CORS removal is unconditional and
+doesn't affect this: CORS only governs browser access, not CLI/desktop
+MCP clients, which were never subject to it in the first place.
+
+## 1.8.3
+
+`close_file` now routes through Sublime's real window-close commands
+(`close_file`/`close_by_index`) instead of calling `view.close()`
+directly. A direct API call bypasses any host-side close-handling hook
+entirely, the same way a mouse-X tab close bypasses Sublime's own
+`on_window_command` dispatch (`sublimehq/sublime_text#1922`) — this was
+how a misdirected `close_file` call (an unresolved `path` silently falling
+back to the active view) closed an unrelated coordinating session's own
+tab instead of the intended disposable one on 2026-09-15. Routing through
+the real command gives a host package a chance to see and handle the
+close — e.g. GhostShell's `ai_terminal` package now blocks the command
+outright for its own tabs. Tool description and the `sublime-mcp` skill
+docs updated to describe the new behavior and the still-real limitation:
+`close_file` cannot target an unsaved/path-less tab by anything other than
+being the active view.
+
+## 1.8.2
+
+Removes the `package-mcp-generator` skill. A full audit of the real,
+current Package Control catalog (5434 packages, filtered to real
+installs >=10k and a GitHub push within 2 years -- 182 survivors,
+individually source-triaged) found zero packages that actually need a
+standalone dedicated MCP server; the one candidate that looked like an
+exception (a native OS color-picker dialog, in ColorPicker and
+ColorHelper) turned out to be reachable too, by launching the same
+bundled executable directly and driving it with a separate UI-automation
+tool instead of through Sublime's own blocking command. `get_package_mcp_info`
+keeps its `output_file`/`extension_template` fields as a documented
+escape hatch, just no longer points at a generator skill nothing in the
+real corpus ends up needing. `package-skill-generator` (the lightweight,
+validated pattern actually used throughout the audit) is unaffected.
+
+## 1.8.1
+
+Documents a known Claude Code harness bug (not a sublime-mcp bug) in
+`AGENT_GUIDE.md`: reading Sublime's console via
+`get_console(mode='visible'/'auto')` (and the `get_console_full`/
+`get_console_win` aliases) on Windows can trigger a spurious
+"Interrupted, what do you want to do instead?" from the Claude Code
+client even though nothing was actually interrupted -- filed upstream
+as anthropics/claude-code#93529. `mode='captured'` avoids the OS-level
+path that triggers it, but is called out explicitly as not a
+guaranteed substitute: it only contains messages observed since
+capture began, so an earlier error can still be missed. No code
+changes.
+
+## 1.8.0
+
+Removes the IDE Companion feature entirely (Gemini/Qwen/Claude Code
+legacy `/ide` diff-review integration: `lib/ide_companion.py`,
+`lib/claude_ide.py`, the Accept/Reject commands, keymaps, and context
+menu entries). It had a long history of serious, structural problems
+across its lifetime -- main-thread freezes from an O(n*m) diff
+computed on the UI thread, a Win32 foreground-activation call that
+could wedge the whole editor even when deferred, the Accept/Reject
+banner silently disappearing on a common diff shape, and the review
+window seizing OS-level input focus with no way to switch away until
+the review was resolved. Given that pattern, the decision was to
+remove the feature rather than continue patching it one bug at a
+time. sublime-mcp's core MCP server (HTTP bridge + MCP SSE) is
+unaffected.
+
+## 1.7.9
+
+Fixes the Accept/Reject banner silently disappearing from a diff
+review whenever the diff has a hunk right at row 0 (a very common
+case -- any edit near the top of the file). `_highlight_diff_panes`
+was giving its own empty-string annotation to every changed/added/
+removed line, including row 0, and that competed with the real
+Accept/Reject banner annotation `_add_accept_reject_banner` pins to
+the same row -- the empty one silently won, so the banner never
+rendered. Row 0 now gets its diff-highlight color fill through a
+separate, unannotated region key, leaving row 0's one annotation slot
+for the banner. Verified live: same diff, banner now shows correctly.
+
+## 1.7.8
+
+Fixes two confirmed causes of a full editor freeze in the IDE Companion
+diff-review flow (`openDiff`):
+
+- `_line_diff_ops`'s O(n*m) pure-Python diff DP (capped at 4,000,000
+  cells before falling back to `difflib`) was running synchronously on
+  ST's single UI thread inside `_on_main`, blocking the whole editor
+  for however long a sizeable diff took to compute. Now computed on
+  the calling (already off-main) thread before the main-thread-only
+  UI work runs.
+- `_force_window_foreground`'s Win32 `ShowWindow`/`SetForegroundWindow`/
+  `BringWindowToTop` calls, meant to bring the new review window to
+  the OS foreground, still wedged the main thread even when deferred
+  via `sublime.set_timeout(...)` -- confirmed live via
+  `main_thread_stack`/`diagnostics` showing the main thread genuinely
+  stuck inside `BringWindowToTop`. Moved off ST's main thread entirely
+  onto a plain background thread so a hang there can never hold the
+  editor hostage.
+
+Both fixes verified live: the same near-worst-case diff (1900x2047
+lines, DP just under the cap) that reproduced the freeze before now
+opens cleanly in under a second with heartbeat staying fresh
+throughout.
+
+## 1.7.7
+
+Fixes a Package Control submission bug: `Main.sublime-menu` hardcoded
+`${packages}/sublime-mcp/...` for the settings and keymap paths, but
+Package Control installs this package under the folder name from
+`m.json` ("MCP Commander"), not the git repo name. That path only
+resolved locally by coincidence (dev clones are usually named
+`sublime-mcp`); it would have broken the Preferences menu for every
+real install. Renamed `sublime-mcp.sublime-settings` to
+`MCP Commander.sublime-settings` to match and fixed all references.
+
+## 1.7.6
+
+Adds `drive_input_panel`: fills and submits/cancels Sublime's currently
+open `show_input_panel`, e.g. a package's "Enter a path..." prompt.
+Input-panel views aren't reachable through any documented API
+(`window.views()`, `window.active_view()`, etc. all miss them), and
+pressing Enter to submit is a native keybinding (`select`, gated by
+`panel_has_focus`/`panel_type=="input"` in the default keymap) rather
+than anything `view.run_command("insert", ...)` can trigger — a literal
+inserted newline is silently accepted into the buffer without
+submitting. `drive_input_panel` locates the panel's view directly and
+drives it via Sublime's own built-in `select`/`hide_panel` commands,
+which reach the panel's real `on_done`/`on_cancel` callback correctly
+even when that callback belongs to a package running on the legacy
+Python 3.3 plugin host (a separate OS process from the one `eval_python`
+reaches) — no monkeypatching or OS-level keyboard injection required.
+
+## 1.7.5
+
+Removes dead `debugger-mcp`/`lsp-mcp` probing code from the Node proxy's
+`doctor --all` path (`packages/node-proxy/bin/cli.js`) — those were
+separate standing MCP servers removed in 1.7.0 when the repo flattened
+to a single package; the CLI kept probing their old ports (9505/9506)
+regardless. `doctor` now only checks sublime-mcp itself; the `--all`
+flag is gone.
+
+Also brings the README's install instructions up to date: Package
+Control (search "MCP Commander") is now documented as the primary
+install path, pending merge of the channel submission
+([sublimehq/package_control_channel#9554](https://github.com/sublimehq/package_control_channel/pull/9554));
+the manual clone+symlink steps are demoted to "for development." Removed
+the stale Codex config example referencing the long-removed
+`debugger-mcp`/`lsp-mcp` servers.
+
+## 1.7.4
+
+Fixes view-name matching (`run_command`'s `name` param and
+`get_view_content`) silently failing for any normal saved file. The
+lookup only checked `view.name()` (the tab-title override), which is
+empty for a file-backed view that was never explicitly renamed — so
+targeting a tab by its filename always missed, and the error's own
+`open_views` diagnostic showed blank names instead of the real
+filenames. Now falls back to the file's basename, matching what
+`get_open_files` already did correctly.
+
+## 1.7.3
+
+Fixes a real regression introduced while responding to the Package Control
+review bot: an attempted fix for its "don't import root-level plugin
+module" finding removed the only import path that actually worked on
+plugin reload, breaking the plugin entirely (`ModuleNotFoundError:
+No module named 'search_results'`). The correct fix, per the bot's own
+suggestion, is what's here now: `search_results.py`, `mcp_http_policy.py`,
+`ide_companion.py`, `claude_ide.py`, and `acp_client.py` moved into a real
+`lib/` subpackage, so they're no longer independently scanned as
+root-level plugins and the relative import is unambiguous either way.
+
+Also addresses the bot's other findings:
+- Added a "Key Bindings" entry under Preferences > Package Settings >
+  MCP Commander in `Main.sublime-menu` (the diff-review Escape/Ctrl+S/
+  Ctrl+Shift+Enter bindings existed but had no menu entry to find them).
+- `subprocess.Popen`/`subprocess.run` calls on Windows now pass
+  `STARTUPINFO` with `SW_HIDE` to avoid a flashing console window.
+
+## 1.7.2
+
+Adds the `mcp-name: io.github.dpc00/sublime-mcp` marker required by the
+MCP Registry to verify PyPI package ownership before publishing.
+
+## 1.7.1
+
+Adds `.gitattributes` (`export-ignore`) so a Package Control install ships
+only the actual Sublime Text plugin, not the whole dev repo (tests, tools,
+skills, proxy package sources, `.claude/`). Bumps the (previously stale)
+MCP Registry manifest's version to match.
+
+## 1.7.0
+
+Removes debugger-mcp and lsp-mcp; the repo is now a single, flat Sublime Text
+package instead of a multi-package nested layout.
+
+- Removed `packages/debugger-mcp` and `packages/lsp-mcp`. Both were built on
+  the assumption that controlling an installed package needs its own MCP
+  server — `get_package_mcp_info` plus `eval_python`/`run_command` covers it
+  directly, and their hard-won internals knowledge (async bridges, object
+  graphs, real dispatch tables) is preserved as reusable skill files instead
+  of frozen into standing servers. `skills/package-skill-generator` documents
+  how to produce an equivalent skill for any other installed package.
+- Flattened `packages/st-plugin/*` to the repo root, so the repo root is now
+  directly the Package Control package — no more nested multi-package
+  structure to translate at release time.
+- Reframed `get_package_mcp_info`'s description around direct use (discover,
+  read source, call directly) rather than only "write an MCP extension."
+- Fixed the diff-review Accept/Reject banner rendering one line below its
+  anchor (`add_phantom`/`LAYOUT_BLOCK` replaced with `add_regions`/annotations).
+- Fixed IDE-companion listeners misattributing the agent's own tool-driven
+  actions to the human user; added `diagnostics`/`main_thread_stack` tools
+  (heartbeat, dispatch depth, listener event counts) for live introspection.
+- Regenerated the Node/Python proxy fallback catalogs (238 tools).
+
+## 1.6.0
+
+Adds first-class support for Sublime Text's native tab multi-select and sheet
+APIs.
+
+- `get_sheets` now reports stable sheet IDs, group positions, selected state,
+  focused state, and the active group.
+- Adds dedicated tools for querying selected sheets, selecting or focusing
+  sheets by ID/index, reordering sheets, and moving sheet collections between
+  groups.
+- Exposes Sublime's seven native directional tab-selection and focus commands.
+- Correctly aggregates selected sheets across all editor groups while retaining
+  optional per-group queries.
+- Updates the Node and Python proxy catalogs, agent guides, catalog generator,
+  and regression coverage for the expanded 236-tool surface.
+
+## 1.5.1
+
+Fixes an OS-level focus-stealing bug in the Windows `get_console`/`get_console_win`
+backend introduced in 1.5.0.
+
+- `get_console_win` now restores the OS foreground window that was active before
+  the capture ran (previously it left keyboard focus on Sublime Text after every
+  call, even when another application had focus beforehand).
+- Cleanup on timeout is now idempotent: a slow capture chain and the timeout
+  fallback can no longer race and restore UI state twice.
+
+## 1.5.0
+
+Reduces MCP context overhead while keeping the complete Sublime, debugger,
+and LSP capability catalogs available on demand.
+
+- Each server now advertises a focused seven-tool surface by default, with
+  discovery and batch tools for advanced capabilities.
+- Adds structured native project search, streamable HTTP support, health
+  endpoints, a connection doctor, and installable Codex skills.
+- Adds a unified `get_console` API. Prospective console capture is reload-safe
+  and deduplicated, while the Windows full-history backend now restores the
+  previous panel, editor focus, pointer position, and text clipboard.
+- `get_output_panel(name="Console")` now routes through the working console
+  backend instead of treating the built-in console as a normal output panel.
+- Updates agent guides, generated proxy catalogs, and focused-surface tests.
+
+## 1.4.6
+
+Removes vestigial Package Control artifacts. This project isn't listed in
+Package Control's default channel (an earlier attempt was abandoned in
+favor of the current clone-and-symlink install method), so the
+`.gitattributes` `export-ignore` rules (mostly pointing at paths from a
+pre-`packages/` repo layout that no longer exist) and the
+`messages.json`/`messages/*.txt` version-message system (which only
+auto-displays when Package Control is tracking an install) were dead
+weight. Their content is now this file plus the Installation section of
+README.md.
+
+No functional or tool changes.
+
+## 1.4.5
+
+Fixes the Preferences > Package Settings menu added in 1.4.4.
+
+- The three plugins' `Main.sublime-menu` entries used a non-standard
+  `open_file` x2 pattern (separate "Settings" / "Settings – User" items).
+  Replaced with the standard `edit_settings` command, matching how every
+  other Sublime Text package exposes its settings (a synced default/user
+  split view opened from a single "Settings" menu item).
+- Also added the "Preferences" (mnemonic n) and "Package Settings"
+  (mnemonic P) caption/mnemonic pair on the parent menu nodes, matching
+  Sublime's own Default package and third-party packages like TreeSitter,
+  so the menu merges correctly instead of relying on another package
+  having already defined those captions.
+
+No functional or tool changes; ports and defaults are unchanged from 1.4.4.
+
+## 1.4.4
+
+Replaces the port-configuration env vars with real Sublime Text settings.
+
+- sublime-mcp, debugger-mcp, and lsp-mcp each read their MCP SSE / HTTP
+  bridge ports from a `<name>.sublime-settings` file (`"mcp_port"` /
+  `"http_port"`) instead of env vars (`SUBLIME_MCP_MCP_PORT`,
+  `SUBLIME_MCP_PORT`, `DEBUGGER_MCP_PORT`, `DEBUGGER_HTTP_PORT`,
+  `LSP_MCP_PORT`, `LSP_HTTP_PORT` — all removed).
+- Each plugin now has a Preferences > Package Settings menu entry so
+  overriding a port is a normal ST settings edit, not a shell
+  environment variable.
+- sublime-mcp's old naming (`SUBLIME_MCP_MCP_PORT`/`SUBLIME_MCP_PORT`)
+  was also inconsistent with debugger-mcp/lsp-mcp's
+  `<NAME>_MCP_PORT`/`<NAME>_HTTP_PORT` convention; this removes the
+  inconsistency along with the env vars.
+
+`SUBLIME_MCP_BASE` (used by the bundled Node/Python proxies to find
+sublime-mcp's HTTP bridge) is unaffected — that's a proxy-side override,
+not a plugin port binding.
+
+Default ports are unchanged: sublime-mcp 9502/9500 (Win), 9503/9501
+(Mac/Linux); debugger-mcp 9505/9515; lsp-mcp 9506/9516.
+
+## 1.4.3
+
+Fixes the mcp 2.0 pin and a `get_sheet_content` bug.
+
+- `mcp>=1.2,<2` is now `mcp>=1.2`. `mcp_server.py` binds `FastMCP`
+  (mcp<2) or `MCPServer` (mcp>=2.0, which renamed it) at import time,
+  so both major versions work without a dependency ceiling.
+- `get_sheet_content` assumed the backend returned a dict with a
+  `"content_base64"` key. It never did — that key only ever existed
+  in the docstring. Image tabs now parse the actual response shape
+  (a list of content blocks), and the image's MIME type is sniffed
+  from its magic bytes instead of trusted from the file extension
+  (which was wrong or absent for some files).
+
+No tool or API changes otherwise.
+
+## 1.4.2
+
+Fixes a broken 1.4.1 install and version drift.
+
+- `pip install sublime-mcp` resolved `mcp` to 2.0.0, which removed
+  `mcp.server.fastmcp`. The server died at import with
+  `ModuleNotFoundError`. The dependency is now pinned to `mcp>=1.2,<2`.
+- The version reported over MCP had drifted across surfaces:
+  package.json said 1.4.1, node-proxy advertised 1.4.0, and the
+  Sublime plugin reported 1.3.1. All three now derive from one place,
+  so they cannot disagree again.
+
+No tool or API changes. 1.4.1's 220-tool catalog work is unchanged.
+
+## 1.4.1
+
+Fix: both the node and Python MCP proxies hand-maintained their own copy
+of the tool catalog, and both had drifted from the 220 tools the backend
+actually serves. The Python proxy was worst affected — it only exposed
+72 of 220 tools, silently hiding 148 backend tools from any Python-side
+agent.
+
+Both proxies now generate their tool catalogs directly from the
+backend's `_MCP_TOOLS`, so the proxy surface can no longer drift out of
+sync with what the backend actually implements.
+
+## 1.4.0
+
+220 typed MCP tools are now documented (up from 63), covering view, tab,
+pane, edit, selection, scroll, macro, file, project, marks, jumps, folds,
+transform, and browser commands, plus read-only getters, `batch`, and
+`eval_python`.
+
+- New: `batch` tool — send multiple tool calls in one round trip (capped
+  at 50 calls per request), available in both the Python and Node
+  proxies.
+- New: `get_help` added to debugger-mcp and lsp-mcp for in-session tool
+  discovery.
+- Fixes: threaded HTTP bridges (no more blocking under concurrent
+  requests), keep-alive on bridge/SSE handlers, several MCP bridge
+  routing and startup-race fixes.
+
+## 1.3.0
+
+The MCP server is now built directly into the ST plugin — no external
+process (pip or npx) is required.
+
+New: "MCP Commander: Server Status" in the Command Palette lets you stop
+or restart the server without reloading the plugin.

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+**No tool waits any more.** A handler that sleeps, polls or blocks for a result holds the request
+thread, makes every concurrent call time out behind it and stalls the agent on a guess about how
+long work takes. The waits came out: `open_file` no longer waits up to 3 s for the tab to load,
+`save_file` no longer waits 1.5 s for the tab to go clean, `close_file` no longer waits 1.5 s for
+the tab to close, `pick_quick_panel` no longer waits 1 s (2 s from the 3.3 host) for the package's
+callback, `dismiss_native_window` no longer waits for the window to go, `_ensure_view` (every
+`str_replace_based_edit_tool` call) no longer polls a loading file for up to 5 s, and
+`project_search` no longer polls its results panel for up to 30 s.
+
+Each returns at once with a note, and where a result is still coming, the read-back:
+`project_search_results` (matches plus `complete`) for a search, `get_quick_panel`'s `last_pick`
+for a pick callback, `get_sheets` and `native_dialogs` for a save, a close or a dismissal. The
+agent decides when to ask again. `AGENT_GUIDE.md` says so in "Tools never wait; the agent does the
+waiting", and the one briefing skill carries the same rule.
+
 `project_search` passed `where` to Sublime unchanged, and Find in Files takes one string: a list of
 paths or globs was ignored, so the search silently ran over the project folders instead of the
 places asked for (found 2026-11-06, reproduced 2026-11-09). A list is now joined with commas — the

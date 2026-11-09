@@ -364,13 +364,14 @@ def list_windows(pid):
     return found
 
 
-def dismiss(pid, hwnd=None, action="cancel", button_text=None, wait=2.0):
+def dismiss(pid, hwnd=None, action="cancel", button_text=None):
     """Dismiss a dialog or menu of process ``pid``.
 
     hwnd: the window to act on; default is the first dialog, then the first menu.
     action: "cancel" (default), "ok", "close" (WM_CLOSE) or "button" (with button_text).
-    Returns a dict with ``ok``, ``closed`` (window gone after up to ``wait`` seconds)
-    and what was done. Never raises for an unsuitable window; it reports instead."""
+    Returns at once with ``ok`` and what was done; it does not wait for the window to go. Check
+    ``list_native_windows`` (or this reply's ``native_dialogs``) if you need to know. Never raises
+    for an unsuitable window; it reports instead."""
     if not SUPPORTED:
         raise NotImplementedError("native window handling is implemented for Windows only")
     if action not in ("cancel", "ok", "close", "button"):
@@ -405,26 +406,5 @@ def dismiss(pid, hwnd=None, action="cancel", button_text=None, wait=2.0):
         _user32.PostMessageW(target["hwnd"], WM_CLOSE, 0, 0)
         done = "sent WM_CLOSE"
 
-    def wait_closed(seconds):
-        deadline = time.time() + seconds
-        while time.time() < deadline:
-            if not _user32.IsWindow(target["hwnd"]) or not _user32.IsWindowVisible(target["hwnd"]):
-                return True
-            time.sleep(0.05)
-        return False
-
-    closed = wait_closed(wait)
-    retried = False
-    if not closed and chosen is not None:
-        # The first click on a dialog that is not yet active is sometimes dropped: Package Control's
-        # "needs to be restarted" message (button not yet the default) stayed open after the first
-        # BM_CLICK and closed after the second (bug log B14, 2026-10-30, reproduced). Click once more;
-        # a click on a button of a window that has closed in the meantime does nothing.
-        _user32.PostMessageW(chosen["hwnd"], BM_CLICK, 0, 0)
-        retried = True
-        closed = wait_closed(wait)
-    out = {"ok": True, "closed": closed, "did": done, "hwnd": target["hwnd"],
-           "kind": target["kind"], "title": target["title"]}
-    if retried:
-        out["retried"] = True
-    return out
+    return {"ok": True, "did": done, "hwnd": target["hwnd"],
+            "kind": target["kind"], "title": target["title"]}

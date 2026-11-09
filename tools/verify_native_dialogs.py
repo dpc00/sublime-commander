@@ -79,16 +79,21 @@ def main():
                 for w in listing["windows"] if w["kind"] in ("dialog", "menu", "window")
             ]
             dismissed = P.post(args.port, "dismiss_native_window", {"action": "cancel"}, timeout=8)
-            row["dismiss"] = {k: dismissed.get(k) for k in ("ok", "closed", "did", "title", "error")}
+            row["dismiss"] = {k: dismissed.get(k) for k in ("ok", "did", "title", "error")}
         except Exception as e:
             row["error"] = "%s: %s" % (type(e).__name__, e)
         time.sleep(1.0)
+        try:
+            after = P.post(args.port, "list_native_windows", {}, timeout=8)
+            row["gone_after_1s"] = not any(w.get("kind") == "dialog" for w in after.get("windows", []))
+        except Exception as e:
+            row["gone_after_1s"] = None
         row["answers_again"] = P.alive(args.port, 6)
         thread.join(timeout=15)
         row["tool_call_outcome"] = json.dumps(box)[:140]
         results.append(row)
-        print("%-36s frozen=%-5s dismissed=%-5s answers_again=%s" % (
-            name, row.get("frozen_while_dialog_open"), (row.get("dismiss") or {}).get("closed"), row["answers_again"]), flush=True)
+        print("%-36s frozen=%-5s gone=%-5s answers_again=%s" % (
+            name, row.get("frozen_while_dialog_open"), row.get("gone_after_1s"), row["answers_again"]), flush=True)
         if not row["answers_again"]:
             print("  !! still frozen - stopping so nothing piles up")
             break

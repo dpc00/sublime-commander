@@ -2381,9 +2381,6 @@ def _set_project_data(body):
     return _on_main(fn)
 
 
-_OPEN_FILE_WAIT_SECONDS = 3
-
-
 def _open_file(body):
     path = body.get("path")
     if not path:
@@ -2402,31 +2399,12 @@ def _open_file(body):
     if not (isinstance(result, dict) and result.get("ok")):
         return result
 
-    # Sublime opens the file asynchronously: until it is loaded and active, the PREVIOUS tab is
-    # still the active one, and a keystroke or an "active tab" tool sent next lands there
-    # (ui_type_text typed into the old untitled tab in 1 of 3 runs). Wait, off the main thread, until
-    # the new tab is loaded and active.
-    def check():
-        w = sublime.active_window()
-        v = w.find_open_file(path)
-        if v is None:
-            return None
-        active = w.active_view()
-        return {"loading": v.is_loading(), "active": active is not None and active.id() == v.id()}
-
-    deadline = time.time() + _OPEN_FILE_WAIT_SECONDS
-    while True:
-        state = _on_main(check)
-        if isinstance(state, dict) and not state["loading"] and state["active"]:
-            result["active"] = True
-            return result
-        if time.time() >= deadline:
-            result["pending"] = True
-            result["note"] = ("the file was sent to Sublime but is not yet loaded and active after {} s; "
-                              "check get_sheets (is_focused) before typing or using an active-tab tool"
-                              .format(_OPEN_FILE_WAIT_SECONDS))
-            return result
-        time.sleep(0.05)
+    # Sublime opens a file asynchronously, and this call does not wait for it: the tab may still be
+    # loading and the previous tab may still be active for a moment (ui_type_text typed into the old
+    # untitled tab in 1 of 3 runs when it did). Confirm with get_sheets (is_focused) before typing.
+    result["note"] = ("opened; Sublime loads it asynchronously - check get_sheets (is_focused) "
+                      "before typing or using an active-tab tool")
+    return result
 
 
 def _goto_line(body):
@@ -2657,9 +2635,6 @@ def _set_status(body):
     return _on_main(fn)
 
 
-_SAVE_FILE_WAIT_SECONDS = 1.5
-
-
 def _save_file(body):
     path = body.get("path")
 
@@ -2686,32 +2661,13 @@ def _save_file(body):
     result = _on_main(fn)
     if not (isinstance(result, dict) and result.get("ok")):
         return result
-    vid = result.pop("_view_id", None)
+    result.pop("_view_id", None)
 
-    # `save` only asks Sublime to save. An untitled tab opens a Save As dialog, and a failed write
-    # (read-only file, full disk) shows an error dialog; both used to come back as plain ok.
-    def is_clean():
-        for win in sublime.windows():
-            for vw in win.views():
-                if vw.id() == vid:
-                    return not vw.is_dirty()
-        return True
-
-    deadline = time.time() + _SAVE_FILE_WAIT_SECONDS
-    while True:
-        if _on_main(is_clean) is True:
-            result["saved"] = True
-            return result
-        if time.time() >= deadline:
-            result["saved"] = False
-            result["pending"] = True
-            result["note"] = ("the save was sent but the tab is still modified after {} s: Sublime is "
-                              "probably showing a Save As or an 'Unable to save' dialog (Windows: "
-                              "list_native_windows and dismiss_native_window; elsewhere answer it on "
-                              "screen), or the file is read-only. Do not repeat the call before you have "
-                              "looked.".format(_SAVE_FILE_WAIT_SECONDS))
-            return result
-        time.sleep(0.05)
+    # `save` only asks Sublime to save. A Save As dialog (untitled tab) or an "Unable to save" error
+    # is reported by this reply's native_dialogs, or by the next call's; this tool does not wait to
+    # find out. Check get_sheets (is_dirty) before assuming the bytes are on disk.
+    result["note"] = "save requested; check get_sheets (is_dirty) and native_dialogs before assuming it finished"
+    return result
 
 
 def _save_all(body):
@@ -2720,9 +2676,6 @@ def _save_all(body):
         return {"ok": True}
 
     return _on_main(fn)
-
-
-_CLOSE_FILE_WAIT_SECONDS = 1.5
 
 
 def _close_file(body):
@@ -2787,34 +2740,14 @@ def _close_file(body):
     result = _on_main(fn)
     if not (isinstance(result, dict) and result.get("ok")):
         return result
-    vid = result.pop("_view_id", None)
+    result.pop("_view_id", None)
 
     # The close command only ASKS Sublime to close the tab. It stays open when Sublime shows a
-    # "Save Changes?" dialog (also for a tab that get_sheets reports is_dirty false, for example a
-    # file that was created after its tab was opened: the window title still shows the modified dot)
-    # or when a host hook refuses the close. Before, the call said ok either way. Check, off the
-    # main thread, that the tab is really gone.
-    def still_open():
-        return any(vw.id() == vid
-                   for win in sublime.windows()
-                   for vw in list(win.views()) + _preview_views(win))
-
-    deadline = time.time() + _CLOSE_FILE_WAIT_SECONDS
-    while True:
-        if not _on_main(still_open):
-            result["closed"] = True
-            return result
-        if time.time() >= deadline:
-            result["closed"] = False
-            result["pending"] = True
-            result["note"] = ("the close was sent but the tab is still open after {} s: Sublime is probably "
-                              "asking 'Save changes before closing?' (a dialog that may not block other tools; "
-                              "on Windows list_native_windows and dismiss_native_window answer it, elsewhere "
-                              "answer it on screen), or a host hook refused the close. get_sheets may still say "
-                              "is_dirty false. Retrying the call raises another dialog: answer the first one."
-                              .format(_CLOSE_FILE_WAIT_SECONDS))
-            return result
-        time.sleep(0.05)
+    # "Save Changes?" dialog or a host hook refuses; this tool does not wait to see which. The
+    # dialog appears in native_dialogs, and get_sheets answers whether the tab is still there.
+    result["note"] = ("close requested; check get_sheets (the tab is gone) and native_dialogs "
+                      "(a Save Changes? prompt) before assuming it closed")
+    return result
 
 
 def _open_folder(body):
@@ -2994,6 +2927,7 @@ def _drive_input_panel(body):
 
 
 _QUICK_PANELS = {}  # window id -> record of the quick panel last opened from this plugin host
+_LAST_PICK = {}     # outcome of the last pick whose callback ran, read by get_quick_panel
 
 
 def _quick_panel_item(item):
@@ -3298,19 +3232,17 @@ def _get_quick_panel(body):
         page = indexes[offset:offset + limit]
         return {"items": [items[n] for n in page], "indexes": page, "total": len(items),
                 "matched": len(indexes), "offset": offset, "flags": rec["flags"],
-                "selected_index": rec["selected_index"]}
+                "selected_index": rec["selected_index"],
+                **({"last_pick": dict(_LAST_PICK)} if _LAST_PICK else {})}
     return _on_main(fn)
-
-
-_PICK_CALLBACK_WAIT_SECONDS = 1.0  # how long a pick waits for the package's callback before answering pending
 
 
 def _pick_quick_panel(body):
     """Pick an item of the recorded quick panel by index or by text, or cancel (index -1).
 
-    The callback runs on the main thread after this returns; a callback that opens a native dialog
-    leaves it blocked, so the answer is `pending: true` after _PICK_CALLBACK_WAIT_SECONDS instead
-    of a request that never completes."""
+    Returns as soon as the pick is sent, with ``started: true`` when the package's callback is still
+    running; its outcome is recorded for get_quick_panel (``last_pick``), and a dialog it opens shows
+    up in the next tool result's ``native_dialogs``."""
     index, text = body.get("index"), body.get("text")
     kind, found, waited, wid = _quick_panel_request(
         body, {"action": "pick", "index": index, "text": text})
@@ -3370,6 +3302,13 @@ def _pick_quick_panel(body):
                 box["error"] = e
             finally:
                 box["done"] = True
+                _LAST_PICK.clear()
+                _LAST_PICK.update({
+                    "picked": i,
+                    "item": items[i],
+                    "error": None if box.get("error") is None else "%s: %s" % (
+                        type(box["error"]).__name__, box["error"]),
+                })
 
         if rec["on_select"] is None:
             box["done"] = True
@@ -3387,20 +3326,16 @@ def _pick_quick_panel(body):
         return payload
 
     i, item, box = payload
-    deadline = time.time() + _PICK_CALLBACK_WAIT_SECONDS
-    while not box.get("done") and time.time() < deadline:
-        time.sleep(0.02)
-    if not box.get("done"):
-        return {"ok": True, "picked": i, "item": item, "pending": True,
-                "note": "the panel was closed and the package's callback was started, but it has not "
-                        "finished after %.1f s; a native dialog may be open and blocking Sublime: "
-                        "check list_native_windows and answer it with dismiss_native_window"
-                        % _PICK_CALLBACK_WAIT_SECONDS}
-    if box.get("error") is not None:
-        e = box["error"]
-        return {"error": "the panel was closed and the package's callback raised %s: %s"
-                         % (type(e).__name__, e), "picked": i, "item": item}
-    return {"ok": True, "picked": i, "item": item}
+    if box.get("done"):
+        if box.get("error") is not None:
+            return {"error": "the package's callback raised %s: %s"
+                             % (type(box["error"]).__name__, box["error"]),
+                    "picked": i, "item": item}
+        return {"ok": True, "picked": i, "item": item}
+    # The callback runs on the main thread after the panel closed; this tool does not wait for it.
+    return {"ok": True, "picked": i, "item": item, "started": True,
+            "note": "the pick was sent and the package's callback is running; read its outcome from "
+                    "get_quick_panel (last_pick) and any dialog it opens from native_dialogs"}
 
 
 def _find_in_file(body):
@@ -3913,17 +3848,13 @@ _EDIT_HIGHLIGHT_MS = 30000  # how long green underline stays visible
 
 
 def _ensure_view(path):
-    """Open *path* in ST if not already open, then wait for the async load to complete.
+    """Open *path* in ST if not already open and return its view, without waiting for the load.
 
-    ST's window.open_file() returns immediately with a loading view; the file
-    content is not available until view.is_loading() returns False.  We poll
-    from the HTTP thread (50 × 100 ms = 5 s max) so the ST main thread stays
-    free to process the load callback.  Each _on_main call is brief.
+    ST's window.open_file() returns immediately with a loading view, and a still-loading view has
+    no content to read or edit. Instead of polling (this used to sleep up to 5 s), the call says so
+    and the caller asks again when it chooses.
 
-    Returns (view, None) on success or (None, {"error": ...}) on failure.
-    """
-    import time
-
+    Returns (view, None) or (None, {"error": ...})."""
     def _open():
         w = sublime.active_window()
         v = w.find_open_file(path)
@@ -3936,14 +3867,10 @@ def _ensure_view(path):
     v, err = _on_main(_open)
     if err:
         return None, err
-
-    # Poll until loaded (each _on_main is brief; main thread free between sleeps)
-    for _ in range(50):
-        if not _on_main(lambda: v.is_loading()):
-            return v, None
-        time.sleep(0.1)
-
-    return None, {"error": "timeout waiting for file to load: {}".format(path)}
+    if _on_main(lambda: v.is_loading()):
+        return None, {"error": "the file is still loading: {}; call again when you choose"
+                               .format(path), "loading": True}
+    return v, None
 
 
 def _edit_file(body):
@@ -5117,9 +5044,10 @@ def _discover_tools(args):
 
 
 def _project_search(args):
-    """Run ST's native Find in Files engine and return parsed match records."""
-    import time
+    """Start ST's native Find in Files engine and return at once.
 
+    The search runs inside the editor and writes into its results panel; this call does not wait
+    for it (it used to poll for up to 30 s). Read the matches with project_search_results."""
     pattern = args.get("pattern", "")
     if not pattern:
         return {"error": "pattern required"}
@@ -5134,8 +5062,6 @@ def _project_search(args):
     regex = bool(args.get("regex", False))
     case_sensitive = bool(args.get("case_sensitive", False))
     whole_word = bool(args.get("whole_word", False))
-    limit = max(1, min(int(args.get("limit", 200)), 2000))
-    timeout = max(1.0, min(float(args.get("timeout", 30.0)), _PROJECT_SEARCH_TIMEOUT_SECONDS))
     show_panel = bool(args.get("show_panel", False))
 
     if not _project_search_lock.acquire(False):
@@ -5155,48 +5081,62 @@ def _project_search(args):
                 "case_sensitive": case_sensitive, "regex": regex,
                 "whole_word": whole_word,
                 # The tool reads the results from the output panel; with Find's "Use Buffer" on they
-                # would open in a Find Results tab instead and the tool would wait for nothing.
+                # would open in a Find Results tab instead and project_search_results would wait for
+                # nothing.
                 "use_buffer": False,
             })
             # This is the Find button command for the native Find in Files panel.
             window.run_command("find_all")
+            if not show_panel:
+                window.run_command("hide_panel")
             return {"ok": True}
 
         started = _on_main(start_search)
-        if started.get("error"):
-            return started
-        deadline = time.time() + timeout
-        content = ""
-        while time.time() < deadline:
-            def read_results():
-                panel = sublime.active_window().find_output_panel("find_results")
-                return panel.substr(sublime.Region(0, panel.size()))
-            content = _on_main(read_results)
-            if search_is_complete(content):
-                break
-            time.sleep(0.05)
-        else:
-            return {"error": "native project search timed out", "timeout": timeout}
-
-        matches = parse_find_results(content, pattern, regex, case_sensitive, limit)
-        summary = content.rstrip().splitlines()[-1] if content.strip() else ""
-        if not show_panel:
-            _on_main(lambda: sublime.active_window().run_command("hide_panel"))
-        return {
-            "engine": "sublime_find_in_files",
-            "pattern": pattern,
-            "where": where,
-            "matches": matches,
-            "returned": len(matches),
-            "truncated": len(matches) >= limit,
-            "summary": summary,
-        }
     finally:
         _project_search_lock.release()
+    if started.get("error"):
+        return started
+    return {"ok": True, "started": True, "pattern": pattern, "where": where,
+            "panel": "find_results", "read_with": "project_search_results",
+            "note": "the search runs in the editor; read it with project_search_results when you choose"}
+
+
+def _project_search_results(args):
+    """Read the Find in Files results panel now, with no waiting.
+
+    Returns the matches written so far and ``complete``: the panel's own final summary line means
+    the search has finished. Call it again later when ``complete`` is false; this tool never polls."""
+    pattern = args.get("pattern", "")
+    if not pattern:
+        return {"error": "pattern required (the one the search used: parsing needs it)"}
+    regex = bool(args.get("regex", False))
+    case_sensitive = bool(args.get("case_sensitive", False))
+    limit = max(1, min(int(args.get("limit", 200)), 2000))
+
+    def read_results():
+        window = sublime.active_window()
+        if not window:
+            return None
+        panel = window.find_output_panel("find_results")
+        return "" if panel is None else panel.substr(sublime.Region(0, panel.size()))
+
+    content = _on_main(read_results)
+    if content is None:
+        return {"error": "no active window"}
+    matches = parse_find_results(content, pattern, regex, case_sensitive, limit)
+    summary = content.rstrip().splitlines()[-1] if content.strip() else ""
+    complete = search_is_complete(content)
+    out = {"engine": "sublime_find_in_files", "pattern": pattern, "matches": matches,
+           "returned": len(matches), "truncated": len(matches) >= limit,
+           "complete": complete, "summary": summary}
+    if not complete:
+        out["note"] = "the search has not written its summary yet; ask again when you choose"
+    return out
 
 _POST["/batch"] = _batch
 _POST["/discover_tools"] = _discover_tools
 _POST["/project_search"] = _project_search
+_POST["/project_search_results"] = _project_search_results
 
 
 def _get_package_mcp_info(body):
@@ -5708,8 +5648,10 @@ _MCP_TOOLS = [
      }},
      _discover_tools),
     ("project_search",
-     "Search project files with Sublime Text's native Find in Files engine and return "
-     "structured {path,line,col,text} matches. This is the preferred project search tool.",
+     "Start a search with Sublime Text's native Find in Files engine and return at once; this call "
+     "does not wait for it. Read the structured {path,line,col,text} matches with "
+     "project_search_results, and ask again there while its reply says complete: false. This is the "
+     "preferred project search tool.",
      {"type": "object", "properties": {
          "pattern": {"type": "string"},
          "where": {"anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],
@@ -5717,11 +5659,20 @@ _MCP_TOOLS = [
          "case_sensitive": {"type": "boolean", "default": False},
          "regex": {"type": "boolean", "default": False},
          "whole_word": {"type": "boolean", "default": False},
-         "limit": {"type": "integer", "default": 200},
-         "timeout": {"type": "number", "default": 30},
          "show_panel": {"type": "boolean", "default": False},
      }, "required": ["pattern"]},
      _project_search),
+    ("project_search_results",
+     "Read the Find in Files results panel now and return the matches written so far, with complete: "
+     "true once the panel carries the search's summary line. Never waits: if complete is false, ask "
+     "again when you choose. Pass the same pattern (and regex/case_sensitive) the search used.",
+     {"type": "object", "properties": {
+         "pattern": {"type": "string"},
+         "case_sensitive": {"type": "boolean", "default": False},
+         "regex": {"type": "boolean", "default": False},
+         "limit": {"type": "integer", "default": 200},
+     }, "required": ["pattern"]},
+     _project_search_results),
     ("claim_resource",
      "Announce intent to use a shared Sublime Text singleton (the native input panel, the "
      "Control Panel, or any other resource name agents agree on) for a short multi-step "
@@ -6052,9 +6003,8 @@ _MCP_TOOLS = [
      }, "required": ["group"]},
      _p("/move_sheets_to_group")),
     ("open_file",
-     "Open a file in Sublime Text, optionally jumping to a specific line and column. Returns once the "
-     "file is loaded and is the active tab (active: true); if that takes longer than 3 s the answer is "
-     "pending: true with a note, so check get_sheets before typing into it.",
+     "Open a file in Sublime Text, optionally jumping to a specific line and column. Returns at once; "
+     "Sublime loads it asynchronously, so check get_sheets (is_focused) before typing into it.",
      {"type": "object", "properties": {
          "path": {"type": "string"},
          "line": {"type": "integer", "default": 0},
@@ -6125,9 +6075,8 @@ _MCP_TOOLS = [
     ("save_file",
      "Save a file. Pass path to save a specific open file; omit path to save the active file. "
      "Refuses with an error when the file's folder does not exist (nothing is created; make the folder "
-     "first). The result says saved: true once the tab is clean; saved: false with pending: true means "
-     "it is still modified after 1.5 s (a Save As dialog for an untitled tab, an 'Unable to save' "
-     "dialog, or a read-only file): look before repeating.",
+     "first). Returns at once: the save is requested, not waited for. Check get_sheets (is_dirty) and "
+     "native_dialogs (a Save As prompt, an 'Unable to save' error) before repeating.",
      {"type": "object", "properties": {"path": {"type": "string", "default": ""}}},
      _p("/save_file")),
     ("close_file",
@@ -6148,9 +6097,9 @@ _MCP_TOOLS = [
      "A tab with unsaved edits normally raises Sublime's native \"Save Changes?\" dialog, which "
      "blocks the main thread until someone answers it; pass discard=true to throw the unsaved "
      "edits away and close at once (the result then says discarded). "
-     "The result says closed: true once the tab is gone; closed: false with pending: true means the tab "
-     "is still open after 1.5 s (a Save Changes dialog, even when get_sheets says is_dirty false, or a "
-     "host hook refused): do not repeat the call, each repeat raises another dialog. "
+     "Returns at once; it does not wait to see whether the tab went. Check get_sheets (the tab is "
+     "gone) and native_dialogs (a Save Changes? prompt) before repeating: each repeat raises another "
+     "dialog. "
      "(run_command 'close' with scope='view' does not close a tab: use this tool.)",
      {"type": "object", "properties": {
          "path": {"type": "string", "default": ""},
@@ -6266,10 +6215,9 @@ _MCP_TOOLS = [
      "Pick an item of the quick panel shown by get_quick_panel: by index, or by text (case-"
      "insensitive match on the item's first line; must match exactly one item). index -1 cancels. "
      "Closes the panel and runs the package's own selection callback. That callback runs after this "
-     "answers, so one that opens a native dialog cannot hold the request: the answer is pending: true "
-     "after 1 s (2 s for a panel from the Python 3.3 host) with a note, meaning the pick went through "
-     "and a dialog is blocking Sublime -- answer it with list_native_windows and "
-     "dismiss_native_window. A fast callback returns its real result.",
+     "answers, and this tool does not wait for it: the answer is started: true with the picked index, "
+     "and the callback's outcome appears as last_pick in get_quick_panel (a dialog it opens appears in "
+     "the next result's native_dialogs). A callback that had already run returns its real result.",
      {"type": "object", "properties": {
          "index": {"type": "integer", "description": "Item index, or -1 to cancel."},
          "text": {"type": "string", "description": "Text of the item to pick."},

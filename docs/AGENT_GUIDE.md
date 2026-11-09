@@ -45,6 +45,24 @@ ST tools use **1-based** line/column (`get_active_file`, `open_file`,
 `goto_line`, `replace_lines`). Language-server tools use **0-based**. Subtract 1 when
 passing an ST cursor into an `lsp_*` tool.
 
+## Tools never wait; the agent does the waiting
+
+No call sleeps, polls or blocks to produce a result. A command that starts work — a build, a
+syntax test, a package install, a language server, anything that opens a panel or tab — returns at
+once, and the result is read later, by you.
+
+- Read it with the tool that owns it: `get_output_panel` (build or syntax-test results),
+  `get_console` (tracebacks), `get_quick_panel`, `get_sheets`.
+- You arrange the delay, not the editor: do other work, then ask again in a later call. Repeating
+  a read is cheap; a blocked session is not.
+- Never put a starting call and its read-back in one `batch`; the read runs immediately.
+- A timeout is information about the editor, not a reason to wait longer. Look at state first
+  (`get_sheets`, `list_native_windows`), then decide.
+
+This is a rule, not a preference: a handler that sleeps, polls or blocks for a result is a defect.
+If you are writing a sleep, a retry loop or a timeout to collect a result, stop and split the call
+into a start and a read instead. Age is not an excuse for a tool that already does it.
+
 ## Quick start
 
 Eight tools are listed and are called directly: `get_help`, `get_active_file`, `ui_screenshot`,
@@ -102,13 +120,14 @@ batch(calls=[{"tool": "close_file", "args": {"path": "..."}}])      # hidden too
 `create` opens the new tab itself (no `open_file` needed) and fails if the file already exists;
 the file reaches the disk when `save_file` runs. `str_replace` and `insert` edit the open tab, so
 they also need `save_file`. `create` does not make missing folders, and `save_file` into a missing folder is
-refused with an error (it used to answer ok while Sublime showed an "Unable to save" dialog); the result says
-`saved: true`, or `saved: false` with `pending: true` when the tab is still modified after 1.5 s (a Save As or
-error dialog, or a read-only file). `get_sheets` and `get_open_files` add `disk_differs: true` to a tab that
+refused with an error (it used to answer ok while Sublime showed an "Unable to save" dialog). It returns at
+once: the save is requested, not waited for — check `get_sheets` (`is_dirty`) and the result's
+`native_dialogs` (a Save As prompt, an "Unable to save" error) before repeating. `get_sheets` and
+`get_open_files` add `disk_differs: true` to a tab that
 reads as clean but holds an empty buffer for a file that has content on disk: Sublime then counts the buffer as
 modified and asks "Save changes?" on close. To open an existing file use
-the hidden tool `open_file(path=...)`; it returns once the file is loaded and is the active tab
-(`active: true`), or says `pending: true` after 3 s when it is not yet.
+the hidden tool `open_file(path=...)`; it returns at once and Sublime loads the file asynchronously, so check
+`get_sheets` (`is_focused`) before typing into it.
 
 Hidden tools (everything except the eight) are only reachable through `batch`; calling one
 directly gives "No such tool". `get_sheets` returns every tab's full settings (over 100 lines per
@@ -167,11 +186,11 @@ Skip save and ST looks edited while `git diff` is empty.
 A dirty view makes `close_file` open ST's save prompt. Save first, or pass `discard: true`
 (it asks the person). Always give `name` (or `index`, or `path`): with none of them `close_file`
 closes the ACTIVE tab, which the person may be typing in. A `name` that fits several tabs is
-refused with the list of matches. The result says `closed: true` once the tab is gone. `closed: false` with
-`pending: true` means it is still open after 1.5 s because Sublime is asking "Save changes before closing?" (this
-can happen even when `get_sheets` says `is_dirty: false`, for example a file that was created after its tab was
-opened) or a host hook refused the close. Do not repeat the call: each repeat raises another dialog. Answer the
-first dialog (Windows: `list_native_windows`, `dismiss_native_window`; WSL/Linux: on screen).
+refused with the list of matches. It returns at once and does not wait to see whether the tab went: check
+`get_sheets` (the tab is gone) and `native_dialogs` (Sublime may be asking "Save changes before closing?",
+which can happen even when `get_sheets` says `is_dirty: false`, for example a file created after its tab was
+opened), or a host hook may have refused the close. Do not repeat the call before you have looked: each repeat
+raises another dialog. Answer the dialog (Windows: `dismiss_native_window`; WSL/Linux: on screen).
 
 ## eval_python
 
@@ -194,7 +213,8 @@ get_sheet_content(index=2)         # untitled / scratch / terminal tabs too
 open_file(path=..., line=42, col=1)
 save_all()
 revert_file(name="notes.txt")      # asks the person; name or index, else the active view
-project_search(pattern=..., where=...)  # ST Find-in-Files, structured matches
+project_search(pattern=..., where=...)  # starts ST Find-in-Files and returns at once
+project_search_results(pattern=...)     # reads the matches written so far (complete: bool)
 discover_tools()                        # categories; see "Finding tools"
 get_commands()                     # command ids, scopes, packages, palette captions
 ```
@@ -312,7 +332,9 @@ posted keys do not reach it.
 ## Find in Files
 
 Where scope, include and exclude patterns, and the option flags. `project_search` runs the same
-engine and exposes none of them. In order:
+engine and exposes none of them. It starts the search and returns at once;
+`project_search_results(pattern=...)` reads what has been written and says `complete` when the
+search has finished. In order:
 
 ```
 find_in_folder(dirs=["C:\\Users\\me\\project", "*.py", "-test/"])   # opens the panel, empties Find
@@ -540,13 +562,11 @@ Observed on build 4200 (2026-10-07).
   when the 3.3 host is off; the command palette and
   Goto Anything give an error, and then the keyboard is the only way. Picking runs the package's own callback, so pick only items you mean to run (some
   pickers open files, folders or browser tabs). If the callback raises a modal dialog (Jekyll's remove
-  commands: "Confirm Delete"), `pick_quick_panel` answers `{ok: true, pending: true, note: ...}`: after
-  1 s when the panel came from sublime-commander's own host, after 2 s when it came from the 3.3 host. The
-  pick went through, the dialog is open and blocks Sublime: answer it with `list_native_windows` and
-  `dismiss_native_window` (or Return on its hwnd), then check the result. Nothing is reported as
-  `pending` on a guess: a fast callback returns its real result, and in the 3.3 host `pending` is only
-  used when that host had just answered (a missing or unloaded helper is "no recorded quick panel"
-  instead). `drive_input_panel` only fills input panels.
+  commands: "Confirm Delete"), `pick_quick_panel` returns at once with `started: true` and does not wait
+  for the callback: the dialog appears in the next result's `native_dialogs`, and the callback's outcome in
+  `get_quick_panel` (`last_pick`). Answer the dialog with `dismiss_native_window` (or Return on its hwnd),
+  then check the result. A callback that had already run returns its real result; in the 3.3 host a missing
+  or unloaded helper is "no recorded quick panel" instead. `drive_input_panel` only fills input panels.
   **The package manager's Install Package / Remove Package lists take up to ~15 s to appear after
   Enter** (the status bar says "Loading packages..."): pass `wait_ms` (at most 60000) to
   `pick_quick_panel` or `get_quick_panel`, for example `pick_quick_panel(text="Bicep",

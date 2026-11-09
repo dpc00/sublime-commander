@@ -25,6 +25,17 @@ discover_tools(query="bookmarks")         # keyword search across all tools
 batch(calls=[{"tool": "get_bookmarks", "args": {}}])
 ```
 
+## No tool waits
+
+A tool returns what exists when it returns. Nothing in a handler sleeps, polls or blocks for a
+result; the caller asks again on its own schedule. Read a started job with the tool that owns it:
+`project_search_results` (`complete: true` once the search has written its summary),
+`get_output_panel` (build and syntax-test results), `get_console`, `get_quick_panel` (`last_pick`
+for a pick callback), `get_sheets`, `list_native_windows` and every result's `native_dialogs`.
+Never put a starting call and its read-back in one `batch`; the read runs immediately.
+`settle_ms`/`wait_ms`/`wait_idle_s` are observation windows the caller asks for, not the tool
+deciding to wait. When writing or reviewing a handler, a sleep is a defect.
+
 ## Tool choice: the editor, because it is faster
 
 Sublime Text is the fast path: a sublime-commander call runs inside the editor process that already holds

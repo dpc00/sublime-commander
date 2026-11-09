@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+`project_search` passed `where` to Sublime unchanged, and Find in Files takes one string: a list of
+paths or globs was ignored, so the search silently ran over the project folders instead of the
+places asked for (found 2026-11-06, reproduced 2026-11-09). A list is now joined with commas — the
+form the Where box uses — and a value that is neither a string nor a list is refused with an error
+instead of being ignored.
+
 A native dialog was only visible through `list_native_windows`, and nothing pushed it: one that
 appeared while a step ran (the "unregistered copy" reminder after a save, a package's error box, a
 chooser) went unnoticed until the person pointed at it. Every `tools/call` result now carries

@@ -5124,6 +5124,13 @@ def _project_search(args):
     if not pattern:
         return {"error": "pattern required"}
     where = args.get("where", "")
+    if isinstance(where, (list, tuple)):
+        # Find in Files' Where box is one string of comma-separated paths and globs. A list was
+        # passed straight to Sublime, which ignored it, so the search silently ran over the
+        # project folders instead of the places named (found 2026-11-06). Join what was meant.
+        where = ", ".join(str(w) for w in where if str(w).strip())
+    elif not isinstance(where, str):
+        return {"error": "where must be a string or a list of paths/globs"}
     regex = bool(args.get("regex", False))
     case_sensitive = bool(args.get("case_sensitive", False))
     whole_word = bool(args.get("whole_word", False))
@@ -5705,7 +5712,8 @@ _MCP_TOOLS = [
      "structured {path,line,col,text} matches. This is the preferred project search tool.",
      {"type": "object", "properties": {
          "pattern": {"type": "string"},
-         "where": {"type": "string", "description": "ST Where expression; empty uses current project folders."},
+         "where": {"anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],
+                   "description": "ST Where expression, or a list of paths/globs (joined with commas); empty uses current project folders."},
          "case_sensitive": {"type": "boolean", "default": False},
          "regex": {"type": "boolean", "default": False},
          "whole_word": {"type": "boolean", "default": False},

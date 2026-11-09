@@ -200,7 +200,8 @@ get_commands()                     # command ids, scopes, packages, palette capt
 ```
 
 `project_search` `where` accepts folder paths, `*.py`, `-*.md`, `${project}`,
-`${open_files}`, `${folder:Name}`.
+`${open_files}`, `${folder:Name}` — or a list of those, which is joined with commas
+(measured 2026-11-09: a list used to be passed to Sublime unchanged and silently ignored).
 
 ## Typing into a GhostShell terminal tab (a shell, Claude Code and other agent CLIs)
 

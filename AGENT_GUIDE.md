@@ -486,6 +486,12 @@ Observed on build 4200 (2026-10-07).
   label, and "Yes" counts: on Emmet's telemetry prompt it meant "Yes, enable telemetry", and on a
   `Save Changes?` it meant "Yes" (2026-11-08). Read the button labels from `list_native_windows`
   first and name one with `action: "button"` when the choice matters.
+- **Every tool result carries `native_dialogs` while one is open.** The reply gains `native_dialogs`
+  (hwnd, title, buttons, messages) whenever a native dialog is open at the moment the call
+  finishes — including the call that timed out because of it — so a dialog that appears while a
+  step runs (the unregistered-copy reminder after a save, a package's error box, a chooser) does not
+  wait for the person to point at it. Read it and answer it before the next step, with
+  `dismiss_native_window`; never `action: "ok"` on labels you have not read.
 - **A dialog's fields are windows of their own.** Every dialog now carries `controls`: each Edit,
   ComboBox, ListBox, list view and tree view under it, with `hwnd`, class, control id, parent class,
   text and rect. The File name box of a common Open/Save dialog is the Edit nested in the

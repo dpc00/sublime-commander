@@ -8012,6 +8012,34 @@ def _consent_gate_result(params, modern, session_id=None):
                                params if modern else {}, can_ask)
 
 
+def _note_open_dialogs(data):
+    """Add ``native_dialogs`` to a dict result when a native dialog is open right now.
+
+    A dialog is only visible through ``list_native_windows``; nothing pushes it, so one that
+    appears while a step runs (the unregistered-copy reminder after a save, a package's error
+    box, the "Open" chooser of a command) went unnoticed until the person named it. Every
+    tools/call now carries it, read the same no-main-thread way the dialog tools use, so it also
+    works while the dialog blocks Sublime. Only dialogs, and only when there are some."""
+    if not native_windows.SUPPORTED or not isinstance(data, dict):
+        return data
+    try:
+        found = [w for w in native_windows.list_windows(_native_window_pids())
+                 if w.get("kind") == "dialog"]
+    except Exception:
+        return data
+    if not found:
+        return data
+    brief = []
+    for d in found:
+        messages = [m[:200] for m in d.get("messages", [])]
+        brief.append({"hwnd": d.get("hwnd"), "title": d.get("title"),
+                      "buttons": [b.get("text") for b in d.get("buttons", [])],
+                      "messages": messages})
+    out = dict(data)
+    out["native_dialogs"] = brief
+    return out
+
+
 def _mcp_call_tool(params):
     """The result of a tools/call. A tool that fails is reported in the result with isError
     (all protocol versions); only a tool that does not exist raises _UnknownTool (-32602)."""
@@ -8024,7 +8052,7 @@ def _mcp_call_tool(params):
             entry = next((t for t in _MCP_TOOLS if t[0] == tool_name), None)
         if entry is None:
             raise _UnknownTool(tool_name)
-        data = _with_arg_warning(entry[3](tool_args), entry[2], tool_args)
+        data = _note_open_dialogs(_with_arg_warning(entry[3](tool_args), entry[2], tool_args))
     except _UnknownTool:
         raise
     except Exception as e:

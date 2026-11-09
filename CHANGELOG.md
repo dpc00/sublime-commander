@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+A native dialog was only visible through `list_native_windows`, and nothing pushed it: one that
+appeared while a step ran (the "unregistered copy" reminder after a save, a package's error box, a
+chooser) went unnoticed until the person pointed at it. Every `tools/call` result now carries
+`native_dialogs` — hwnd, title, button labels and message text — whenever a dialog is open at the
+moment the call finishes, including the call that timed out because of one. It is read the same
+no-main-thread way as the dialog tools, so it works while the dialog blocks Sublime. Measured on
+4215: with the native Open dialog up, both a failing `prompt_open_file` and a plain `get_console_log`
+reported it; after `dismiss_native_window` the field was gone.
+
 A native dialog could be read and dismissed but not filled: `list_native_windows` gave a dialog's
 buttons and message text only, so the File name box of a common Open/Save dialog had no handle to
 name and `ui_type_text` posted at the dialog itself reached no control. Measured 2026-11-09 while

@@ -784,7 +784,12 @@ def _get_sheets(params):
         active_sheet_id = active_sheet.id() if active_sheet else None
         active_group = w.active_group()
         out = []
-        for i, s in enumerate(w.sheets()):
+        # A preview view is reached through its placeholder sheet (selected_sheets_in_group
+        # returns the sheet, w.sheets() does not) or, when there is no sheet at all, only
+        # through _preview_views. Match them by path so one tab is one row.
+        preview_by_path = {v.file_name(): v for v in _preview_views(w) if v.file_name()}
+        reported_paths = set()
+        for i, s in enumerate(_all_sheets(w)):
             kind = type(s).__name__
             path = None
             try:
@@ -792,6 +797,8 @@ def _get_sheets(params):
             except Exception:
                 pass
             v = s.view()
+            if v is None and path and path in preview_by_path:
+                v = preview_by_path[path]
             item = {
                 "index": i,
                 "id": s.id(),
@@ -825,6 +832,11 @@ def _get_sheets(params):
                 except Exception:
                     item["size"] = None
                 item["syntax"] = _view_syntax(v)[0]
+                item["view_id"] = v.id()
+            if path:
+                reported_paths.add(path)
+                if path in preview_by_path:
+                    item["preview"] = True
             out.append(item)
         # An untouched untitled buffer is a view the window shows but window.sheets() leaves out,
         # while selected_sheets_in_group() does return it -- so the reply carried
@@ -838,8 +850,15 @@ def _get_sheets(params):
                 continue
             v = s.view()
             if v is None:
+                try:
+                    sheet_path = s.file_name()
+                except Exception:
+                    sheet_path = None
+                v = preview_by_path.get(sheet_path) if sheet_path else None
+            if v is None:
                 continue
             item = {
+                # Addressable: the loop above and _resolve_sheet_refs share _all_sheets.
                 "index": len(out),
                 "id": s.id(),
                 "type": type(s).__name__,
@@ -856,15 +875,27 @@ def _get_sheets(params):
                 "is_read_only": v.is_read_only(),
                 "size": v.size(),
                 "syntax": _view_syntax(v)[0],
+                "view_id": v.id(),
             }
+            if item["path"]:
+                reported_paths.add(item["path"])
+                if item["path"] in preview_by_path:
+                    item["preview"] = True
             out.append(item)
         # A preview a package opened is in neither sheet list, yet it is the tab on screen
         # (see _preview_views): without this, get_sheets said nothing was open while a file
         # was in front of the person.
-        for offset, v in enumerate(_preview_views(w), len(out)):
+        for v in _preview_views(w):
+            if v.file_name() in reported_paths:
+                # already reported through the sheet that holds it
+                continue
             item = {
-                "index": offset,
-                "id": v.id(),
+                # No sheet behind it, so there is no sheet id and no index that focus_sheet
+                # or close_file could resolve: name it by path and say what it is. It used to
+                # carry the *view* id in "id" and an index past the end of the sheet list.
+                "index": None,
+                "id": None,
+                "view_id": v.id(),
                 "type": "PreviewSheet",
                 "path": v.file_name(),
                 "name": _view_display_name(v),
@@ -978,6 +1009,24 @@ def _get_selected_sheets(params):
     return _on_main(fn)
 
 
+def _all_sheets(w):
+    """Every sheet the window shows: w.sheets() plus the ones only the group reports.
+
+    A preview a package opened is held by a sheet that selected_sheets_in_group() returns and
+    w.sheets() leaves out, so a row get_sheets listed could not be focused by index or by id
+    -- "sheet id 64 not found" for a tab that was in front of the person (measured
+    2026-11-10). One list, in one order, is what index and id both mean.
+    """
+    sheets = list(w.sheets())
+    known = {s.id() for s in sheets}
+    for group in range(w.num_groups()):
+        for s in w.selected_sheets_in_group(group):
+            if s.id() not in known:
+                sheets.append(s)
+                known.add(s.id())
+    return sheets
+
+
 def _resolve_sheet_refs(w, body, require_one=False):
     indices = body.get("indices")
     ids = body.get("ids")
@@ -988,7 +1037,7 @@ def _resolve_sheet_refs(w, body, require_one=False):
     if indices is None and ids is None:
         return None, "provide index/indices or id/ids"
 
-    all_sheets = w.sheets()
+    all_sheets = _all_sheets(w)
     by_id = {s.id(): s for s in all_sheets}
     resolved = []
     seen = set()

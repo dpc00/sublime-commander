@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**A preview tab was listed three times, with handles that did not work.** With a file open through a
+package's preview (`sublime.TRANSIENT`), `get_sheets` reported the tab as an empty placeholder row
+*and* a synthetic `PreviewSheet` row whose `id` was the **view** id and whose `index` sat past the
+end of the sheet list — while `focus_sheet` answered `"sheet id 64 not found"` and `"index 9 out of
+range (have 9 sheets)"` for both. `w.sheets()` leaves out the sheet that holds such a tab;
+`selected_sheets_in_group()` returns it. There is now one list, `_all_sheets`, used by `get_sheets`
+and by `_resolve_sheet_refs`, so one tab is one row and its `index` and `id` both address it; the
+row carries `view_id` and `preview`, and every row carries `view_id`. Preview views with no sheet at
+all still appear, but with `index: null` and `id: null` instead of borrowed numbers.
+
+Measured on 4215 before and after: three rows and two failures → one row, `index 9`, `id 64`,
+`focus_sheet` succeeding by both.
+
 **`revert_file` claimed it asks the person first — it does not.** Sublime reverts a modified buffer
 with no dialog at all, so the documented promise was false and an agent could rely on a confirmation
 that never comes. Measured 2026-11-10: a dirty buffer reverted silently and the discarded edit could

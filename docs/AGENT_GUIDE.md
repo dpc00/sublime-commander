@@ -342,14 +342,12 @@ name rather than left for the editor to resolve: a project set in the same `batc
 otherwise answered `0 matches` with `complete: true`, because the editor had not picked the project
 up yet. A window with no folders gets an error saying to pass `where`, never an empty result.
 `project_search_results` reports `returned`, `total` and `truncated`, and `truncated` is true only
-when matches were actually dropped by `limit`.
+when matches were actually dropped by `limit`. It reads the one shared results panel, so it checks
+the panel's own header against the pattern and `regex` flag you pass: a read for a search that has
+not started yet is refused with `panel_pattern` rather than answered with the previous search's
+matches.
 
-In order:
-
-```
-find_in_folder(dirs=["C:\\Users\\me\\project", "*.py", "-test/"])   # opens the panel, empties Find
-ui_type_text(text="needle")                                       # fills Find, caret stays there
-toggle_regex                                                      # one toggle per call, panel focused
+In order:              # one toggle per call, panel focused
 find_all                                                          # runs it; panel closes
 get_output_panel                                                  # reads find_results
 ```

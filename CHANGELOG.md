@@ -17,6 +17,14 @@ caller inferred truncation from `len(matches) >= limit`. The parser now returns 
 caller slices: `truncated` is true only when matches were dropped, and the result carries `total`
 alongside `returned`, so a caller can tell 8 of 8 from 3 of 8.
 
+**A read could hand back the previous search's matches as its own.** The results panel is one
+shared buffer, and `project_search_results(pattern=…)` trusted the pattern it was given instead of
+asking what the panel was showing. Measured 2026-11-10: a search for `foo(bar)` with `regex: true`
+that had written nothing yet returned the earlier search's match — `sub/gamma.md:1 "nested needle"` —
+with `complete: true`. The reader now compares the panel's own header (`Searching 8 files for
+"needle" (case sensitive)`) against the requested pattern and regex flag, and refuses with an error
+naming what the panel actually holds, rather than attributing a stranger's results.
+
 **A POST for an SSE session that no longer exists hung the client instead of failing.** Reloading
 this package clears its session table — which happens whenever the package's own files change — and
 `/messages?sessionId=…` dispatched anyway, handed the result to a queue that no longer existed and

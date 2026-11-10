@@ -72,7 +72,7 @@ import sublime_plugin
 
 from .lib import consent
 from .lib import native_windows
-from .lib.search_results import parse_find_results, search_is_complete
+from .lib.search_results import panel_search_pattern, parse_find_results, search_is_complete
 
 # Single source of truth for the version this plugin advertises over MCP.
 # Keep in step with server.json (no automated test enforces this; check by
@@ -5137,6 +5137,17 @@ def _project_search_results(args):
     content = _on_main(read_results)
     if content is None:
         return {"error": "no active window"}
+    header = panel_search_pattern(content)
+    if header and header[0] != pattern:
+        return {"error": "the results panel is showing a search for {!r}, not {!r}".format(header[0], pattern),
+                "panel_pattern": header[0],
+                "hint": "run project_search with this pattern, then read again; the panel holds one "
+                        "search at a time and an unread read would report the previous search's matches"}
+    if header and bool(header[1]) != regex:
+        return {"error": "the results panel searched {!r} with regex={}, not regex={}".format(
+                    header[0], bool(header[1]), regex),
+                "panel_pattern": header[0],
+                "hint": "run project_search with the same regex flag, then read again"}
     matches = parse_find_results(content, pattern, regex, case_sensitive)
     total = len(matches)
     shown = matches[:limit]

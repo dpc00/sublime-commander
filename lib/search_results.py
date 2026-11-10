@@ -8,6 +8,7 @@ _SUMMARY_RE = re.compile(
     re.IGNORECASE,
 )
 _RESULT_RE = re.compile(r"^\s+(\d+):\s?(.*)$")
+_HEADER_RE = re.compile(r'^\s*Searching\b.*?\bfor "(.*)"(?P<flags>(?: \([^)]*\))*)\s*$', re.MULTILINE)
 
 
 def search_is_complete(text):
@@ -16,6 +17,19 @@ def search_is_complete(text):
 
 
 _MAX_PARSE = 50000
+
+
+def panel_search_pattern(text):
+    """The pattern the results panel is actually showing, from its own header line.
+
+    Returns (pattern, is_regex) or None when no header has been written yet. A caller that
+    reads the panel without this check can attribute the previous search's matches to its own
+    pattern (found 2026-11-10: reading after a search that had not written anything yet returned
+    the earlier search's match, with complete: true)."""
+    m = _HEADER_RE.search((text or ""))
+    if not m:
+        return None
+    return m.group(1), "regex" in (m.group("flags") or "").lower()
 
 
 def parse_find_results(text, pattern="", regex=False, case_sensitive=False, hard_limit=_MAX_PARSE):
@@ -56,3 +70,5 @@ def parse_find_results(text, pattern="", regex=False, case_sensitive=False, hard
         if len(matches) >= max(1, int(hard_limit)):
             break
     return matches
+
+# reload probe 2283889471952

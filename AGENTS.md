@@ -54,8 +54,13 @@ reported — never clicked by a watcher — unless the person asks for it.
 No PR and no fork unless the maintainer's gate passes: a maintainer commit within 90 days and at
 least one PR ever merged. Otherwise the finding is an issue comment only, starting
 `omp - deepseek v4 flash reports:`. When the gate passes: fork under `dpc00`, branch `fix/<topic>`,
-clone in a scratch dir outside every repo, verify the patched files in the portable before pushing,
-then delete the fork and the clone.
+clone in `~/tools/forks` (not a scratch dir — that is where fork clones live and stay), verify the
+patched files in the portable before pushing.
+
+**Never delete an unmerged fork, and never delete its clone.** Fork and clone stay in
+`~/tools/forks` until the pull request is merged (or the maintainer closes it unmerged and says so),
+and only then are they removed. Donald, 2026-11-10: "never delete any unmerged fork" — after a clone
+was deleted minutes after its PR was opened, which orphaned nothing but lost the working copy.
 
 ## Elsewhere in this repo
 

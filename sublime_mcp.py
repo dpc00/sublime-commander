@@ -5071,13 +5071,27 @@ def _project_search(args):
             window = sublime.active_window()
             if not window:
                 return {"error": "no active window"}
+            # An empty Where means "the project folders", and the editor resolves that itself --
+            # including when it has not finished picking up a project that was set a moment
+            # earlier. Measured 2026-11-10: set_project_data followed by a search in the same
+            # batch returned "0 matches" with complete: true, and one file of a two-deep fixture
+            # was missing from a search started right after the window's folders changed. Naming
+            # the folders explicitly makes the answer depend on the request, not on the editor's
+            # indexing timing.
+            effective_where = where
+            if not effective_where:
+                folders = window.folders()
+                if not folders:
+                    return {"error": "this window has no folders and no where was given: pass the "
+                                     "paths or globs to search, or open a folder first"}
+                effective_where = ", ".join(folders)
             panel = window.find_output_panel("find_results")
             panel.set_read_only(False)
             panel.run_command("select_all")
             panel.run_command("right_delete")
             panel.set_read_only(True)
             window.run_command("show_panel", {
-                "panel": "find_in_files", "pattern": pattern, "where": where,
+                "panel": "find_in_files", "pattern": pattern, "where": effective_where,
                 "case_sensitive": case_sensitive, "regex": regex,
                 "whole_word": whole_word,
                 # The tool reads the results from the output panel; with Find's "Use Buffer" on they
@@ -5089,14 +5103,14 @@ def _project_search(args):
             window.run_command("find_all")
             if not show_panel:
                 window.run_command("hide_panel")
-            return {"ok": True}
+            return {"ok": True, "where": effective_where}
 
         started = _on_main(start_search)
     finally:
         _project_search_lock.release()
     if started.get("error"):
         return started
-    return {"ok": True, "started": True, "pattern": pattern, "where": where,
+    return {"ok": True, "started": True, "pattern": pattern, "where": started.get("where", where),
             "panel": "find_results", "read_with": "project_search_results",
             "note": "the search runs in the editor; read it with project_search_results when you choose"}
 
@@ -5123,11 +5137,13 @@ def _project_search_results(args):
     content = _on_main(read_results)
     if content is None:
         return {"error": "no active window"}
-    matches = parse_find_results(content, pattern, regex, case_sensitive, limit)
+    matches = parse_find_results(content, pattern, regex, case_sensitive)
+    total = len(matches)
+    shown = matches[:limit]
     summary = content.rstrip().splitlines()[-1] if content.strip() else ""
     complete = search_is_complete(content)
-    out = {"engine": "sublime_find_in_files", "pattern": pattern, "matches": matches,
-           "returned": len(matches), "truncated": len(matches) >= limit,
+    out = {"engine": "sublime_find_in_files", "pattern": pattern, "matches": shown,
+           "returned": len(shown), "total": total, "truncated": total > len(shown),
            "complete": complete, "summary": summary}
     if not complete:
         out["note"] = "the search has not written its summary yet; ask again when you choose"
@@ -7784,6 +7800,24 @@ class _MCPHandler(BaseHTTPRequestHandler):
             payload = json.dumps({"jsonrpc": "2.0", "id": None,
                                   "error": {"code": -32700, "message": problem}}).encode()
             self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if not session_id or session_id not in _mcp_sessions:
+            # A reload of this package clears _mcp_sessions, and the client keeps posting to the
+            # session id it was given. Dispatching anyway meant the result was handed to a queue
+            # that no longer existed and dropped, so the client waited until its own timeout and
+            # every later call looked like a frozen server (measured 2026-11-10: two calls timed
+            # out and only a Sublime restart recovered). Answer on the HTTP response instead.
+            rid = body.get("id") if isinstance(body, dict) else None
+            payload = json.dumps({"jsonrpc": "2.0", "id": rid,
+                                  "error": {"code": -32000,
+                                            "message": "unknown or expired SSE session; reconnect to /sse "
+                                                       "(this server restarts when MCP Commander reloads)"}}).encode()
+            self.send_response(404)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()

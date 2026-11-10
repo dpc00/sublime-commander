@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+**A search over a project set moments earlier answered `0 matches`, and said it was complete.**
+`project_search` left an empty `where` for the editor to resolve, so the engine read the window's
+project as it stood before the project was applied: in one `batch`, `set_project_data` followed by
+`project_search` returned `0 matches` with `complete: true`, and a search started one call earlier
+on a two-deep fixture missed a whole subdirectory (5 of 7 files). The window's folders are now
+passed to Find in Files by name, so the answer depends on the request rather than on the editor's
+indexing; a window with no folders gets an error naming that, instead of an empty success. Measured
+after the change: the same batch returns all 8 matches across 7 files.
+
+**`truncated` was true whenever the result set merely reached `limit`.** A complete search with 8
+matches and `limit: 8` reported `truncated: true`, because the parser stopped at the limit and the
+caller inferred truncation from `len(matches) >= limit`. The parser now returns every match and the
+caller slices: `truncated` is true only when matches were dropped, and the result carries `total`
+alongside `returned`, so a caller can tell 8 of 8 from 3 of 8.
+
+**A POST for an SSE session that no longer exists hung the client instead of failing.** Reloading
+this package clears its session table — which happens whenever the package's own files change — and
+`/messages?sessionId=…` dispatched anyway, handed the result to a queue that no longer existed and
+dropped it. The client waited for its own timeout, and every later call looked like a frozen server:
+two calls timed out in the rig and only a Sublime restart recovered. An unknown or missing session
+is now answered `404` with a JSON-RPC `-32000` saying to reconnect to `/sse`. Measured: 2 ms, where
+it previously never answered at all.
+
 ## 1.4.0 — 2026-11-10
 
 **No tool waits any more.** A handler that sleeps, polls or blocks for a result holds the request

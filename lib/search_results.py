@@ -15,8 +15,16 @@ def search_is_complete(text):
     return bool(_SUMMARY_RE.search((text or "").rstrip()))
 
 
-def parse_find_results(text, pattern="", regex=False, case_sensitive=False, limit=200):
-    """Convert ST's Find Results text into stable, structured matches."""
+_MAX_PARSE = 50000
+
+
+def parse_find_results(text, pattern="", regex=False, case_sensitive=False, hard_limit=_MAX_PARSE):
+    """Convert ST's Find Results text into stable, structured matches.
+
+    Every match in the text is parsed; the caller slices to its own limit. Stopping at the
+    caller's limit here made a complete result set of exactly that size look truncated
+    (found 2026-11-10: 8 matches, limit 8, complete summary, truncated: true).
+    ``hard_limit`` only bounds a pathological panel."""
     matches = []
     current_path = None
     flags = 0 if case_sensitive else re.IGNORECASE
@@ -45,6 +53,6 @@ def parse_find_results(text, pattern="", regex=False, case_sensitive=False, limi
             "col": found.start() + 1 if found else 1,
             "text": preview,
         })
-        if len(matches) >= max(1, int(limit)):
+        if len(matches) >= max(1, int(hard_limit)):
             break
     return matches

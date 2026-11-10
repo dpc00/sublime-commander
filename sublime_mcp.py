@@ -2387,6 +2387,14 @@ def _open_file(body):
         return {"error": "path required"}
     line = body.get("line", 0)
     col = body.get("col", 0)
+    # Sublime opens a blank view for a path that is not there, so a typo reported "opened" and left
+    # an empty tab named after it -- the caller then types into a buffer that is not the file it
+    # meant (measured 2026-11-10 on does_not_exist.txt: view present, nothing on disk). An absolute
+    # path is checked here; a relative one is left to Sublime, which resolves it against the project.
+    if os.path.isabs(path) and not os.path.exists(path):
+        return {"error": "no such file: " + path, "missing": True,
+                "hint": "open_file opens an existing file; use new_file_at to create one, "
+                        "or check the path"}
 
     def fn():
         w = sublime.active_window()

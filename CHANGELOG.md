@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**`open_file` reported success for a path that does not exist.** Sublime opens a blank view for it,
+so a typo returned `ok: true` and left an empty tab named after the missing file — measured on
+`does_not_exist.txt`: the view was there, nothing was on disk, and anything typed next landed in a
+buffer that was not the file asked for. An absolute path is now checked and refused with `missing:
+true` and a hint to use `new_file_at`; a relative path is still left to Sublime, which resolves it
+against the project.
+
 **A list `where` with a comma in a path searched nothing.** The list is joined into Find in Files'
 comma-separated Where box, so `["…/mcpfix/comma,dir"]` became two paths that do not exist and the
 search answered `0 matches` with `complete: true`. Entries containing a comma are now quoted — the

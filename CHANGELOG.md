@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**`project_search_results` was invisible to a client that shows only the default surface.** Its
+partner `project_search` is advertised by default and its own reply says "read it with
+`project_search_results`", but that tool was in neither `_MCP_DEFAULT_TOOL_NAMES` nor
+`tool_tree.json` — found 2026-11-10 by diffing the 381 registered tools against the tree (every leaf
+was callable; exactly this read-back was missing). It is part of the default surface now, in both
+`sublime_mcp.py` and the tree generator's `DEFAULT_ADVERTISED`, and the default list returns nine
+tools instead of eight.
+
 **`open_file` reported success for a path that does not exist.** Sublime opens a blank view for it,
 so a typo returned `ok: true` and left an empty tab named after the missing file — measured on
 `does_not_exist.txt`: the view was there, nothing was on disk, and anything typed next landed in a

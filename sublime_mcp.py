@@ -7657,6 +7657,10 @@ _MCP_DEFAULT_TOOL_NAMES = frozenset({
     "batch",
     "get_active_file",
     "project_search",
+    # The read-back for project_search. Left out, a client that shows only the default surface got
+    # a tool that says "read it with project_search_results" and no way to call it (found
+    # 2026-11-10 comparing the registry against tool_tree.json).
+    "project_search_results",
     "str_replace_based_edit_tool",
     "save_file",
     "discover_tools",

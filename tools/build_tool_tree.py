@@ -171,7 +171,8 @@ put("app/merge_and_web", "sublime_merge_blame_file sublime_merge_file_history su
 put("app/misc", "primary_j_changed")
 
 DEFAULT_ADVERTISED = {"get_help", "batch", "get_active_file", "project_search",
-                      "str_replace_based_edit_tool", "save_file", "discover_tools", "ui_screenshot"}
+                      "project_search_results", "str_replace_based_edit_tool", "save_file",
+                      "discover_tools", "ui_screenshot"}
 
 
 def tool_names():

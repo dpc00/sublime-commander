@@ -1,0 +1,22 @@
+{
+  "schema_version": "3.0.0",
+  "packages": [
+    {
+      "name": "MCP Commander",
+      "description": "MCP server for Sublime Text 4 — lets an agent read and control a running ST instance",
+      "author": "dpc00",
+      "homepage": "https://github.com/dpc00/sublime-commander",
+      "details": "https://github.com/dpc00/sublime-commander",
+      "labels": ["ai", "mcp"],
+      "releases": [
+        {
+          "sublime_text": ">=4000",
+          "platforms": ["*"],
+          "version": "1.4.0",
+          "url": "https://codeload.github.com/dpc00/sublime-commander/zip/v1.4.0",
+          "date": "2026-11-10 03:30:00"
+        }
+      ]
+    }
+  ]
+}

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**`close_file` raised the native "Save Changes?" dialog for a modified tab.** With `discard` left
+at its default, closing a dirty tab made Sublime ask, which blocks the main thread until a person
+answers — measured in the rig 2026-11-10: the call timed out after 5 s and the thread stayed blocked
+13 s until the dialog was cancelled. It now refuses and names both ways out (save first, or
+`discard: true`); the discard path still closes without a prompt, verified in the same host.
+
 **`save_file` and `save_all` raised a native Save As dialog for a tab with no file name.** The
 dialog blocks Sublime's main thread until a person answers it and takes the window away from
 whoever is using the editor — the case the rules say must never be raised in the session-hosting

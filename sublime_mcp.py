@@ -2732,6 +2732,16 @@ def _close_file(body):
                     "open_views": [_view_display_name(x) for x in list(w.views()) + _preview_views(w)]}
         if not v:
             return {"error": "no active view"}
+        if v.is_dirty() and not discard:
+            # Closing a modified tab makes Sublime ask "Save Changes?" in a native dialog, which
+            # blocks the main thread until a person answers and takes the window from whoever is
+            # using the editor (raised in the rig 2026-11-10, blocked 13 s). Refuse and say both
+            # ways out, instead of raising it and timing out.
+            return {"error": "this tab has unsaved changes, so closing it would open the native "
+                             "\"Save Changes?\" dialog and block Sublime until someone answers it. "
+                             "Save it first, or pass discard=true to throw the edits away",
+                    "dirty": True, "path": v.file_name(),
+                    "name": _view_display_name(v)}
         discarded = False
         if discard and v.is_dirty():
             # Mark the tab scratch so Sublime closes it without the "Save Changes?" dialog,

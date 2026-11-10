@@ -2248,6 +2248,12 @@ def _get_view_chars(params):
         end_c = int(end_p) if end_p is not None else size
         begin_c = max(0, begin)
         end_c = min(size, end_c)
+        if end_c < begin_c:
+            # Sublime's Region tolerates a reversed pair and substr returns the text between them,
+            # so begin 5 / end 2 answered "rst" while echoing begin 5 and end 2 -- the caller's
+            # arithmetic on those numbers then disagreed with the text it was given (measured
+            # 2026-11-10). Report the range that was actually returned.
+            begin_c, end_c = end_c, begin_c
         return {
             "name": _view_display_name(v),
             "path": v.file_name(),

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+**`get_view_chars` echoed a range it had not returned.** `begin: 5, end: 2` answered `content: "rst"`
+— Sublime's `Region` tolerates a reversed pair — while still reporting `begin: 5, end: 2`, so the
+numbers disagreed with the text. The range is normalised and reported as returned (measured
+2026-11-10 on a 23-character buffer).
+
 **`close_file` raised the native "Save Changes?" dialog for a modified tab.** With `discard` left
 at its default, closing a dirty tab made Sublime ask, which blocks the main thread until a person
 answers — measured in the rig 2026-11-10: the call timed out after 5 s and the thread stayed blocked

@@ -3701,8 +3701,14 @@ def _revert_file(body):
             v = _active_view()
         if not v:
             return {"error": "no active view"}
+        was_dirty = v.is_dirty()
         v.run_command("revert")
-        return {"ok": True}
+        # Sublime reverts a modified buffer without asking (measured 2026-11-10: no dialog,
+        # and the text that was replaced cannot be recovered from the buffer). Say so, so a
+        # caller is not left believing a prompt appeared.
+        return {"ok": True, "discarded_edits": was_dirty,
+                "note": ("unsaved edits were discarded without asking" if was_dirty
+                         else "the tab had no unsaved edits")}
 
     return _on_main(fn)
 
@@ -5851,7 +5857,10 @@ _MCP_TOOLS = [
     ("revert_file",
      "Revert a file to its last saved state, discarding unsaved changes. Pass name (partial, "
      "case-insensitive; refused if it fits several tabs) or index (0-based, from get_open_files); "
-     "with neither it reverts the active tab, so name the tab you mean. Asks the person first.",
+     "with neither it reverts the active tab, so name the tab you mean. Sublime does not ask "
+     "first: measured on 4215, a modified buffer was reverted with no dialog and no way "
+     "back to the discarded text, so save anything you need before calling it. The reply "
+     "says whether edits were discarded.",
      {"type": "object", "properties": {
          "name": {"type": "string", "default": ""},
          "index": {"type": "integer", "default": -1},

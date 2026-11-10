@@ -212,7 +212,7 @@ get_sheets()                       # every tab: stable id, group/index, selectio
 get_sheet_content(index=2)         # untitled / scratch / terminal tabs too
 open_file(path=..., line=42, col=1)
 save_all()
-revert_file(name="notes.txt")      # asks the person; name or index, else the active view
+revert_file(name="notes.txt")      # discards unsaved edits, no prompt; name or index, else active view
 project_search(pattern=..., where=...)  # starts ST Find-in-Files and returns at once
 project_search_results(pattern=...)     # reads the matches written so far (complete: bool)
 discover_tools()                        # categories; see "Finding tools"

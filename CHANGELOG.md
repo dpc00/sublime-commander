@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**`revert_file` claimed it asks the person first — it does not.** Sublime reverts a modified buffer
+with no dialog at all, so the documented promise was false and an agent could rely on a confirmation
+that never comes. Measured 2026-11-10: a dirty buffer reverted silently and the discarded edit could
+not be recovered from the buffer. The description now says so, the reply carries
+`discarded_edits` and a note, and the same wrong line is gone from both copies of the guide.
+
 **`get_view_chars` echoed a range it had not returned.** `begin: 5, end: 2` answered `content: "rst"`
 — Sublime's `Region` tolerates a reversed pair — while still reporting `begin: 5, end: 2`, so the
 numbers disagreed with the text. The range is normalised and reported as returned (measured

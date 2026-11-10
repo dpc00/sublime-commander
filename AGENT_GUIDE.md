@@ -369,7 +369,7 @@ engine and exposes none of them. It starts the search and returns at once;
 search has finished.
 
 `where` takes the Where box's own syntax, or a list of paths and globs, which is joined with
-commas. Left empty it searches the window's folders, and those folders are passed to the engine by
+commas — an entry containing a comma is quoted so it stays one path. Left empty it searches the window's folders, and those folders are passed to the engine by
 name rather than left for the editor to resolve: a project set in the same `batch` as the search
 otherwise answered `0 matches` with `complete: true`, because the editor had not picked the project
 up yet. A window with no folders gets an error saying to pass `where`, never an empty result.

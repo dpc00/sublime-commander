@@ -637,7 +637,7 @@ def _get_active_file(params):
         limit = size if max_chars <= 0 else min(size, max_chars)
         out = {
             "path": v.file_name(),
-            "name": v.name(),
+            "name": _view_display_name(v),
             "content": v.substr(sublime.Region(0, limit)),
             "size": size,
             "line": row + 1,
@@ -797,7 +797,7 @@ def _get_sheets(params):
                 "id": s.id(),
                 "type": kind,
                 "path": path,
-                "name": v.name() if v else None,
+                "name": _view_display_name(v) if v else None,
                 "is_dirty": v.is_dirty() if v else False,
                 "group": s.group(),
                 "index_in_group": w.get_sheet_index(s)[1],
@@ -927,7 +927,7 @@ def _sheet_summary(w, s, settings=True):
         "id": s.id(),
         "type": type(s).__name__,
         "path": path,
-        "name": v.name() if v else None,
+        "name": _view_display_name(v) if v else None,
         "is_dirty": v.is_dirty() if v else False,
         "group": group,
         "index_in_group": index_in_group,
@@ -1173,7 +1173,7 @@ def _get_sheet_content(params):
             "index": index,
             "type": kind,
             "path": path,
-            "name": v.name(),
+            "name": _view_display_name(v),
             "content": v.substr(sublime.Region(0, v.size())),
         }
 
@@ -1245,7 +1245,7 @@ def _get_view_content(params):
         if not v:
             return {"error": "no view found"}
         return {
-            "name": v.name(),
+            "name": _view_display_name(v),
             "path": v.file_name(),
             "content": v.substr(sublime.Region(0, v.size())),
         }
@@ -1268,10 +1268,10 @@ def _send_to_view(body):
         if not v:
             return {"error": "no view found"}
         if v.is_read_only():
-            return {"error": "view is read-only", "name": v.name()}
+            return {"error": "view is read-only", "name": _view_display_name(v)}
         w.focus_view(v)
         v.run_command("insert", {"characters": text})
-        return {"ok": True, "name": v.name()}
+        return {"ok": True, "name": _view_display_name(v)}
 
     return _on_main(fn)
 
@@ -2204,7 +2204,7 @@ def _get_layout(params):
         views_by_group = {}
         for g in range(w.num_groups()):
             views_by_group[g] = [
-                {"path": v.file_name(), "name": v.name()} for v in w.views_in_group(g)
+                {"path": v.file_name(), "name": _view_display_name(v)} for v in w.views_in_group(g)
             ]
         return {
             "layout": layout,
@@ -2226,7 +2226,7 @@ def _get_view_size(params):
             return err
         if not v:
             return {"error": "no view found"}
-        return {"name": v.name(), "path": v.file_name(), "size": v.size()}
+        return {"name": _view_display_name(v), "path": v.file_name(), "size": v.size()}
 
     return _on_main(fn)
 
@@ -2249,7 +2249,7 @@ def _get_view_chars(params):
         begin_c = max(0, begin)
         end_c = min(size, end_c)
         return {
-            "name": v.name(),
+            "name": _view_display_name(v),
             "path": v.file_name(),
             "size": size,
             "begin": begin_c,
@@ -2279,7 +2279,7 @@ def _get_view_regions(params):
         for k in keys:
             out[k] = [{"begin": r.begin(), "end": r.end(), "text": v.substr(r)[:80]}
                       for r in v.get_regions(k)[:500]]
-        return {"name": v.name(), "path": v.file_name(), "regions": out}
+        return {"name": _view_display_name(v), "path": v.file_name(), "regions": out}
 
     return _on_main(fn)
 
@@ -2356,7 +2356,7 @@ def _get_view_phantoms(params):
         if last and last > 0:
             phantoms = phantoms[-last:]
         return {
-            "name": v.name(),
+            "name": _view_display_name(v),
             "path": v.file_name(),
             "phantoms": phantoms,
             "count": len(phantoms),
@@ -3536,11 +3536,18 @@ def _eval_python(body):
     buf = io.StringIO()
 
     def fn():
+        def _capture_print(*a, **kw):
+            # Only *default* the stream: a caller writing to sys.stderr, or naming any other
+            # stream, used to hit "print() got multiple values for keyword argument 'file'"
+            # because this wrapper forced file=buf (measured 2026-11-10).
+            kw.setdefault("file", buf)
+            return print(*a, **kw)
+
         env = {
             "sublime": sublime,
             "window": sublime.active_window(),
             "view": sublime.active_window().active_view(),
-            "print": lambda *a, **kw: print(*a, **kw, file=buf),
+            "print": _capture_print,
         }
         try:
             exec(code, env)  # noqa: S102
@@ -5056,7 +5063,18 @@ def _project_search(args):
         # Find in Files' Where box is one string of comma-separated paths and globs. A list was
         # passed straight to Sublime, which ignored it, so the search silently ran over the
         # project folders instead of the places named (found 2026-11-06). Join what was meant.
-        where = ", ".join(str(w) for w in where if str(w).strip())
+        # An entry that itself contains a comma is quoted, because the box splits on every comma:
+        # one path became two that do not exist and the search answered "0 matches" with
+        # complete: true (measured 2026-11-10; Sublime honours the quotes, and spaces need none).
+        entries = []
+        for entry in where:
+            text = str(entry).strip()
+            if not text:
+                continue
+            if "," in text and not (text.startswith('"') and text.endswith('"')):
+                text = '"' + text.replace('"', '\\"') + '"'
+            entries.append(text)
+        where = ", ".join(entries)
     elif not isinstance(where, str):
         return {"error": "where must be a string or a list of paths/globs"}
     regex = bool(args.get("regex", False))

@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+**A list `where` with a comma in a path searched nothing.** The list is joined into Find in Files'
+comma-separated Where box, so `["…/mcpfix/comma,dir"]` became two paths that do not exist and the
+search answered `0 matches` with `complete: true`. Entries containing a comma are now quoted — the
+form Sublime honours; spaces need no quoting. Measured 2026-11-10: quoted, the same search returns
+its match.
+
+**`print(..., file=…)` raised inside `eval_python`.** The injected `print` forced `file=buf`, so any
+caller naming a stream got `TypeError: print() got multiple values for keyword argument 'file'` —
+including `file=sys.stdout`, and including code that simply wanted `sys.stderr`. It now defaults the
+stream instead of forcing it, so output written to the capture buffer still comes back as `output`
+and an explicitly named stream goes where it was asked to.
+
+**Twelve tools reported blank tab names.** `View.name()` returns `''` for file-backed views on build
+4215 — measured on `close_a.txt` and on `Preferences.sublime-settings`, and `set_name` on such a view
+does not change it — while `View.sheet().name()` returns the real name. The existing helper
+`_view_display_name` (the view's name, else the basename of its file) was used by `get_open_files`
+and `close_file` but not by the rest: `get_active_file`, `get_sheets`, `focus_sheet`, the view reads,
+`ui_type_text`, `get_layout`, `view_size`, `view_chars`, `view_regions` and phantoms all returned
+`"name": ""`. They all use the helper now.
+
 **A search over a project set moments earlier answered `0 matches`, and said it was complete.**
 `project_search` left an empty `where` for the editor to resolve, so the engine read the window's
 project as it stood before the project was applied: in one `batch`, `set_project_data` followed by

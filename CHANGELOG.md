@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**`save_file` and `save_all` raised a native Save As dialog for a tab with no file name.** The
+dialog blocks Sublime's main thread until a person answers it and takes the window away from
+whoever is using the editor — the case the rules say must never be raised in the session-hosting
+window. Raised in the rig by `save_file` on an untitled buffer (2026-11-10, dismissed as Cancel).
+Both refuse now and name the alternative (`save_file` with a path, or `prompt_save_as`
+deliberately); `save_all` lists the offending `view_ids` instead of opening one dialog per tab.
+
 **`project_search_results` was invisible to a client that shows only the default surface.** Its
 partner `project_search` is advertised by default and its own reply says "read it with
 `project_search_results`", but that tool was in neither `_MCP_DEFAULT_TOOL_NAMES` nor

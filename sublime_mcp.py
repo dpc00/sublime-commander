@@ -2657,6 +2657,15 @@ def _save_file(body):
         if not v:
             return {"error": "no active view"}
         target = v.file_name()
+        if not target:
+            # `save` on a tab with no file name opens the native Save As dialog, which blocks
+            # Sublime's main thread until a person answers it and takes the window away from
+            # whoever is using the editor (raised in the rig 2026-11-10 by save_file with an
+            # untitled buffer). Refuse instead: a caller that wants to choose a path asks for it
+            # with prompt_save_as, deliberately.
+            return {"error": "this tab has no file name, so saving would open a native Save As dialog "
+                             "and block Sublime until someone answers it. Save a named file (path=), "
+                             "or use prompt_save_as to choose one"}
         if target and not os.path.isdir(os.path.dirname(target)):
             # Sublime would answer the save with a "Unable to save" dialog and leave the tab modified,
             # while this call used to say ok. Nothing is created: make the folder first.
@@ -2680,7 +2689,17 @@ def _save_file(body):
 
 def _save_all(body):
     def fn():
-        sublime.active_window().run_command("save_all")
+        w = sublime.active_window()
+        # save_all asks for a path for every unnamed tab it touches (a native Save As per tab),
+        # which blocks the main thread and takes the window from whoever is using the editor.
+        # Refuse with the list instead of raising one dialog per tab.
+        unnamed = [v.id() for v in w.views() if v.is_dirty() and not v.file_name()]
+        if unnamed:
+            return {"error": "{} tab(s) have no file name, so save_all would open a native Save As "
+                             "dialog for each and block Sublime until someone answers it; save those "
+                             "tabs by path, or use prompt_save_as".format(len(unnamed)),
+                    "view_ids": unnamed}
+        w.run_command("save_all")
         return {"ok": True}
 
     return _on_main(fn)

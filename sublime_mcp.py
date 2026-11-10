@@ -77,7 +77,7 @@ from .lib.search_results import parse_find_results, search_is_complete
 # Single source of truth for the version this plugin advertises over MCP.
 # Keep in step with server.json (no automated test enforces this; check by
 # hand on release).
-__version__ = "0.0.0"
+__version__ = "1.4.0"
 
 from .lib.mcp_http_policy import is_oauth_discovery_path, send_no_authorization
 

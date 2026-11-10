@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.4.0 — 2026-11-10
+
 **No tool waits any more.** A handler that sleeps, polls or blocks for a result holds the request
 thread, makes every concurrent call time out behind it and stalls the agent on a guess about how
 long work takes. The waits came out: `open_file` no longer waits up to 3 s for the tab to load,

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**`eval_python_latest` ran arbitrary code with no approval.** The consent gate lists whole tools by
+name, and it listed `eval_python` but not `eval_python_latest` — which writes the code to a file and
+runs the *system* Python, outside Sublime's sandbox. With `require_consent_for_destructive` on,
+`eval_python` and `delete_file` each answered `input_required` while
+`eval_python_latest` answered `complete` and ran the code (measured 2026-11-11 on 4215 through
+`/mcp` with elicitation support). Both eval tools are destructive now: the gate asks, the code goes
+to the review panel, the question names which interpreter runs it, and a `batch` containing either
+asks once for the whole batch. The lists in `AGENT_GUIDE.md`, `docs/AGENT_GUIDE.md`, the skill and
+`MCP Commander.sublime-settings` name it too.
+
 **A JSON body that is not an object dropped the connection with no answer.** A JSON-RPC batch
 (`[{"jsonrpc":"2.0",…}]`), a bare string, a number or `null` raised `AttributeError` on `msg.get`
 before any dispatch, so Streamable HTTP closed the socket and the legacy SSE transport answered

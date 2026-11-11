@@ -94,7 +94,8 @@ Full section: `get_help(section="Find in Files")`. Short version:
 - `pick_quick_panel` on a panel of a Python 3.3 package that raises a dialog in its callback
   (Jekyll's "Confirm Delete") answers `pending: true`: the pick went through and the dialog blocks
   Sublime; answer it with `list_native_windows` and `dismiss_native_window`.
-- `delete_file` / `delete_folder` (and `revert_file`, `close_window`, `exit`, `eval_python`, `close_file` with
+- `delete_file` / `delete_folder` (and `revert_file`, `close_window`, `exit`, `eval_python`,
+  `eval_python_latest`, `close_file` with
   `discard`) ask the person first; "Denied, nothing was changed" means no: do not retry or go around it.
   Once allowed, delete also raises a Windows confirmation dialog for every item.
 - With a completion popup open, a posted Tab does not expand a snippet trigger: press Escape

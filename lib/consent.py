@@ -25,8 +25,14 @@ REQUEST_KEY = "consent"
 DESTRUCTIVE_TOOLS = frozenset({
     "delete_file", "delete_folder", "revert_file", "revert",
     "close_window", "close_workspace", "remove_folder",
-    "exit", "eval_python",
+    "exit", "eval_python", "eval_python_latest",
 })
+
+# Tools that run Python the person must read before approving. eval_python runs code in Sublime's
+# own plugin host; eval_python_latest writes it to a file and runs the system interpreter, outside
+# that sandbox -- so both need the same question, and neither may run unapproved (2026-11-11:
+# eval_python asked and eval_python_latest ran the same kind of code with no prompt at all).
+_EVAL_TOOLS = frozenset({"eval_python", "eval_python_latest"})
 
 # Sublime commands that run_command must not run unasked.
 DESTRUCTIVE_COMMANDS = frozenset({
@@ -55,7 +61,8 @@ def _log_text(items, limit=160):
 
 
 def eval_codes(name, args, _depth=0):
-    """The Python code of every eval_python call a tools/call would run (also inside a batch)."""
+    """The Python code of every eval_python/eval_python_latest call a tools/call would run (also
+    inside a batch)."""
     if not isinstance(args, dict):
         args = {}
     if name == "batch" and _depth == 0:
@@ -64,7 +71,7 @@ def eval_codes(name, args, _depth=0):
             if isinstance(call, dict):
                 codes.extend(eval_codes(call.get("tool"), call.get("args") or {}, 1))
         return codes
-    return [str(args.get("code", "")).strip()] if name == "eval_python" else []
+    return [str(args.get("code", "")).strip()] if name in _EVAL_TOOLS else []
 
 
 def destructive_items(name, args, _depth=0, prompt=False):
@@ -84,17 +91,20 @@ def destructive_items(name, args, _depth=0, prompt=False):
                 if isinstance(call, dict):
                     items.extend(destructive_items(call.get("tool"), call.get("args") or {}, 1, prompt))
         return items
-    if name == "eval_python":
+    if name in _EVAL_TOOLS:
         code = str(args.get("code", "")).strip()
+        where = ("Sublime's plugin host" if name == "eval_python"
+                 else "a separate system Python process, outside Sublime")
         if len(code) > EVAL_REVIEW_LIMIT:
-            items.append("eval_python: " + EVAL_TOO_LONG.format(len(code), EVAL_REVIEW_LIMIT))
+            items.append("{}: {}".format(name, EVAL_TOO_LONG.format(len(code), EVAL_REVIEW_LIMIT)))
         elif prompt:
             first = (code.splitlines() or [""])[0][:60]
-            items.append("eval_python: runs Python code ({} lines). READ ALL OF IT in the panel at the "
-                         "bottom of Sublime before accepting. It starts: {}".format(len(code.splitlines()), first))
+            items.append("{}: runs Python code ({} lines) in {}. READ ALL OF IT in the panel at the "
+                         "bottom of Sublime before accepting. It starts: {}".format(
+                             name, len(code.splitlines()), where, first))
         else:
-            items.append("eval_python: runs this Python code in the editor (one line, \\n is a line break): "
-                         + json.dumps(code, ensure_ascii=False))
+            items.append("{}: runs this Python code in {} (one line, \\n is a line break): ".format(
+                name, where) + json.dumps(code, ensure_ascii=False))
     elif name == "close_file":
         if args.get("discard"):
             items.append("close_file with discard: unsaved edits are thrown away: " + _short(

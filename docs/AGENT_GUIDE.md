@@ -611,8 +611,8 @@ Observed on build 4200 (2026-10-07).
 ## Destructive tools ask the person first
 
 These calls do not run until the person says yes: `delete_file`, `delete_folder`, `revert`,
-`revert_file`, `close_window`, `close_workspace`, `remove_folder`, `exit`, `eval_python`, `close_file`
-with `discard`, and `run_command` of any of those commands. Inside a `batch`, one such call makes the
+`revert_file`, `close_window`, `close_workspace`, `remove_folder`, `exit`, `eval_python`,
+`eval_python_latest`, `close_file` with `discard`, and `run_command` of any of those commands. Inside a `batch`, one such call makes the
 whole batch ask once, before any call of it runs.
 
 - Your client shows an Accept / Decline question (Claude Code: in the terminal) and repeats the call

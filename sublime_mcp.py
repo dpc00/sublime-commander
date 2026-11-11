@@ -4506,6 +4506,7 @@ def _close_duplicate_tabs(body):
     only = body.get("path") or ""
     discard = bool(body.get("discard", False))
     dry_run = bool(body.get("dry_run", False))
+    keep_count = int(body.get("keep", 1))          # keep=0 closes every tab of that path
 
     def snapshot():
         """{path key: [(window, sheet, path)]} for live sheets, in window then tab order."""
@@ -4536,12 +4537,14 @@ def _close_duplicate_tabs(body):
         groups = snapshot()
         closed, kept, kept_dirty, missed = [], [], [], []
         for target, entries in groups.items():
-            if len(entries) < 2:
+            if len(entries) <= max(0, keep_count):
                 continue
-            keep_window, keep_sheet, keep_path = entries[0]
-            kept.append({"path": keep_path, "window_id": keep_window.id(), "sheet_id": keep_sheet.id()})
-            for window, sheet, path in entries[1:]:
-                if sheet.id() == keep_sheet.id():
+            survivors = entries[:max(0, keep_count)]
+            for keep_window, keep_sheet, keep_path in survivors:
+                kept.append({"path": keep_path, "window_id": keep_window.id(), "sheet_id": keep_sheet.id()})
+            keep_window, keep_sheet = (survivors[0][0], survivors[0][1]) if survivors else (None, None)
+            for window, sheet, path in entries[len(survivors):]:
+                if keep_sheet is not None and sheet.id() == keep_sheet.id():
                     continue
                 view = sheet.view()
                 if view is not None and view.is_dirty() and not discard:
@@ -4559,7 +4562,7 @@ def _close_duplicate_tabs(body):
                         window.run_command("close_file")
                     else:
                         window.run_command("close_by_index", {"group": group, "index": position})
-                    if live_sheet(keep_window.id(), keep_sheet.id())[1] is None:
+                    if keep_sheet is not None and live_sheet(keep_window.id(), keep_sheet.id())[1] is None:
                         return {"error": "the kept tab vanished while closing duplicates; stopped",
                                 "kept": kept, "closed": closed}
                 closed.append(record)
@@ -6842,7 +6845,8 @@ _MCP_TOOLS = [
      {"type": "object", "properties": {
          "path": {"type": "string", "description": "Only this file (default: every path with duplicates)."},
          "discard": {"type": "boolean", "description": "Also close tabs with unsaved changes (default false)."},
-         "dry_run": {"type": "boolean", "description": "List what would close, change nothing."}},
+         "dry_run": {"type": "boolean", "description": "List what would close, change nothing."},
+         "keep": {"type": "integer", "description": "How many tabs of each path to keep (default 1; 0 closes them all)."}},
       },
      _p("/close_duplicate_tabs")),
     ("get_ui_state",

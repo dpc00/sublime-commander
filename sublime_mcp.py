@@ -2242,16 +2242,37 @@ def _click_menu_item(body):
     return _on_main(fn)
 
 
-def _window_widget_view(window, skip=None):
-    """The widget view this window owns right now, if any: an overlay's input (the command palette,
-    Goto Anything), or an input panel's. Sublime exposes no overlay state and `active_panel()` stays
-    null for an overlay, so this is the only signal it leaves -- a valid widget view whose window()
-    is this window (measured on 4215, 2026-11-11: the palette adds view 21 with window 2 and removes
-    it on hide, while the idle widget views have no window)."""
-    for view_id in range(1, 260):
-        view = sublime.View(view_id)
+# Widget view ids are global and grow with every overlay ever opened, so a fixed scan range goes
+# blind: with a limit of 260 the command palette stopped being found after ~300 opens, and an open
+# palette was reported as "nothing open" again (measured 2026-11-11 on 4215). Scan until a long run
+# of ids is invalid instead, which also covers the holes destroyed views leave behind.
+_WIDGET_SCAN_CAP = 4096        # 4096 sublime.View() probes cost 1.5 ms on 4215 (measured)
+_widget_scan_cap = _WIDGET_SCAN_CAP
+
+
+def _widget_views(window, skip=None):
+    """Every widget view this window owns right now, in id order.
+
+    Sublime exposes no overlay state and `active_panel()` stays null for an overlay, so a widget
+    view whose window() is this window is the only signal an open overlay (command palette, Goto
+    Anything) or an input panel leaves behind.
+
+    Ids are global and keep growing: each overlay open allocates one and destroying it does not
+    give the id back, so after a few hundred opens the palette's view is past any small limit and
+    every fixed range (or any "stop after N invalid ids" rule) goes blind -- measured 2026-11-11,
+    the palette was reported as "nothing open" after 300 opens. The scan therefore walks the whole
+    range each time, remembers the highest live id it saw, and quadruples the range when live ids
+    come close to its end.
+    """
+    global _widget_scan_cap
+    cap = _widget_scan_cap
+    found = []
+    highest = 0
+    for view_id in range(1, cap):
+        view = sublime.View(view_id)          # note: the object is truthy for every id
         if not view.is_valid():
             continue
+        highest = view_id
         try:
             if not view.settings().get("is_widget"):
                 continue
@@ -2261,8 +2282,16 @@ def _window_widget_view(window, skip=None):
             continue
         owner = view.window()
         if owner is not None and owner.id() == window.id():
-            return view
-    return None
+            found.append(view)
+    if highest >= cap - 64 and cap < 65536:
+        _widget_scan_cap = min(cap * 4, 65536)
+    return found
+
+
+def _window_widget_view(window, skip=None):
+    """The widget view this window owns right now, if any (the overlay's or the input panel's)."""
+    views = _widget_views(window, skip)
+    return views[0] if views else None
 
 
 def _ui_state_on_main():
@@ -3389,19 +3418,10 @@ def _find_input_panel_view(window):
     filters by is_widget + matching window, which is the only way to reach
     the view at all (confirmed empirically; ST exposes no direct accessor).
     """
-    for vid in range(0, 128):
-        v = sublime.View(vid)
-        if not v.is_valid():
-            continue
-        try:
-            if not v.settings().get("is_widget"):
-                continue
-        except Exception:
-            continue
-        vw = v.window()
-        if vw and vw.id() == window.id():
-            return v
-    return None
+    # One adaptive scan for every widget view of this window: a fixed id range went blind once the
+    # ids had grown past it (see _widget_views).
+    views = _widget_views(window)
+    return views[0] if views else None
 
 
 def _drive_input_panel(body):

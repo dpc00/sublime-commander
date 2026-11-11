@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**Overlay detection went blind after a few hundred palette opens.** `get_ui_state` found an open
+command palette by scanning widget view ids, and the scan stopped at a fixed limit (260). Widget view
+ids are global and are not reused: each palette open allocates one, so after ~300 opens the palette's
+view sat past the limit and an open palette was reported as `overlay: {open: false}` again — the exact
+blindness the tool exists to prevent (measured on 4215, 2026-11-11). The same fixed-range bug existed
+in the input-panel finder, whose comment claimed a "separate low-id widget namespace"; the palette's
+own view id had reached 320. Both now walk the whole id range, check `is_valid()` (the `View` object
+is truthy for every id, which is how a naive probe looks fine), and quadruple the range when live ids
+approach its end — 4096 probes cost 1.5 ms. Verified: the palette is reported open after 0, 300 and
+600 open/close cycles, and text typed into it comes back in `overlay.text`.
+
 **`get_ui_state`: one call that says whether anything is in front of the person.** An overlay (the
 command palette, Goto Anything) left no trace in any tool: `active_panel` is null for one, the picker
 recorder does not see it, and a native window listing does not either — measured on 4215, an open

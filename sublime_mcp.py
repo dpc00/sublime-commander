@@ -3280,6 +3280,31 @@ def _save_all(body):
     return _on_main(fn)
 
 
+def _answer_deleted_file_prompt(timeout=2.5):
+    """Answer the "Save Deleted File?" dialog that closing a missing file raises.
+
+    Runs on the request thread while the close waits on a timer, so it can click the dialog that
+    would otherwise block Sublime's main thread until a person answers it (measured 2026-11-11).
+    Returns the dismiss reply, or None when no such dialog appeared."""
+    if not native_windows.SUPPORTED:
+        return None
+    pid = _sublime_process_id()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            windows = native_windows.list_windows([pid])
+        except Exception:
+            windows = []
+        for window in windows:
+            if window.get("kind") != "dialog":
+                continue
+            text = " ".join(window.get("messages") or []) + " " + (window.get("title") or "")
+            if "deleted" in text.lower():
+                return native_windows.dismiss(pid, window["hwnd"], "button", "No")
+        time.sleep(0.1)
+    return None
+
+
 def _close_file(body):
     path = body.get("path")
     name = body.get("name", "") or ""
@@ -3334,12 +3359,23 @@ def _close_file(body):
         # through the command path gives any such hook a chance to run.
         vid = v.id()
         on_disk = v.file_name() or ""
-        if discard and on_disk and not os.path.exists(on_disk):
-            # A tab whose file is not on disk (a retargeted buffer, or a package path that does
-            # not exist) still raised "Save Changes?" from close_file after set_scratch, blocking
-            # the main thread in the rig on 2026-11-11. There is no file to save, so close the
-            # view itself: that cannot raise a dialog and no host hook owns a file that is absent.
-            v.close()
+        if discard and (not on_disk or not os.path.exists(on_disk)):
+            # A tab whose file is gone still raises "Save Deleted File?" on close, even after
+            # set_scratch (measured 2026-11-11: a clean buffer whose file had been deleted, and
+            # before that a dirty retargeted buffer, each blocked the main thread). Close it on a
+            # timer so this call stays free to answer that dialog itself, with No.
+            def close_missing():
+                try:
+                    v.set_scratch(True)
+                    v.close()
+                except Exception:
+                    pass
+
+            sublime.set_timeout(close_missing, 0)
+            answered = _answer_deleted_file_prompt()
+            return {"ok": True, "discarded": True, "answered": answered,
+                    "note": "the file is gone from disk, so Sublime asks \"Save Deleted File?\" on "
+                            "close; the tool answered it and closed the tab"}
         elif v is w.active_view():
             w.run_command("close_file")
         else:
@@ -3364,8 +3400,10 @@ def _close_file(body):
     # The close command only ASKS Sublime to close the tab. It stays open when Sublime shows a
     # "Save Changes?" dialog or a host hook refuses; this tool does not wait to see which. The
     # dialog appears in native_dialogs, and get_sheets answers whether the tab is still there.
-    result["note"] = ("close requested; check get_sheets (the tab is gone) and native_dialogs "
-                      "(a Save Changes? prompt) before assuming it closed")
+    # A branch that already said what it did keeps its note.
+    if "note" not in result:
+        result["note"] = ("close requested; check get_sheets (the tab is gone) and native_dialogs "
+                          "(a Save Changes? prompt) before assuming it closed")
     return result
 
 

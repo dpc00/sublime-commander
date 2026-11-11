@@ -4728,6 +4728,13 @@ def _edit_file(body):
             w = sublime.active_window()
             if os.path.exists(path):
                 return {"error": "file already exists: {}".format(path)}
+            parent = os.path.dirname(path)
+            if parent and not os.path.isdir(parent):
+                # The save cannot succeed in a folder that does not exist, and the generic
+                # "could not write the file" gave no clue what to fix (measured 2026-11-11:
+                # Data/todo-scan/probe.py answered that way while the real problem was the folder).
+                return {"error": "the folder does not exist: {} (nothing was written; create it "
+                                 "first)".format(parent), "missing_folder": parent}
             v = w.new_file()
             v.retarget(path)
             syn = sublime.find_syntax_for_file(path)

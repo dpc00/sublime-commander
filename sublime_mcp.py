@@ -3132,6 +3132,41 @@ def _notify_agent_tab(body):
         return {"error": "no native editor window found (Windows only)"}
     time.sleep(max(0.15, settle_ms / 1000.0))
 
+    # A terminal tab (GhostShell's `ai_terminal_view`, Terminus's `terminus_view`) forwards `insert`
+    # straight to the PTY and repaints the buffer from the program's output, so simulated keystrokes
+    # are not the way in and the buffer never holds the line that was typed: GhostShell's
+    # on_text_command turns an insert into term.send_string and a lone "\n" into "\r" (ai_terminal.py,
+    # "Enter in ST is an insert of \n; TUIs expect CR") and replaces the command with a noop. Reading
+    # the buffer back for the text therefore cannot succeed on such a tab - measured 2026-11-11, two
+    # notify_agent_tab calls both held for exactly that reason. Send through the terminal's own
+    # handler instead, and do not pretend to have read the text back.
+    if _on_main(lambda: bool(target.settings().get("ai_terminal_view")
+                             or target.settings().get("terminus_view"))):
+        def deliver_to_terminal():
+            target.run_command("insert", {"characters": text})
+            if submit:
+                target.run_command("insert", {"characters": "\n"})
+            return True
+
+        _on_main(deliver_to_terminal)
+        time.sleep(max(0.25, settle_ms / 1000.0))
+        result = {"ok": True, "name": target_name, "view_id": target_id, "hwnd": hwnd,
+                  "characters": len(text), "submitted": bool(submit), "delivered": "terminal-insert",
+                  "note": "the tab is a terminal, so the line and the Return went through its own "
+                          "insert handler to the PTY; its buffer holds the program's painting, not "
+                          "the typed text, so nothing is read back"}
+        if restore and previous_id is not None and previous_id != target_id:
+            def put_back_terminal():
+                w2 = sublime.active_window()
+                for view in list(w2.views()) + _preview_views(w2):
+                    if view.id() == previous_id:
+                        w2.focus_view(view)
+                        return True
+                return False
+
+            result["focus_restored"] = bool(_on_main(put_back_terminal))
+        return result
+
     pid = _sublime_process_id()
     typed = ui_input.type_text(pid, hwnd, text, settle_ms=settle_ms)
     if "error" in typed:

@@ -4307,6 +4307,36 @@ def _duplicate_line(body):
 # (after stripping a few meta keys). Use these for simple command wrappers so
 # the tool schema in _MCP_TOOLS stays the source of truth for documentation.
 
+def _close_window(body):
+    """Close the active window, replying before the last window's close runs.
+
+    Closing the last window quits Sublime Text, and `window.run_command("close_window")` does not
+    return while the plugin host shuts down: measured 2026-11-11 on 4215, a 5 s main-thread
+    timeout with the stack inside window_run_command and no dialog anywhere. Reply first and close
+    afterwards, the way `_exit_app` handles `exit`.
+    """
+    def fn():
+        w = sublime.active_window()
+        if not w:
+            return {"error": "no active window"}
+        if len(sublime.windows()) > 1:
+            w.run_command("close_window")
+            return {"ok": True}
+        return None
+
+    result = _on_main(fn)
+    if result is not None:
+        return result
+
+    def close():
+        w = sublime.active_window()
+        if w is not None:
+            w.run_command("close_window")
+
+    sublime.set_timeout(close, 300)
+    return {"ok": True, "note": "last window: Sublime is closing; this connection will drop"}
+
+
 def _vc(cmd):
     def handler(body):
         args = {k: v for k, v in body.items() if v is not None}
@@ -5036,7 +5066,7 @@ _POST = {
     "/close_to_right_by_index": _wc("close_to_right_by_index"),
     "/close_unmodified_to_right_by_index": _wc("close_unmodified_to_right_by_index"),
     "/close_unselected": _wc("close_unselected"),
-    "/close_window": _wc("close_window"),
+    "/close_window": _close_window,
     "/close_workspace": _wc("close_workspace"),
     "/commit_completion": _vc("commit_completion"),
     "/console_python_version": _wc("console_python_version"),
@@ -7910,7 +7940,7 @@ _MCP_TOOLS = [
      {"type": "object", "properties": {"group": {"type": "integer", "description": "The index of the target group."}, "index": {"type": "integer", "description": "The index within the target group."}}},
      _p("/close_unselected")),
     ("close_window",
-     "Closes the active window. (WindowCommand) Observed on Sublime Text 4215: quits Sublime Text (which also stops this MCP server).",
+     "Closes the active window. (WindowCommand) Observed on Sublime Text 4215: quits Sublime Text (which also stops this MCP server). The last window's name has the reply sent before the close runs, because the command does not return while Sublime shuts down.",
      {"type": "object", "properties": {}},
      _p("/close_window")),
     ("close_workspace",

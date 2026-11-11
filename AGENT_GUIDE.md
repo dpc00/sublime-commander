@@ -272,6 +272,10 @@ tab a short message (text, then Return in the same batch), which it answered. Ea
   same turn. If the first `get_sheets` in the batch does not show the target focused, the text went to your own tab. (Not
   `eval_python`: it asks the person on every call.)
 - **`ok` is not proof.** Read the target tab back and quote the line before saying it was sent.
+- **`notify_agent_tab` does the whole sequence in one call** — focus the tab, type, then Return — and it
+  refuses the Return when the tab's last lines show an approval prompt: **Return at omp's (or Claude
+  Code's) approval prompt ANSWERS it**, so a stray keypress there approves the action. It reports
+  `held` and what it saw instead, and puts the tab that was in front back (`restore_focus`).
 - **A line typed without a Return is not shown** in `get_sheet_content` right away (76 characters typed, text unchanged): one more
   reason to always send the Return.
 - **Claude Code and other agent tabs** read a burst of text as a paste and take an Enter in the same read as part of it (text of 60

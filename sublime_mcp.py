@@ -2849,6 +2849,145 @@ def _run_command(body):
     return result
 
 
+# Words that only appear in a terminal tab when the CLI is asking the person to approve an action.
+# Return pressed at such a prompt ANSWERS it (omp's approval prompt takes Enter), so a notice must
+# never submit while one is on screen: that would turn "type a notice" into "approve".
+_APPROVAL_MARKERS = ("approve", "allow", "deny", "permission", "[y/n]", "yes/no", "allow once",
+                     "always allow", "don't ask again")
+
+
+def _agent_tab_tail(limit=4000):
+    """The end of the active tab's text, where a terminal CLI keeps its prompt."""
+    v = _active_view()
+    if not v:
+        return ""
+    size = v.size()
+    return v.substr(sublime.Region(max(0, size - limit), size))
+
+
+def _agent_tab_prompt_state(tail, typed):
+    """(may_submit, reason) for a terminal tab whose text ends with `tail`.
+
+    An approval prompt drawn in the last few lines is the danger: Return answers it. And the typed
+    line must be on the tab's LAST non-empty line, which is where a CLI draws the composer — if it
+    is anywhere else the keystrokes did not reach the prompt (a menu, a different pane, a buffer
+    that is not a terminal at all), so Return would land somewhere unintended.
+    """
+    lines = [line for line in (tail or "").splitlines() if line.strip()]
+    if not lines:
+        return False, "the tab is empty; nothing to submit to"
+    if any(marker in " ".join(lines[-3:]).lower() for marker in _APPROVAL_MARKERS):
+        return False, ("an approval prompt is on screen; Return would answer it, so nothing was "
+                       "submitted")
+    if typed and typed.strip()[:40].lower() not in lines[-1].lower():
+        return False, ("the typed text is not on the tab's last line, so Return was not pressed: "
+                       "the keystrokes did not reach the prompt")
+    return True, ""
+
+
+def _editor_hwnd_for(window):
+    """The native window handle of this process's editor window (the one holding `window`)."""
+    if not native_windows.SUPPORTED:
+        return None
+    try:
+        wins = [w for w in native_windows.list_windows(_native_window_pids())
+                if w.get("kind") == "editor_window"]
+    except Exception:
+        return None
+    if not wins:
+        return None
+    if len(wins) == 1:
+        return wins[0]["hwnd"]
+    try:
+        active = window.active_view()
+        name = _view_display_name(active).lower() if active else ""
+    except Exception:
+        name = ""
+    for w in wins:
+        if name and name in (w.get("title") or "").lower():
+            return w["hwnd"]
+    return wins[0]["hwnd"]
+
+
+def _notify_agent_tab(body):
+    """Type a line into a terminal tab that hosts an agent (omp, Claude Code, a shell prompt).
+
+    An agent CLI owns the keyboard in its tab and offers no other channel, so a typed line is the
+    one way to hand it a message it did not ask for: keystrokes go to the window with that tab in
+    front, and the line arrives at the agent's prompt as a user message. Nothing in the agent has
+    to change for it.
+
+    Pressing Return at an approval prompt answers it, so the submit step reads the tab back first:
+    the text must be on the prompt line, and no approval prompt may be in the last few lines.
+    When either check fails the call types nothing further, submits nothing, and says why.
+    """
+    from .lib import ui_input
+
+    text = body.get("text")
+    if not text:
+        return {"error": "text required: the line to type into the agent's tab"}
+    text = str(text)
+    if len(text) > 2000:
+        return {"error": "text is limited to 2000 characters per call"}
+    name = body.get("name", "") or ""
+    index = int(body.get("index", -1))
+    submit = body.get("submit", True) is not False
+    restore = body.get("restore_focus", True) is not False
+    settle_ms = max(0, min(int(body.get("settle_ms", 250) or 0), 5000))
+
+    def pick():
+        w = sublime.active_window()
+        if name or index >= 0:
+            view, error = _resolve_view(w, name, index)
+            return w, view, error
+        return w, w.active_view(), None
+
+    resolved = _on_main(pick)
+    w, target, err = resolved
+    if err:
+        return err
+    if not target:
+        return {"error": "no active view"}
+    if _on_main(lambda: target.is_read_only()):
+        return {"error": "the tab is read-only", "name": _on_main(lambda: _view_display_name(target))}
+    target_id = _on_main(lambda: target.id())
+    target_name = _on_main(lambda: _view_display_name(target))
+    previous_id = _on_main(lambda: (lambda prev: (w.focus_view(target), prev.id() if prev else None)[1])(w.active_view()))
+    hwnd = _on_main(lambda: _editor_hwnd_for(w))
+    if not hwnd:
+        return {"error": "no native editor window found (Windows only)"}
+    time.sleep(max(0.15, settle_ms / 1000.0))
+
+    pid = _sublime_process_id()
+    typed = ui_input.type_text(pid, hwnd, text, settle_ms=settle_ms)
+    if "error" in typed:
+        return typed
+    result = {"ok": True, "name": target_name, "view_id": target_id, "hwnd": hwnd,
+              "characters": len(text), "submitted": False}
+    if submit:
+        tail = _on_main(_agent_tab_tail)
+        may_submit, reason = _agent_tab_prompt_state(tail, text)
+        if not may_submit:
+            result["held"] = reason
+        else:
+            key = ui_input.press_key(pid, hwnd, "Return", None, "post", settle_ms)
+            if "error" in key:
+                result["submit_error"] = key["error"]
+            else:
+                result["submitted"] = True
+    if restore and previous_id is not None and previous_id != target_id:
+        def put_back():
+            w2 = sublime.active_window()
+            for view in list(w2.views()) + _preview_views(w2):
+                if view.id() == previous_id:
+                    w2.focus_view(view)
+                    return True
+            return False
+
+        result["focus_restored"] = bool(_on_main(put_back))
+    return result
+
+
 def _run_build(body):
     def fn():
         sublime.active_window().run_command("exec", body or {})
@@ -4413,6 +4552,7 @@ _POST = {
     "/replace_selection": _replace_selection,
     "/replace_lines": _replace_lines,
     "/run_command": _run_command,
+    "/notify_agent_tab": _notify_agent_tab,
     "/run_build": _run_build,
     "/set_status": _set_status,
     "/claim_resource": _claim_resource,
@@ -6412,6 +6552,23 @@ _MCP_TOOLS = [
          "index": {"type": "integer", "default": -1},
      }, "required": ["begin", "end", "text"]},
      _p("/replace_lines")),
+    ("notify_agent_tab",
+     "Type one line into a terminal tab that hosts an agent CLI (omp, Claude Code, a shell), so an\n"
+     "agent that has no other channel receives it at its prompt as a user message. Keystrokes go to\n"
+     "the editor window with that tab in front; text (at most 2000 characters), submit (default true,\n"
+     "presses Return), name/index (which tab, default the active one), restore_focus (default true).\n"
+     "Return at an approval prompt ANSWERS it, so the submit step reads the tab back first: the text\n"
+     "must be on the prompt line and no approval prompt may be in the last lines, otherwise it submits\n"
+     "nothing and returns why in `held`.",
+     {"type": "object", "properties": {
+         "text": {"type": "string", "description": "The line to type into the agent's tab."},
+         "submit": {"type": "boolean", "description": "Press Return afterwards (default true). Refused while an approval prompt is on screen."},
+         "name": {"type": "string", "description": "Part of the tab's name (default: the active tab)."},
+         "index": {"type": "integer", "description": "View index from get_open_files (default -1)."},
+         "restore_focus": {"type": "boolean", "description": "Put the tab that was in front back afterwards (default true)."},
+         "settle_ms": {"type": "integer", "description": "Milliseconds to wait after typing and after Return (default 250)."}},
+      "required": ["text"]},
+     _p("/notify_agent_tab")),
     ("run_command",
      "Run any Sublime Text command. scope='window' (default) or 'view'.\n"
      "For scope='view'/'text', optionally target a specific tab with name "

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+**`notify_agent_tab`: hand a terminal-hosted agent a line it did not ask for, without approving
+anything.** An agent CLI in a GhostShell tab owns the keyboard and offers no other channel, so the
+only way to tell it something is to type at its prompt. The new tool does the whole sequence in one
+call — focus the tab (by name or index), type the text, press Return — and then puts back the tab that
+was in front.
+
+The Return is the dangerous half. **A Return pressed at omp's (or Claude Code's) approval prompt
+answers it**, so a notice typed at the wrong moment approves the action. The tool therefore reads the
+tab back before submitting: the text must be on the tab's last non-empty line (where a CLI draws its
+composer) and no approval prompt may be in the last three lines. When either check fails it presses
+nothing, answers `submitted: false` with the reason in `held`, and the typed text stays visible in the
+tab. Measured on 4215 in the rig: text on the prompt line → typed and submitted, `focus_restored:
+true`; text landing on an earlier line → held, no Return; a line ending `Allow this action? [y/N]` →
+held, no Return.
+
+Nothing here needs a change in the agent: the line arrives as a user message at its prompt.
+
 **A native dialog is now detected and announced the moment it opens; a blocked call gives up in about
 a quarter of a second instead of five.** Nothing watched for dialogs: a call that hit one waited the
 full 5 s before saying "main-thread timeout after 5s", `list_native_windows` called the thread blocked

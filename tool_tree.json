@@ -615,6 +615,7 @@
      "hide_panel",
      "hide_popup",
      "html_print",
+     "notify_agent_tab",
      "open_control_panel",
      "pick_quick_panel",
      "prompt_open",

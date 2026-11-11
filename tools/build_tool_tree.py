@@ -87,7 +87,7 @@ def put(path, names):
 put("files/open_and_create", "open_file new_file new_file_at new_folder open_recent_file open_recent_folder "
     "open_recent_project_or_workspace reopen reopen_last_file clone_file switch_file open_dir "
     "open_folder open_containing_folder view_resource open_file_settings send_to_view")
-put("files/save_and_close", "save_all revert_file revert revert_hunk revert_modification save close_file "
+put("files/save_and_close", "close_duplicate_tabs save_all revert_file revert revert_hunk revert_modification save close_file "
     "close_all close_unmodified close_pane close_transient close_deleted_files "
     "close_by_index close_others_by_index close_selected close_unselected close_to_right_by_index "
     "close_unmodified_to_right_by_index close")

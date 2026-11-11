@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+**`close_duplicate_tabs`: duplicates survive a reload, so they need removing.** Sublime's session
+keeps every tab it had, so several tabs of one file stay there across a plugin reload *and* a restart
+(confirmed 2026-11-11: duplicates spread over three windows, all still present after a restart) --
+closing them is the only way, and nothing in the toolset did it. The new tool keeps one tab per path,
+closes the rest (a tab with unsaved changes is left alone unless `discard` is true, and is listed in
+`kept_dirty`), works across every window, takes an optional `path`, and `dry_run` lists what would
+close without changing anything. Measured in the portable: three tabs of one file spread over three
+windows -> dry run listed two closers and changed nothing, then the run left exactly one tab.
+
 **`open_file` made another copy of a file that was already open, and every path-based tool only
 looked in the window in front.** Four calls to `open_file` on one path produced four tabs of the same
 file (measured 2026-11-11, while a file was open in its own window and the person's window was in

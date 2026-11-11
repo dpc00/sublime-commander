@@ -4490,6 +4490,61 @@ def _find_open_view(path):
     return None, None
 
 
+def _close_duplicate_tabs(body):
+    """Close the extra tabs that show the same file, keeping one per path.
+
+    Sublime's session keeps every tab it had, so duplicates survive a plugin reload and a restart --
+    nothing else in this toolset removes them (measured 2026-11-11: four tabs of one file, moved
+    between windows, still there after a restart). The one that is kept is the first found, in window
+    order and then tab order. A tab with unsaved changes is left alone unless discard is true, and
+    is listed in "kept_dirty" so the caller knows why.
+
+    Params: path (optional -- only this file), discard (default false), dry_run (default false).
+    """
+    only = body.get("path") or ""
+    discard = bool(body.get("discard", False))
+    dry_run = bool(body.get("dry_run", False))
+
+    def fn():
+        groups = {}
+        for window in sublime.windows():
+            for index, sheet in enumerate(_all_sheets(window)):
+                try:
+                    path = sheet.file_name()
+                except Exception:
+                    path = None
+                if not path:
+                    continue
+                if only and _normalised_path(path) != _normalised_path(only):
+                    continue
+                groups.setdefault(_normalised_path(path), []).append((window, sheet, path))
+        closed, kept, kept_dirty = [], [], []
+        for target, entries in groups.items():
+            if len(entries) < 2:
+                continue
+            window0, sheet0, path0 = entries[0]
+            kept.append({"path": path0, "window_id": window0.id(), "sheet_id": sheet0.id()})
+            for window, sheet, path in entries[1:]:
+                view = sheet.view()
+                if view is not None and view.is_dirty() and not discard:
+                    kept_dirty.append({"path": path, "window_id": window.id(),
+                                       "sheet_id": sheet.id(), "reason": "unsaved changes"})
+                    continue
+                record = {"path": path, "window_id": window.id(), "sheet_id": sheet.id()}
+                if not dry_run:
+                    group, position = window.get_sheet_index(sheet)
+                    if position < 0:
+                        view and window.focus_view(view)
+                    window.run_command("close_by_index" if position >= 0 else "close_file",
+                                       {} if position < 0 else {"group": group, "index": position})
+                closed.append(record)
+        return {"ok": True, "kept": kept, "closed": closed, "kept_dirty": kept_dirty,
+                "duplicate_groups": sum(1 for e in groups.values() if len(e) > 1),
+                "dry_run": dry_run}
+
+    return _on_main(fn)
+
+
 def _ensure_view(path):
     """Open *path* in ST if not already open and return its view, without waiting for the load.
 
@@ -4753,6 +4808,7 @@ _POST = {
     "/run_command": _run_command,
     "/notify_agent_tab": _notify_agent_tab,
     "/ui_state": _get_ui_state,
+    "/close_duplicate_tabs": _close_duplicate_tabs,
     "/run_build": _run_build,
     "/set_status": _set_status,
     "/claim_resource": _claim_resource,
@@ -6752,6 +6808,17 @@ _MCP_TOOLS = [
          "index": {"type": "integer", "default": -1},
      }, "required": ["begin", "end", "text"]},
      _p("/replace_lines")),
+    ("close_duplicate_tabs",
+     "Close the extra tabs that show the same file, keeping one per path. Sublime's session keeps every\n"
+     "tab it had, so duplicates survive a plugin reload and a restart; this is the way to remove them.\n"
+     "path (optional) limits it to one file; a tab with unsaved changes is left alone unless discard is\n"
+     "true and is listed in kept_dirty; dry_run lists what would close.",
+     {"type": "object", "properties": {
+         "path": {"type": "string", "description": "Only this file (default: every path with duplicates)."},
+         "discard": {"type": "boolean", "description": "Also close tabs with unsaved changes (default false)."},
+         "dry_run": {"type": "boolean", "description": "List what would close, change nothing."}},
+      },
+     _p("/close_duplicate_tabs")),
     ("get_ui_state",
      "Report everything that can be in front of the person right now: native dialogs and menus (read\n"
      "without the main thread, so they are reported even while one of them blocks the editor), the\n"

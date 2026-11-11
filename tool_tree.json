@@ -227,6 +227,7 @@
      "close_all",
      "close_by_index",
      "close_deleted_files",
+     "close_duplicate_tabs",
      "close_file",
      "close_others_by_index",
      "close_pane",

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+**`list_native_windows` showed a file dialog's File name box as empty while it held the path.**
+`GetWindowText` answers an empty string for the Edit that sits inside a ComboBoxEx32, which is
+exactly the "File name:" control: `ui_set_text` put a path in it, the dialog opened that file, and
+the listing still reported `text: ""` (measured 2026-11-11 in the rig). The text of a control whose
+`GetWindowText` is empty is now read with `WM_GETTEXT` under a 250 ms deadline, so a caller can see
+what a dialog holds — and a hung control still cannot stall the listing.
+
+**`ui_screenshot` cut a region to fit and said nothing, and read a `scale` of 0 as "full size".**
+A 100x20 region at x=800 of an 816-wide picture answered a 16x20 image with no word about the crop,
+and `scale: 0` answered the full-size picture while a negative scale was refused (measured
+2026-11-11). The reply now carries `region` (the crop actually taken) and `region_clamped: true`
+when the request had to be cut; `scale` and `max_width` of 0 or less are refused like negative ones.
+
+**A file dialog wants a Windows path in its File name box.** `ui_set_text` on the Edit of a common
+Open dialog with `C:/dir/file.txt` made the dialog answer "The file name is not valid" and stay open,
+where `C:\dir\file.txt` opened the file (measured 2026-11-11). The tool description says so now.
+
 **`eval_python_latest` ran arbitrary code with no approval.** The consent gate lists whole tools by
 name, and it listed `eval_python` but not `eval_python_latest` — which writes the code to a file and
 runs the *system* Python, outside Sublime's sandbox. With `require_consent_for_destructive` on,

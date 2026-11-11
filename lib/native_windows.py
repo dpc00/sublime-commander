@@ -16,6 +16,9 @@ import time
 
 WM_CLOSE = 0x0010
 BM_CLICK = 0x00F5
+WM_GETTEXT = 0x000D
+WM_GETTEXTLENGTH = 0x000E
+SMTO_ABORTIFHUNG = 0x0002
 IDOK = 1
 IDCANCEL = 2
 BS_TYPEMASK = 0x0F
@@ -45,6 +48,12 @@ if SUPPORTED:
     _user32.GetDlgCtrlID.argtypes = [wintypes.HWND]
     _user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
     _user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    # Used to read a control's own text buffer (see _text) with a deadline, so a hung control
+    # cannot stall the listing. The same signature ui_input uses for its responsiveness probe.
+    _user32.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+    _user32.SendMessageTimeoutW.restype = ctypes.c_size_t
     _ENUM_PROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
 
@@ -142,7 +151,25 @@ if SUPPORTED:
         n = _user32.GetWindowTextLengthW(hwnd)
         buf = ctypes.create_unicode_buffer(n + 2)
         _user32.GetWindowTextW(hwnd, buf, n + 2)
-        return buf.value
+        if buf.value:
+            return buf.value
+        # A combo box's edit holds its text where GetWindowText does not look: on a common file
+        # dialog's "File name:" row, GetWindowText answered "" for an Edit whose value the dialog
+        # then opened (measured 2026-11-11: ui_set_text put a path in, the dialog opened the file,
+        # and list_native_windows still showed an empty box). WM_GETTEXT reads the control's own
+        # buffer; the deadline keeps a busy control from stalling this listing.
+        size = ctypes.c_size_t(0)
+        if not _user32.SendMessageTimeoutW(hwnd, WM_GETTEXTLENGTH, 0, 0, SMTO_ABORTIFHUNG, 250,
+                                          ctypes.byref(size)):
+            return buf.value
+        if not size.value:
+            return buf.value
+        text = ctypes.create_unicode_buffer(int(size.value) + 2)
+        got = ctypes.c_size_t(0)
+        _user32.SendMessageTimeoutW(hwnd, WM_GETTEXT, len(text),
+                                   ctypes.cast(text, ctypes.c_void_p).value or 0,
+                                   SMTO_ABORTIFHUNG, 250, ctypes.byref(got))
+        return text.value
 
     def _class(hwnd):
         buf = ctypes.create_unicode_buffer(256)

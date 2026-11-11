@@ -143,13 +143,22 @@ def _scaled(rgb, w, h, scale, max_width):
     """Nearest-neighbour resize of packed RGB. ``scale`` multiplies the size (zoom in to read small
     text); ``max_width`` only ever shrinks. The longest side is capped at 4096 pixels."""
     try:
-        s = float(scale) if scale else 1.0
-        if max_width:
-            s = min(s, float(max_width) / w)
+        s = float(scale) if scale is not None and scale != "" else 1.0
     except (TypeError, ValueError):
         return {"error": "scale and max_width must be numbers"}
     if s <= 0:
+        # scale 0 used to be read as "no scale" (0 is falsy) and answered a full-size picture
+        # while a negative scale was refused (measured 2026-11-11); both are refused now.
         return {"error": "scale and max_width must be positive"}
+    if max_width is not None and max_width != "":
+        # max_width 0 was ignored the same way, and a 0-wide picture is not a thing either.
+        try:
+            max_w = float(max_width)
+        except (TypeError, ValueError):
+            return {"error": "scale and max_width must be numbers"}
+        if max_w <= 0:
+            return {"error": "scale and max_width must be positive"}
+        s = min(s, max_w / w)
     s = min(s, 4096.0 / max(w, h))
     nw, nh = max(1, int(round(w * s))), max(1, int(round(h * s)))
     if nw == w and nh == h:
@@ -304,8 +313,11 @@ def screenshot(pid, hwnd, settle_ms=200, region=None, scale=None, max_width=None
     rgb[1::3] = bgra[1::4]
     rgb[2::3] = bgra[0::4]
     out_w, out_h = width, height
+    region_used = None
+    clamped = False
     if region:
         try:
+            asked = {k: int(region[k]) for k in ("x", "y", "width", "height") if k in region}
             rx, ry = max(0, int(region.get("x", 0))), max(0, int(region.get("y", 0)))
             rw = min(width - rx, int(region.get("width", width)))
             rh = min(height - ry, int(region.get("height", height)))
@@ -313,12 +325,22 @@ def screenshot(pid, hwnd, settle_ms=200, region=None, scale=None, max_width=None
             return {"error": "region must be {x, y, width, height} in integer pixels"}
         if rw <= 0 or rh <= 0:
             return {"error": "region is outside the {}x{} window picture".format(width, height)}
+        region_used = {"x": rx, "y": ry, "width": rw, "height": rh}
+        # A region that ran past the picture was quietly trimmed to what fitted: the reply carried
+        # only the cropped size, so a caller asking for 100x20 at x=800 of an 816-wide window got
+        # 16x20 with nothing saying why (measured 2026-11-11). Say what was cropped and whether the
+        # request had to be cut.
+        clamped = any(region_used[k] != asked[k] for k in asked)
         rows = [bytes(rgb[((ry + r) * width + rx) * 3:((ry + r) * width + rx + rw) * 3]) for r in range(rh)]
         rgb, out_w, out_h = b"".join(rows), rw, rh
     done = _scaled(bytes(rgb), out_w, out_h, scale, max_width)
     if "error" in done:
         return done
     result = {"png": _png(done["w"], done["h"], done["rgb"]), "width": done["w"], "height": done["h"]}
+    if region_used:
+        result["region"] = region_used
+        if clamped:
+            result["region_clamped"] = True
     if fallback:
         result["fallback"] = fallback
         result["note"] = note

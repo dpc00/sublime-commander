@@ -5661,6 +5661,10 @@ def _ui_screenshot(body):
     if "png" not in res:
         return res
     info = {"hwnd": int(hwnd), "width": res["width"], "height": res["height"]}
+    if "region" in res:
+        info["region"] = res["region"]
+        if res.get("region_clamped"):
+            info["region_clamped"] = True
     if matched:
         info["window_title"] = matched
     if popups:
@@ -6644,7 +6648,9 @@ _MCP_TOOLS = [
      "Replace the text of one native control of this Sublime Text process (Windows only): pass the hwnd of a "
      "control from the controls list in list_native_windows, for example the Edit nested in the ComboBoxEx32 on "
      "the File name row of a common Open/Save dialog, then answer the dialog with dismiss_native_window. Sets the "
-     "value with WM_SETTEXT (no focus needed) and returns the text read back. Use ui_type_text instead when the "
+     "value with WM_SETTEXT (no focus needed) and returns the text read back. A file dialog's File name box wants a "
+     "Windows path: given one with forward slashes the dialog answers \"The file name is not valid\" and stays open "
+     "(measured 2026-11-11), so send C:\\dir\\file.txt. Use ui_type_text instead when the "
      "target needs real keystrokes. At most 2000 characters.",
      {"type": "object", "properties": {
          "hwnd": {"type": "integer", "description": "Control handle from the controls list in list_native_windows."},

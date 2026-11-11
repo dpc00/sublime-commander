@@ -51,7 +51,7 @@ reported — never clicked by a watcher — unless the person asks for it.
 
 ## PRs and forks
 
-No PR and no fork unless the maintainer's gate passes: a maintainer commit within 90 days and at
+No PR and no fork unless the maintainer's gate passes: a maintainer commit within 12 months and at
 least one PR ever merged. Otherwise the finding is an issue comment only, starting
 `omp - deepseek v4 flash reports:`. When the gate passes: fork under `dpc00`, branch `fix/<topic>`,
 clone in `~/tools/forks` (not a scratch dir — that is where fork clones live and stay), verify the

@@ -3333,7 +3333,14 @@ def _close_file(body):
         # silently closing an unrelated tab instead (2026-09-15) -- going
         # through the command path gives any such hook a chance to run.
         vid = v.id()
-        if v is w.active_view():
+        on_disk = v.file_name() or ""
+        if discard and on_disk and not os.path.exists(on_disk):
+            # A tab whose file is not on disk (a retargeted buffer, or a package path that does
+            # not exist) still raised "Save Changes?" from close_file after set_scratch, blocking
+            # the main thread in the rig on 2026-11-11. There is no file to save, so close the
+            # view itself: that cannot raise a dialog and no host hook owns a file that is absent.
+            v.close()
+        elif v is w.active_view():
             w.run_command("close_file")
         else:
             group, pos = w.get_view_index(v)

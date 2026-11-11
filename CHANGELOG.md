@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+**`get_view_chars` answered with a range that does not exist on a negative request.** `begin: -9,
+end: -2` on a 19-character buffer clamped only the begin, so the normalising swap answered
+`begin: -2` — a position before the start of the buffer — for content that was really an empty range
+at 0. Both ends are clamped to `0..size` before they are compared, so `begin` and `end` are always
+real offsets of the `content` in the same reply (measured 2026-11-11 in the rig: before, `begin: -2`,
+`end: 0`; after, `begin: 0`, `end: 0`, `content: ""`).
+
+**`drive_input_panel` reported `submitted_text: null` for text it had just submitted.** `text` is
+optional — omit it and the tool sends whatever the prompt already holds (Package Control's package
+name, a rename box's current name) — but the reply echoed only the argument, so a submit made without
+`text` said null. The panel's text is read before the panel is submitted and returned in
+`submitted_text`; an `action` other than `submit`/`cancel` is refused before the panel is touched.
+Measured 2026-11-11 in the rig: a panel holding "hello", submitted without `text`, answered
+`"hello"`, and `text: "typed"` answered `"typed"`.
+
+**`get_cursor_context` invented a line.** `full_line(...).end()` stops after the newline of the last
+line it includes, so splitting that text left an empty element that was printed with the NEXT line's
+number: a four-line buffer with the cursor on line 2 and `lines=1` answered
+`1: one / 2: two / 3: three / 4: `, while line 4 holds "four". The empty tail is dropped, so every
+numbered line in the reply is a line that exists (measured 2026-11-11 on 4215).
+
+**`get_sheet_content(index=-1)` read the last tab instead of the one asked for.** A sheet index is a
+position from `get_sheets` (0 .. n-1), but Python's negative indexing turned `-1` into the last
+sheet: with "first" the active tab, `index: -1` returned "second" and echoed `index: -1` — a
+wrong-tab answer with no error. A negative index is refused now (measured 2026-11-11 in the rig).
+
+**`replace_lines` with `end` before `begin` replaced the lines between them.** Sublime's `Region`
+normalises a reversed pair, so `begin: 3, end: 1` answered `ok: true` after "one/two/three/four"
+became "one/X/three/four": line 2 was replaced although the caller named lines 3..1 (measured
+2026-11-11). An edit is not a read, so a reversed range is refused with `nothing was changed`
+instead of editing a region the caller did not name.
+
+**`revert_file` claimed it discarded edits on a tab that has no file.** With nothing on disk,
+Sublime's `revert` does nothing, yet the reply was `ok: true, discarded_edits: true` and "unsaved
+edits were discarded without asking" — measured 2026-11-11: an untitled buffer holding "edited\n"
+answered exactly that and still held its text. It refuses now, says nothing was changed, and leaves
+the buffer alone.
+
+**`project_search_results` could call a running search complete.** `search_is_complete` matched the
+summary against the end of the whole panel text, so a match line whose own text ends in "… 12
+matches" (or "No results found") made an unfinished search report `complete: true`, with `total`
+short and `truncated` wrong. Only the last non-empty line can be the summary now, and it must be
+nothing but the summary; checked against the running and finished panel shapes and the cases in
+`lib/search_results.py`.
+
+**The guides still promised that `revert_file` asks the person first.** Sublime reverts a modified
+buffer with no dialog, and the tool description was corrected on 2026-11-10, but `AGENT_GUIDE.md`
+(served by `get_help`), `docs/AGENT_GUIDE.md` and `docs/agents.md` still said a confirmation comes
+first. All three now say the unsaved edits are discarded with no prompt and that the reply says
+whether it discarded any. Guides only, no code change.
+
 **A preview tab was listed three times, with handles that did not work.** With a file open through a
 package's preview (`sublime.TRANSIENT`), `get_sheets` reported the tab as an empty placeholder row
 *and* a synthetic `PreviewSheet` row whose `id` was the **view** id and whose `index` sat past the

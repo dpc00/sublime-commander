@@ -167,7 +167,8 @@ Run any result with `batch(calls=[{"tool": "<name>", "args": {...}}])`.
 Skip save and ST looks edited while `git diff` is empty.
 
 - Disk `edit`/`write` on a file ST has open → `revert_file(name=...)` (or `index`) so the buffer reloads;
-  it asks the person first, and a name that fits several tabs is refused.
+  it does NOT ask: the unsaved edits are discarded with no prompt (the reply says whether it
+  discarded any); a name that fits several tabs is refused.
 - Short plain text into an empty tab: `insert` is fine. Indented or large multi-line
   content: use `replace_lines(begin, end, text)`, because `insert` (and
   `view.run_command("insert", ...)`) auto-indents every line and piles indentation.

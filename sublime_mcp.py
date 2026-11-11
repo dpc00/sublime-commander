@@ -696,6 +696,12 @@ def _get_cursor_context(params):
         end_pt = v.full_line(end_line).end()
         text = v.substr(sublime.Region(start_pt, end_pt))
         lines = text.split("\n")
+        if lines and lines[-1] == "":
+            # full_line().end() stops after the newline that ends the last included line, so the
+            # split leaves one empty element; printing it gave that element the number of the NEXT
+            # line, which then read as blank (measured 2026-11-11: a 4-line buffer, cursor on line
+            # 2, lines=1 answered "1: one / 2: two / 3: three / 4: " while line 4 holds "four").
+            lines.pop()
         numbered = "\n".join("{:4}: {}".format(start_row + i + 1, l) for i, l in enumerate(lines))
         return {
             "path": v.file_name(),
@@ -1190,6 +1196,13 @@ def _sniff_image_mime(raw, path=None):
 
 def _get_sheet_content(params):
     index = int(params.get("index", [0])[0])
+    if index < 0:
+        # Python's negative indexing turned -1 into the LAST sheet, so a caller that used the
+        # sentinel -1 the other tools take to mean "the active tab" read a different tab's
+        # content, with no error (measured 2026-11-11: active tab "first", index -1 answered
+        # "second"). A sheet index is a position from get_sheets: 0 .. n-1.
+        return {"error": "index must be 0 or more: sheet indexes are the positions get_sheets "
+                         "lists (0 .. n-1); there is no negative index", "index": index}
 
     def fn():
         w = sublime.active_window()
@@ -2295,8 +2308,12 @@ def _get_view_chars(params):
             return {"error": "no view found"}
         size = v.size()
         end_c = int(end_p) if end_p is not None else size
-        begin_c = max(0, begin)
-        end_c = min(size, end_c)
+        # Both ends are clamped to the buffer before they are compared: clamping only `begin` left
+        # end=-2 as -2, and the swap below then reported begin: -2, a position that does not exist,
+        # for a range that was actually returned as an empty one at 0 (measured 2026-11-11 on a
+        # 19-character buffer: begin -9, end -2 answered begin: -2, end: 0, content "").
+        begin_c = max(0, min(size, begin))
+        end_c = max(0, min(size, end_c))
         if end_c < begin_c:
             # Sublime's Region tolerates a reversed pair and substr returns the text between them,
             # so begin 5 / end 2 answered "rst" while echoing begin 5 and end 2 -- the caller's
@@ -2520,6 +2537,13 @@ def _replace_lines(body):
     index = int(body.get("index", -1))
     if begin is None or end is None:
         return {"error": "begin and end required"}
+    # Sublime's Region normalises a reversed pair, so begin 3 / end 1 used to replace the lines
+    # BETWEEN them and answer ok: "one/two/three/four" became "one/X/three/four" -- line 2 was
+    # replaced although the caller named lines 3..1 (measured 2026-11-11). An edit is not a read:
+    # refuse rather than edit a region the caller did not name.
+    if int(end) < int(begin):
+        return {"error": "end ({}) is before begin ({}); nothing was changed -- pass the lines in "
+                         "ascending order".format(end, begin)}
 
     def fn():
         w = sublime.active_window()
@@ -3000,21 +3024,28 @@ def _drive_input_panel(body):
         if panel_view is None:
             return {"error": "input panel is open but its view could not be located"}
 
+        action = body.get("action", "submit")
+        if action not in ("submit", "cancel"):
+            return {"error": "action must be 'submit' or 'cancel'"}
+
         text = body.get("text")
         if text is not None:
             panel_view.run_command("select_all")
             panel_view.run_command("right_delete")
             panel_view.run_command("insert", {"characters": text})
 
-        action = body.get("action", "submit")
+        # Read the panel before submitting: with `text` omitted the caller asks this tool to send
+        # whatever is already in the prompt -- Package Control's package name, a rename box's
+        # current name -- and the reply used to echo only the argument, so it said
+        # submitted_text: null for text that WAS submitted (measured 2026-11-11 in the rig: a
+        # panel opened with "hello" and submitted without `text` replied null).
+        submitted = panel_view.substr(sublime.Region(0, panel_view.size()))
         if action == "submit":
             w.run_command("select")
-        elif action == "cancel":
-            w.run_command("hide_panel", {"cancel": True})
         else:
-            return {"error": "action must be 'submit' or 'cancel'"}
+            w.run_command("hide_panel", {"cancel": True})
 
-        return {"ok": True, "submitted_text": text}
+        return {"ok": True, "submitted_text": submitted}
     return _on_main(fn)
 
 
@@ -3750,6 +3781,15 @@ def _revert_file(body):
             v = _active_view()
         if not v:
             return {"error": "no active view"}
+        if not v.file_name():
+            # "revert" reloads the file from disk; a tab with no file has nothing to reload, so
+            # Sublime does nothing. The reply used to say ok with discarded_edits: true and
+            # "unsaved edits were discarded without asking" for a buffer whose text was still
+            # there (measured 2026-11-11: an untitled buffer holding "edited\n" answered exactly
+            # that and kept its text), which is a claim that a destructive step happened.
+            return {"error": "this tab has no file on disk, so there is nothing to revert to; the "
+                             "buffer was left as it is", "path": None,
+                    "name": _view_display_name(v)}
         was_dirty = v.is_dirty()
         v.run_command("revert")
         # Sublime reverts a modified buffer without asking (measured 2026-11-10: no dialog,
@@ -5909,7 +5949,8 @@ _MCP_TOOLS = [
      "with neither it reverts the active tab, so name the tab you mean. Sublime does not ask "
      "first: measured on 4215, a modified buffer was reverted with no dialog and no way "
      "back to the discarded text, so save anything you need before calling it. The reply "
-     "says whether edits were discarded.",
+     "says whether edits were discarded. A tab with no file on disk (an untitled buffer, a "
+     "scratch tab) cannot be reverted and is refused with the buffer left as it is.",
      {"type": "object", "properties": {
          "name": {"type": "string", "default": ""},
          "index": {"type": "integer", "default": -1},
@@ -5933,6 +5974,8 @@ _MCP_TOOLS = [
      _g("/cursor_context")),
     ("get_sheet_content",
      "Return the content of any tab by its sheet index (from get_sheets).\n"
+     "index is a position in that list, 0 .. number of tabs - 1; a negative index is refused "
+     "rather than counted from the end.\n"
      "Works for text tabs including untitled buffers and Terminus tabs.\n"
      "For image tabs returns the file path and content_base64 (base64-encoded image data).",
      {"type": "object", "properties": {"index": {"type": "integer"}}, "required": ["index"]},
@@ -6329,7 +6372,9 @@ _MCP_TOOLS = [
      "through Sublime's own built-in commands rather than that package's code.\n"
      "text (optional): replace the panel's current content before acting. "
      "action: 'submit' (default, fires on_done) or 'cancel' (fires on_cancel). "
-     "Errors if no input panel is currently open.\n"
+     "Errors if no input panel is currently open. The reply's submitted_text is the panel's "
+     "own text at the moment it was sent -- which is what was in the prompt when text was "
+     "omitted, so a submit without text still says what the package received.\n"
      "If several agents share this Sublime Text, call claim_resource with "
      "resource='input_panel' before opening the panel and release_resource when "
      "you are done, so another agent does not take the panel in between.",

@@ -179,6 +179,13 @@ def tool_names():
     tree = ast.parse((ROOT / "sublime_mcp.py").read_text(encoding="utf-8"))
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "_MCP_TOOLS" for t in node.targets):
+            # Every entry is (name, description, inputSchema, handler). A missing comma in a
+            # description makes two adjacent literals two elements, and the plugin then dies while
+            # loading with "too many values to unpack" -- which py_compile cannot see, so the first
+            # sign was a Sublime with no server on it (2026-11-11).
+            bad = [len(e.elts) for e in node.value.elts if not (isinstance(e, ast.Tuple) and len(e.elts) == 4)]
+            if bad:
+                raise SystemExit("_MCP_TOOLS entries are not 4-tuples: arities {}".format(sorted(set(bad))))
             return [e.elts[0].value for e in node.value.elts]
     raise SystemExit("_MCP_TOOLS not found")
 

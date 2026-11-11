@@ -70,8 +70,8 @@ Why the live buffer, not a disk write:
 - Dirty/save/close are real steps the user can see.
 - No two-sources-of-truth with a stale ST buffer vs disk.
 
-If you did write disk behind ST's back, `revert_file(name=...)` (it asks the person) or reopen so the
-buffer resyncs.
+If you did write disk behind ST's back, `revert_file(name=...)` (it does not ask: unsaved edits are
+discarded) or reopen so the buffer resyncs.
 
 ### Never `run_command` as generic dispatch
 

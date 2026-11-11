@@ -12,8 +12,18 @@ _HEADER_RE = re.compile(r'^\s*Searching\b.*?\bfor "(.*)"(?P<flags>(?: \([^)]*\))
 
 
 def search_is_complete(text):
-    """Return True once Sublime has appended a terminal search summary."""
-    return bool(_SUMMARY_RE.search((text or "").rstrip()))
+    """Return True once Sublime has appended a terminal search summary.
+
+    Only the last non-empty line can be the summary, and it must be nothing but the summary:
+    matching the end of the whole text let a running search look finished, because a MATCH line
+    whose own text ends in "12 matches" (or "No results found") ended the text (measured
+    2026-11-11: `.../doc.md:\\n    7: see 12 matches\\n` answered True while the panel had written
+    no summary). A caller then read a half-written result list as final, with `total` short.
+    """
+    lines = [line for line in (text or "").splitlines() if line.strip()]
+    if not lines:
+        return False
+    return bool(_SUMMARY_RE.fullmatch(lines[-1].strip()))
 
 
 _MAX_PARSE = 50000

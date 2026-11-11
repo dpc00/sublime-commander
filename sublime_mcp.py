@@ -4662,7 +4662,14 @@ def _edit_file(body):
     if not path:
         return {"error": "path required"}
 
-    v, err = _ensure_view(path, wait_ms=int(body.get("wait_ms") or 1500))
+    wait_ms = body.get("wait_ms")
+    if wait_ms is None:
+        wait_ms = 1500
+    try:
+        wait_ms = max(0, int(wait_ms))
+    except (TypeError, ValueError):
+        return {"error": "wait_ms must be an integer number of milliseconds"}
+    v, err = _ensure_view(path, wait_ms=wait_ms)
     if err:
         return err
 

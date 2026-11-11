@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**`open_file` made another copy of a file that was already open, and every path-based tool only
+looked in the window in front.** Four calls to `open_file` on one path produced four tabs of the same
+file (measured 2026-11-11, while a file was open in its own window and the person's window was in
+front) — and because each duplicate was a separate view, one could be loading while another was not,
+so `str_replace_based_edit_tool` answered "the file is still loading" for a file that was fully
+loaded elsewhere. Reading, replacing lines, saving and closing had the same window blindness: a file
+open in another window was answered as "not open". One lookup, `_find_open_view`, now searches every
+window with normalised paths; `open_file` reports `already_open: true` with the owning `window_id` and
+brings that tab forward (moving the caret when `line`/`col` are given), and the five path-based tools
+find the tab wherever it is. Verified in the portable: four opens → one tab, same view id, caret
+moved to 3:5, 4:1 and 1:1 as asked; and with a second window in front, the call still reported the
+first window's tab instead of opening a copy in the second.
+
 **Overlay detection went blind after a few hundred palette opens.** `get_ui_state` found an open
 command palette by scanning widget view ids, and the scan stopped at a fixed limit (260). Widget view
 ids are global and are not reused: each palette open allocates one, so after ~300 opens the palette's

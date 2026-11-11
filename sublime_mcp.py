@@ -1295,9 +1295,9 @@ def _get_file_content(params):
         return {"error": "path required"}
 
     def fn():
-        v = sublime.active_window().find_open_file(path)
+        _, v = _find_open_view(path)
         if not v:
-            return {"error": "not open: {}".format(path)}
+            return {"error": "not open in any window: {}".format(path)}
         return {"path": path, "content": v.substr(sublime.Region(0, v.size()))}
 
     return _on_main(fn)
@@ -2683,11 +2683,25 @@ def _open_file(body):
                         "or check the path"}
 
     def fn():
+        # A file that is already open must be brought forward, never opened a second time: every
+        # call used to make another tab of the same path (four copies of one file, measured
+        # 2026-11-11), each a separate view that could then be loading while another was not.
+        owner, existing = _find_open_view(path)
+        if existing is not None:
+            if line or col:
+                point = existing.text_point(max(0, int(line) - 1), max(0, int(col) - 1))
+                existing.sel().clear()
+                existing.sel().add(sublime.Region(point))
+                existing.show_at_center(point)
+            owner.focus_view(existing)
+            return {"ok": True, "already_open": True, "window_id": owner.id(),
+                    "view_id": existing.id(), "note": "this file was already open; its tab was "
+                    "brought forward instead of opening another"}
         w = sublime.active_window()
         flags = sublime.ENCODED_POSITION if (line or col) else sublime.NewFileFlags.NONE
         fname = "{}:{}:{}".format(path, line, col) if (line or col) else path
         w.open_file(fname, flags)
-        return {"ok": True}
+        return {"ok": True, "already_open": False, "window_id": w.id()}
 
     result = _on_main(fn)
     if not (isinstance(result, dict) and result.get("ok")):
@@ -2696,8 +2710,9 @@ def _open_file(body):
     # Sublime opens a file asynchronously, and this call does not wait for it: the tab may still be
     # loading and the previous tab may still be active for a moment (ui_type_text typed into the old
     # untitled tab in 1 of 3 runs when it did). Confirm with get_sheets (is_focused) before typing.
-    result["note"] = ("opened; Sublime loads it asynchronously - check get_sheets (is_focused) "
-                      "before typing or using an active-tab tool")
+    if not result.get("already_open"):
+        result["note"] = ("opened; Sublime loads it asynchronously - check get_sheets (is_focused) "
+                          "before typing or using an active-tab tool")
     return result
 
 
@@ -2762,9 +2777,9 @@ def _replace_lines(body):
     def fn():
         w = sublime.active_window()
         if path:
-            v = w.find_open_file(path)
+            w, v = _find_open_view(path)
             if not v:
-                return {"error": "not open: {}".format(path)}
+                return {"error": "not open in any window: {}".format(path)}
         elif index >= 0:
             v, err = _resolve_view(w, "", index)
             if err:
@@ -3174,9 +3189,9 @@ def _save_file(body):
     def fn():
         w = sublime.active_window()
         if path:
-            v = w.find_open_file(path)
+            w, v = _find_open_view(path)
             if not v:
-                return {"error": "not open: {}".format(path)}
+                return {"error": "not open in any window: {}".format(path)}
         else:
             v = _active_view()
         if not v:
@@ -3239,9 +3254,9 @@ def _close_file(body):
     def fn():
         w = sublime.active_window()
         if path:
-            v = w.find_open_file(path)
+            w, v = _find_open_view(path)
             if not v:
-                return {"error": "not open: {}".format(path)}
+                return {"error": "not open in any window: {}".format(path)}
         elif name or index >= 0:
             # Target a path-less tab (an unsaved buffer, a panel-less scratch view) the same
             # way run_command does: by partial name or by position. Without this the only
@@ -3412,11 +3427,11 @@ def _select_all_bookmarks(body):
 def _find_input_panel_view(window):
     """Locate the View backing window's currently open show_input_panel, if any.
 
-    Input-panel views are not returned by window.views(), window.active_view(),
-    or any other public lookup -- they live in a separate low-id widget
-    namespace. This scans that namespace directly via sublime.View(id) and
-    filters by is_widget + matching window, which is the only way to reach
-    the view at all (confirmed empirically; ST exposes no direct accessor).
+    Input-panel views are not returned by window.views(), window.active_view(), or any other public
+    lookup: a widget view is reachable only by probing sublime.View(id). Its id is not in a
+    "separate low-id namespace" -- ids are global and grow with every widget ever created (the
+    command palette's own view was id 618 after a few hundred opens, measured 2026-11-11), so this
+    uses the same whole-range probe as _widget_views.
     """
     # One adaptive scan for every widget view of this window: a fixed id range went blind once the
     # ids had grown past it (see _widget_views).
@@ -4441,6 +4456,40 @@ def _set_layout(body):
 _EDIT_HIGHLIGHT_MS = 30000  # how long green underline stays visible
 
 
+def _normalised_path(path):
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
+def _find_open_view(path):
+    """(window, view) for a tab showing `path` in ANY window, or (None, None).
+
+    Every path-based tool used to ask only the ACTIVE window, so a file open in another window was
+    reported as "not open" and `str_replace_based_edit_tool` could not touch it; worse, a file open
+    in another window was opened AGAIN in the active one, and repeated calls left four tabs of the
+    same file in one window (measured 2026-11-11, a file open in its own window while the person's
+    window was in front). Paths are compared normalised, because forward and back slashes and case
+    differ between what a caller types and what Sublime stores.
+    """
+    target = _normalised_path(path)
+    for window in sublime.windows():
+        try:
+            views = list(window.views()) + _preview_views(window)
+        except Exception:
+            continue
+        for view in views:
+            name = view.file_name()
+            if name and _normalised_path(name) == target:
+                return window, view
+    for window in sublime.windows():
+        try:
+            view = window.find_open_file(path)
+        except Exception:
+            view = None
+        if view:
+            return window, view
+    return None, None
+
+
 def _ensure_view(path):
     """Open *path* in ST if not already open and return its view, without waiting for the load.
 
@@ -4450,10 +4499,10 @@ def _ensure_view(path):
 
     Returns (view, None) or (None, {"error": ...})."""
     def _open():
-        w = sublime.active_window()
-        v = w.find_open_file(path)
+        w, v = _find_open_view(path)
         if v:
             return v, None
+        w = sublime.active_window()
         if not os.path.isfile(path):
             return None, {"error": "file not found: {}".format(path)}
         return w.open_file(path), None

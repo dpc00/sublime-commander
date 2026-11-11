@@ -4494,21 +4494,24 @@ def _close_duplicate_tabs(body):
     """Close the extra tabs that show the same file, keeping one per path.
 
     Sublime's session keeps every tab it had, so duplicates survive a plugin reload and a restart --
-    nothing else in this toolset removes them (measured 2026-11-11: four tabs of one file, moved
-    between windows, still there after a restart). The one that is kept is the first found, in window
-    order and then tab order. A tab with unsaved changes is left alone unless discard is true, and
-    is listed in "kept_dirty" so the caller knows why.
+    nothing else in this toolset removes them (measured 2026-11-11: duplicate tabs of one file spread
+    over three windows, still there after the process was stopped and started again). The one that is
+    kept is the first found, in window order and then tab order; it is never closed.
 
-    Params: path (optional -- only this file), discard (default false), dry_run (default false).
+    Every close re-reads the window and finds the tab by sheet id, so closing one tab cannot make the
+    next close hit the wrong one. A tab with unsaved changes is left alone unless discard is true, and
+    is listed in kept_dirty. Params: path (optional -- only this file), discard (default false),
+    dry_run (default false).
     """
     only = body.get("path") or ""
     discard = bool(body.get("discard", False))
     dry_run = bool(body.get("dry_run", False))
 
-    def fn():
+    def snapshot():
+        """{path key: [(window, sheet, path)]} for live sheets, in window then tab order."""
         groups = {}
         for window in sublime.windows():
-            for index, sheet in enumerate(_all_sheets(window)):
+            for sheet in _all_sheets(window):
                 try:
                     path = sheet.file_name()
                 except Exception:
@@ -4518,13 +4521,28 @@ def _close_duplicate_tabs(body):
                 if only and _normalised_path(path) != _normalised_path(only):
                     continue
                 groups.setdefault(_normalised_path(path), []).append((window, sheet, path))
-        closed, kept, kept_dirty = [], [], []
+        return groups
+
+    def live_sheet(window_id, sheet_id):
+        for window in sublime.windows():
+            if window.id() != window_id:
+                continue
+            for sheet in _all_sheets(window):
+                if sheet.id() == sheet_id:
+                    return window, sheet
+        return None, None
+
+    def fn():
+        groups = snapshot()
+        closed, kept, kept_dirty, missed = [], [], [], []
         for target, entries in groups.items():
             if len(entries) < 2:
                 continue
-            window0, sheet0, path0 = entries[0]
-            kept.append({"path": path0, "window_id": window0.id(), "sheet_id": sheet0.id()})
+            keep_window, keep_sheet, keep_path = entries[0]
+            kept.append({"path": keep_path, "window_id": keep_window.id(), "sheet_id": keep_sheet.id()})
             for window, sheet, path in entries[1:]:
+                if sheet.id() == keep_sheet.id():
+                    continue
                 view = sheet.view()
                 if view is not None and view.is_dirty() and not discard:
                     kept_dirty.append({"path": path, "window_id": window.id(),
@@ -4532,13 +4550,21 @@ def _close_duplicate_tabs(body):
                     continue
                 record = {"path": path, "window_id": window.id(), "sheet_id": sheet.id()}
                 if not dry_run:
+                    window, sheet = live_sheet(window.id(), sheet.id())
+                    if sheet is None:
+                        missed.append(record)
+                        continue
                     group, position = window.get_sheet_index(sheet)
                     if position < 0:
-                        view and window.focus_view(view)
-                    window.run_command("close_by_index" if position >= 0 else "close_file",
-                                       {} if position < 0 else {"group": group, "index": position})
+                        window.run_command("close_file")
+                    else:
+                        window.run_command("close_by_index", {"group": group, "index": position})
+                    if live_sheet(keep_window.id(), keep_sheet.id())[1] is None:
+                        return {"error": "the kept tab vanished while closing duplicates; stopped",
+                                "kept": kept, "closed": closed}
                 closed.append(record)
         return {"ok": True, "kept": kept, "closed": closed, "kept_dirty": kept_dirty,
+                "vanished_before_close": missed,
                 "duplicate_groups": sum(1 for e in groups.values() if len(e) > 1),
                 "dry_run": dry_run}
 

@@ -4604,12 +4604,14 @@ def _close_duplicate_tabs(body):
     return _on_main(fn)
 
 
-def _ensure_view(path):
-    """Open *path* in ST if not already open and return its view, without waiting for the load.
+def _ensure_view(path, wait_ms=0):
+    """Open *path* in ST if not already open and return its view.
 
     ST's window.open_file() returns immediately with a loading view, and a still-loading view has
-    no content to read or edit. Instead of polling (this used to sleep up to 5 s), the call says so
-    and the caller asks again when it chooses.
+    no content to read or edit. `wait_ms` is how long to wait for the load: a 2 MB file is ready in
+    well under a second, so a caller that opens one should not have to ask twice (measured
+    2026-11-11: the first call on a 2.2 MB file answered {"loading": true} and a second call was
+    needed). Past `wait_ms` the call still says so and the caller asks again when it chooses.
 
     Returns (view, None) or (None, {"error": ...})."""
     def _open():
@@ -4624,9 +4626,12 @@ def _ensure_view(path):
     v, err = _on_main(_open)
     if err:
         return None, err
-    if _on_main(lambda: v.is_loading()):
-        return None, {"error": "the file is still loading: {}; call again when you choose"
-                               .format(path), "loading": True}
+    deadline = time.monotonic() + max(0, wait_ms) / 1000.0
+    while _on_main(lambda: v.is_loading()):
+        if time.monotonic() >= deadline:
+            return None, {"error": "the file is still loading: {}; call again when you choose"
+                                   .format(path), "loading": True}
+        time.sleep(0.05)
     return v, None
 
 
@@ -4657,7 +4662,7 @@ def _edit_file(body):
     if not path:
         return {"error": "path required"}
 
-    v, err = _ensure_view(path)
+    v, err = _ensure_view(path, wait_ms=int(body.get("wait_ms") or 1500))
     if err:
         return err
 
@@ -5707,11 +5712,13 @@ def _batch(args):
                     texts.append(block)
             results[i] = (texts[0] if len(texts) == 1 else
                           "\n".join(t if isinstance(t, str) else json.dumps(t) for t in texts))
+    failures = sum(1 for r in results if isinstance(r, dict) and r.get("error"))
     if images:
         # Image first, like a plain screenshot tool's reply: the phone app shows a thumbnail
         # for a result that starts with the image.
-        return images + [{"type": "text", "text": json.dumps({"results": results})}]
-    return {"results": results}
+        return images + [{"type": "text", "text": json.dumps(
+            {"ok": not failures, "errors": failures, "results": results})}]
+    return {"ok": not failures, "errors": failures, "results": results}
 
 
 _TOOL_TREE_CACHE = []
@@ -7156,10 +7163,12 @@ _MCP_TOOLS = [
      "  Syntax is auto-detected from the file extension. Errors if path exists.\n\n"
      "command='view': return file content with 1-based line numbers prepended.\n"
      "  Optional view_range=[start, end] to read a slice (end=-1 for EOF).\n\n"
-     "All commands auto-open the file in ST if not already open.",
+     "All commands auto-open the file in ST if not already open, and wait up to\n"
+     "wait_ms (default 1500) for a large file to finish loading before editing it.",
      {"type": "object", "properties": {
          "command": {"type": "string"},
          "path": {"type": "string", "default": ""},
+         "wait_ms": {"type": "integer", "description": "How long to wait for a large file to load (default 1500 ms)."},
          "old_str": {"type": "string"},
          "new_str": {"type": "string"},
          "insert_line": {"type": "integer"},

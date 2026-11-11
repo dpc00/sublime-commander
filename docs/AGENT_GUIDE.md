@@ -646,7 +646,7 @@ the editor. Know these before calling a tool you have not used (checked on 1.14.
   macro), `primary_j_changed` ("Key Binding Changed"), `close_folder_list` ("Confirm Remove Folders": Remove or
   Cancel), `delete_file` and `delete_folder` with `prompt=true` (OK or Cancel), `remove_license` ("Remove license key?":
   Remove or Cancel; it removes the licence) and the `sublime_merge_*` tools when Sublime Merge is not installed
-  ("Sublime Merge Not Found": Download or Cancel). The call returns "main-thread timeout after 5s"; `list_native_windows` shows the
+  ("Sublime Merge Not Found": Download or Cancel). The call fails within a few hundred milliseconds and names the dialog; `list_native_windows` shows the
   dialog and `dismiss_native_window` closes it. Open, Select Folder and Save As have Cancel, not OK: answer
   Cancel (`action="button", button="Cancel"`); OK on a dialog with no OK button fails and leaves the
   main thread blocked. `run_command` with `context_menu` opens a popup menu that blocks the same way.
@@ -700,10 +700,18 @@ own "cannot find perltidy" message. Do not repeat a call that raised a dialog be
 
 ## When a native dialog blocks Sublime (Windows)
 
-If a tool call fails with "main-thread timeout after 5s", or a command just
-opened a native dialog or menu, Sublime's main thread is blocked and almost
-every tool will time out. Two tools still work, because they never use the main
-thread:
+A dialog is reported the moment it opens. A watcher in the plugin polls this
+process's own windows every 150 ms without touching the main thread, prints
+`native dialog opened (seen in 0.15s, not clicked): …` to the console (read it with
+`get_console_log`), pushes a `notifications/message` to every open MCP session, and
+makes a call that is waiting on the main thread fail within a few hundred
+milliseconds with the dialog named — no 5 s wait. Every tool result carries
+`dialog_events` for 30 s afterwards, and `list_native_windows` reports each dialog's
+`open_for_seconds` and the watcher's own state. The watcher never clicks anything:
+answering a dialog is the caller's or the person's decision.
+
+While a dialog is up, almost every tool fails at once. Two tools still work,
+because they never use the main thread:
 
 ```
 list_native_windows()                     # dialogs/menus with buttons + message text + controls,

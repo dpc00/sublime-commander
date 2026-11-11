@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+**A native dialog is now detected and announced the moment it opens; a blocked call gives up in about
+a quarter of a second instead of five.** Nothing watched for dialogs: a call that hit one waited the
+full 5 s before saying "main-thread timeout after 5s", `list_native_windows` called the thread blocked
+only after 2 s, and whether anything was open was visible only if the caller happened to ask. Now a
+background watcher polls this process's own windows every 150 ms — `EnumWindows` needs no main thread,
+so it keeps working while the editor is blocked — and on a new dialog prints one console line, pushes
+an MCP `notifications/message` (level warning, `logger: sublime-commander.dialogs`) to every live SSE
+session, and keeps the last ten notices. `_on_main` waits in 150 ms slices and raises as soon as a
+dialog has been up for 250 ms, so the error arrives at once and names the dialog; the 5 s wait is now
+only for a main thread that is busy with no dialog (a package loading). Every tool result carries
+`dialog_events` for 30 s afterwards, `list_native_windows` reports each dialog's `open_for_seconds`
+and the watcher's own state, and `main_thread_blocked` flips after 250 ms instead of 2 s. The watcher
+only reports: it never clicks a button, which is the caller's or the person's decision.
+
+Measured on 4215 in the rig: notification pushed 0.51 s after the command was issued (the dialog
+itself appears ~0.3 s in), `main_thread_blocked` true 0.295 s in, a `get_line_count` issued while the
+dialog was up answered in 0.48 s with `main-thread timeout after 0.47s … "Open" (dialog)`, the console
+line read back with `get_console_log`, and the dialog still open until `dismiss_native_window`
+cancelled it.
+
 **`list_native_windows` showed a file dialog's File name box as empty while it held the path.**
 `GetWindowText` answers an empty string for the Edit that sits inside a ComboBoxEx32, which is
 exactly the "File name:" control: `ui_set_text` put a path in it, the dialog opened that file, and

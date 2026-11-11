@@ -88,6 +88,20 @@ _PORT = 9500 if sys.platform == "win32" else 9501
 
 _in_flight_dispatch = {"label": None, "started": None}
 
+# ── native dialog detection ───────────────────────────────────────────────────
+#
+# A native dialog blocks Sublime's main thread until someone answers it, and while it is up every
+# tool that needs the main thread is stuck. Nothing used to notice one until a call had waited its
+# full 5 s, or until a caller happened to ask list_native_windows. A background thread polls the
+# process's own windows -- EnumWindows needs no main thread, so it keeps working while the editor is
+# blocked -- and announces a new dialog the moment it appears: a console line, and an MCP
+# notifications/message on every live SSE session. It reports; it never clicks (AGENTS.md: a dialog
+# is answered by the caller or the person, never by a watcher).
+_DIALOG_POLL_SECONDS = 0.15
+_DIALOG_GRACE_SECONDS = 0.25   # how long a dialog must stay up before a waiting call gives up on it
+_MAIN_THREAD_WAIT_SECONDS = 5.0
+_dialog_watch = {"stop": None, "thread": None, "seen": {}, "events": []}
+
 
 def _dispatch_label(fn):
     code = getattr(fn, "__code__", None)
@@ -123,7 +137,7 @@ def _main_thread_where(depth=4):
         return None
 
 
-def _timeout_message(label, windows, where=None):
+def _timeout_message(label, windows, where=None, waited=None):
     """Say why the main thread did not answer, from the native windows that exist.
 
     ``windows`` is the list from native_windows.list_windows, or None when the
@@ -131,8 +145,10 @@ def _timeout_message(label, windows, where=None):
     not always mean a dialog: a package that is loading or installing keeps the
     main thread busy for many seconds with no dialog open, and blaming a dialog
     then sends the caller looking for something that is not there.
-    """
-    head = "main-thread timeout after 5s."
+
+    ``waited`` is how long this call actually waited: a dialog is reported as soon as the watcher
+    sees it (well under a second), and the message must not claim 5 s of waiting then."""
+    head = "main-thread timeout after {:g}s.".format(_MAIN_THREAD_WAIT_SECONDS if waited is None else waited)
     if windows is None and not native_windows.SUPPORTED:
         return (head + " A native dialog may be waiting for an answer (a Save Changes, Unable to save or "
                 "package error dialog is the usual cause), or a package is busy loading. On this platform "
@@ -167,14 +183,17 @@ def _timeout_message(label, windows, where=None):
             "Call again in a few seconds; list_native_windows shows how long it has been busy.".format(label))
 
 
-def _main_thread_timeout_message(label):
+def _main_thread_timeout_message(label, waited=None, dialog_event=None):
     windows = None
     if native_windows.SUPPORTED:
         try:
             windows = native_windows.list_windows(_native_window_pids())
         except Exception:
             windows = None
-    return _timeout_message(label, windows, _main_thread_where())
+    message = _timeout_message(label, windows, _main_thread_where(), waited)
+    if dialog_event:
+        message += " The dialog watcher saw it {}s after it opened.".format(dialog_event)
+    return message
 
 
 def _on_main(fn):
@@ -215,8 +234,29 @@ def _on_main(fn):
             done.set()
 
     sublime.set_timeout(_run, 0)
-    if not done.wait(5.0):
-        raise TimeoutError(_main_thread_timeout_message(label))
+    started = time.time()
+    deadline = started + _MAIN_THREAD_WAIT_SECONDS
+    dialog_since = None
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        if done.wait(min(remaining, _DIALOG_POLL_SECONDS)):
+            break
+        # A dialog that is up IS the answer: the main thread will not run again until it is
+        # answered, so a caller must not sit out the rest of the 5 s wait. The watcher's map is
+        # pruned on every poll, so a dialog that has been dismissed is gone from it.
+        if _dialog_watch["seen"]:
+            if dialog_since is None:
+                dialog_since = time.time()
+            elif time.time() - dialog_since >= _DIALOG_GRACE_SECONDS:
+                raise TimeoutError(_main_thread_timeout_message(
+                    label, round(time.time() - started, 2),
+                    round(dialog_since - started, 2)))
+        else:
+            dialog_since = None
+    if not done.is_set():
+        raise TimeoutError(_main_thread_timeout_message(label, round(time.time() - started, 1)))
     if exc[0]:
         raise exc[0]
     return result[0]
@@ -2666,6 +2706,99 @@ def _dialog_hint():
         text = text[:117] + "..."
     return ("; a native dialog is open{} -- dismiss it first (list_native_windows, "
             "dismiss_native_window)".format(" ({!r})".format(text) if text else ""))
+
+
+def _dialog_summary(dialog):
+    """The part of a native window report worth putting in a notice or a log line."""
+    return {
+        "hwnd": dialog.get("hwnd"),
+        "title": dialog.get("title"),
+        "kind": dialog.get("kind"),
+        "buttons": [b.get("text") for b in dialog.get("buttons") or []],
+        "messages": [str(m)[:300] for m in dialog.get("messages") or []],
+    }
+
+
+def _announce_dialog(dialog, detected_in):
+    """Report one newly opened dialog: console line, a notification on every open session, and a
+    short history a caller can read even if it was not connected when the dialog appeared."""
+    summary = _dialog_summary(dialog)
+    line = ("sublime-commander: native dialog opened (seen in {}s, not clicked): {!r} buttons {}".format(
+        detected_in, summary.get("title"), summary.get("buttons")))
+    print(line)
+    event = {"at": time.time(), "detected_in_seconds": detected_in, "dialog": summary, "line": line}
+    _dialog_watch["events"].append(event)
+    del _dialog_watch["events"][:-10]
+    notice = {"jsonrpc": "2.0", "method": "notifications/message",
+              "params": {"level": "warning", "logger": "sublime-commander.dialogs",
+                         "data": {"message": line, "dialog": summary}}}
+    for session_id in list(_mcp_sessions):
+        try:
+            _mcp_send(session_id, notice)
+        except Exception:
+            pass
+
+
+def _dialog_watcher(stop, pids):
+    """Poll this process's own windows for dialogs until `stop` is set. No main thread: EnumWindows
+    keeps working while a modal dialog has the editor blocked."""
+    interval = _DIALOG_POLL_SECONDS
+    while not stop.is_set():
+        try:
+            found = [w for w in native_windows.list_windows(pids) if w.get("kind") == "dialog"]
+        except Exception:
+            found = []
+        seen = _dialog_watch["seen"]
+        live = set()
+        for dialog in found:
+            hwnd = dialog.get("hwnd")
+            if hwnd in live:
+                continue
+            live.add(hwnd)
+            if hwnd in seen:
+                continue
+            seen[hwnd] = time.time()
+            _announce_dialog(dialog, round(interval, 2))
+        for hwnd in list(seen):
+            if hwnd not in live:
+                del seen[hwnd]
+        if stop.wait(interval):
+            break
+
+
+def _start_dialog_watch():
+    """Start the watcher once per plugin load (Windows only: the window listing is Win32)."""
+    if not native_windows.SUPPORTED:
+        return
+    if _dialog_watch["thread"] and _dialog_watch["thread"].is_alive():
+        return
+    stop = threading.Event()
+    try:
+        pids = _native_window_pids()
+    except Exception:
+        return
+    thread = threading.Thread(target=_dialog_watcher, args=(stop, pids), daemon=True,
+                              name="sublime-commander-dialogs")
+    _dialog_watch["stop"] = stop
+    _dialog_watch["thread"] = thread
+    thread.start()
+
+
+def _stop_dialog_watch():
+    stop = _dialog_watch.get("stop")
+    if stop:
+        stop.set()
+    _dialog_watch["stop"] = None
+    _dialog_watch["thread"] = None
+    _dialog_watch["seen"].clear()
+
+
+def _recent_dialog_events(limit=5):
+    """The last few dialogs the watcher announced, newest last, so a caller that was blocked can
+    read what appeared while it waited (`get_console_log` has the same lines)."""
+    events = _dialog_watch["events"][-limit:]
+    return [{"at": round(e["at"], 3), "detected_in_seconds": e["detected_in_seconds"],
+             "line": e["line"], "dialog": e["dialog"]} for e in events]
 
 
 def _run_command(body):
@@ -5522,7 +5655,7 @@ _POST["/package_mcp_info"] = _get_package_mcp_info
 # main thread: they run on the HTTP request thread and call Win32 on this process's
 # own windows (lib/native_windows.py), so they keep working while ST is blocked.
 
-_BLOCKED_AFTER_SECONDS = 2.0
+_BLOCKED_AFTER_SECONDS = 0.25
 
 
 def _sublime_process_id():
@@ -5552,10 +5685,21 @@ def _list_native_windows(body):
     label = _in_flight_dispatch.get("label")
     running_for = round(time.time() - started, 1) if started else None
     blocked = bool(running_for is not None and running_for > _BLOCKED_AFTER_SECONDS)
+    windows = native_windows.list_windows(_native_window_pids())
+    now = time.time()
+    for window in windows:
+        seen_at = _dialog_watch["seen"].get(window.get("hwnd"))
+        if seen_at:
+            window["open_for_seconds"] = round(now - seen_at, 1)
     result = {
-        "windows": native_windows.list_windows(_native_window_pids()),
+        "windows": windows,
         "main_thread_blocked": blocked,
         "dispatch_running_seconds": running_for,
+        "dialog_watcher": {
+            "poll_seconds": _DIALOG_POLL_SECONDS,
+            "running": bool(_dialog_watch["thread"] and _dialog_watch["thread"].is_alive()),
+            "recent": _recent_dialog_events(3),
+        },
     }
     if blocked:
         result["blocked_by"] = label
@@ -6570,7 +6714,10 @@ _MCP_TOOLS = [
      "a common file dialog's File name box is the Edit nested in the ComboBoxEx32/ComboBox pair on that "
      "row, fill it with ui_set_text). "
      "Works while a native dialog has BLOCKED Sublime's main thread (every other tool "
-     "then times out); the result says whether the main thread is blocked and which tool blocked it.",
+     "then times out); the result says whether the main thread is blocked and which tool blocked it. "
+     "A watcher polls for dialogs every 150 ms without the main thread and announces a new one at once "
+     "(console line, a notifications/message on every open session); each dialog here also carries "
+     "open_for_seconds, and 'dialog_watcher' says whether the watcher is running and what it last saw.",
      {"type": "object", "properties": {}},
      _p("/list_native_windows")),
     ("dismiss_native_window",
@@ -8239,31 +8386,40 @@ def _consent_gate_result(params, modern, session_id=None):
 
 
 def _note_open_dialogs(data):
-    """Add ``native_dialogs`` to a dict result when a native dialog is open right now.
+    """Add ``native_dialogs`` to a dict result when a native dialog is open right now, and
+    ``dialog_events`` when the watcher announced one in the last half minute.
 
     A dialog is only visible through ``list_native_windows``; nothing pushes it, so one that
     appears while a step runs (the unregistered-copy reminder after a save, a package's error
     box, the "Open" chooser of a command) went unnoticed until the person named it. Every
     tools/call now carries it, read the same no-main-thread way the dialog tools use, so it also
-    works while the dialog blocks Sublime. Only dialogs, and only when there are some."""
+    works while the dialog blocks Sublime. Only dialogs, and only when there are some.
+
+    The watcher announces a dialog the moment it opens (console line, notifications/message); a
+    result also carries that announcement, because a dialog that appeared and was answered between
+    two calls is otherwise invisible."""
     if not native_windows.SUPPORTED or not isinstance(data, dict):
         return data
+    out = None
     try:
         found = [w for w in native_windows.list_windows(_native_window_pids())
                  if w.get("kind") == "dialog"]
     except Exception:
-        return data
-    if not found:
-        return data
-    brief = []
-    for d in found:
-        messages = [m[:200] for m in d.get("messages", [])]
-        brief.append({"hwnd": d.get("hwnd"), "title": d.get("title"),
-                      "buttons": [b.get("text") for b in d.get("buttons", [])],
-                      "messages": messages})
-    out = dict(data)
-    out["native_dialogs"] = brief
-    return out
+        found = []
+    if found:
+        brief = []
+        for d in found:
+            messages = [m[:200] for m in d.get("messages", [])]
+            brief.append({"hwnd": d.get("hwnd"), "title": d.get("title"),
+                          "buttons": [b.get("text") for b in d.get("buttons", [])],
+                          "messages": messages})
+        out = dict(data)
+        out["native_dialogs"] = brief
+    recent = [e for e in _recent_dialog_events(5) if time.time() - e["at"] <= 30]
+    if recent:
+        out = out or dict(data)
+        out["dialog_events"] = recent
+    return out if out is not None else data
 
 
 def _mcp_call_tool(params):
@@ -8486,6 +8642,7 @@ def _start_servers():
         except OSError as e:
             print("sublime-commander: could not bind MCP SSE on port {}: {}".format(_MCP_PORT, e))
             _mcp_server = None
+    _start_dialog_watch()
     print("sublime-commander: MCP SSE on {0}:{1}, HTTP bridge on {0}:{2}".format(_BIND_HOST, _MCP_PORT, _PORT))
 
 
@@ -8502,6 +8659,7 @@ def _stop_servers():
         _mcp_server.shutdown()
         _mcp_server.server_close()
         _mcp_server = None
+    _stop_dialog_watch()
     for q in list(_mcp_sessions.values()):
         q.put(None)
     _mcp_sessions.clear()

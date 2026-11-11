@@ -42,10 +42,11 @@
     // Destructive tool calls (delete_file, delete_folder, revert, revert_file,
     // close_window, close_workspace, remove_folder, exit, eval_python,
     // eval_python_latest, a close_file with discard, and run_command of the same
-    // commands, also inside a batch) are not run until the person says yes. On a 2026-07-28 connection
-    // the client shows the question (Claude Code: an Accept / Decline prompt in
-    // the terminal); a client that cannot be asked is denied. Default true. Set
-    // false to run them without asking (a test instance, for example).
+    // commands, also inside a batch) are not run until the person says yes. On a
+    // 2026-07-28 connection the client shows the question (Claude Code: an
+    // Accept / Decline prompt in the terminal); a client that cannot be asked is
+    // denied. Default true. Set false to run them without asking (a test
+    // instance, for example).
     // The direct HTTP bridge cannot ask, so it refuses those routes (eval_python
     // stays open there). The setting is read on every call, so a change
     // takes effect at once.

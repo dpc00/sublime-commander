@@ -4689,7 +4689,14 @@ def _edit_file(body):
             if syn:
                 v.assign_syntax(syn)
             v.run_command("mcp_create_file", {"file_text": file_text})
-            return {"ok": True, "path": path}
+            # The command only fills a buffer: without the save the tab stays dirty and no file
+            # exists, so a following open_file answered "no such file" (measured 2026-11-11, on
+            # both emmet-probe and trailing-probe) while this tool said the file was created.
+            v.run_command("save")
+            if not os.path.isfile(path):
+                return {"error": "could not write the file: {}".format(path),
+                        "view_id": v.id(), "dirty": v.is_dirty()}
+            return {"ok": True, "path": path, "bytes": os.path.getsize(path)}
 
         return _on_main(create_fn)
 

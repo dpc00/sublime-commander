@@ -2242,18 +2242,148 @@ def _click_menu_item(body):
     return _on_main(fn)
 
 
+def _window_widget_view(window, skip=None):
+    """The widget view this window owns right now, if any: an overlay's input (the command palette,
+    Goto Anything), or an input panel's. Sublime exposes no overlay state and `active_panel()` stays
+    null for an overlay, so this is the only signal it leaves -- a valid widget view whose window()
+    is this window (measured on 4215, 2026-11-11: the palette adds view 21 with window 2 and removes
+    it on hide, while the idle widget views have no window)."""
+    for view_id in range(1, 260):
+        view = sublime.View(view_id)
+        if not view.is_valid():
+            continue
+        try:
+            if not view.settings().get("is_widget"):
+                continue
+        except Exception:
+            continue
+        if skip is not None and view.id() == skip:
+            continue
+        owner = view.window()
+        if owner is not None and owner.id() == window.id():
+            return view
+    return None
+
+
+def _ui_state_on_main():
+    """(panel, overlay text, input-panel text) as the window reports them, on the main thread."""
+    w = sublime.active_window()
+    panel = w.active_panel()
+    overlay = None
+    input_text = None
+    if panel == "input":
+        view = _find_input_panel_view(w)
+        input_text = view.substr(sublime.Region(0, view.size())) if view else None
+    else:
+        widget = _window_widget_view(w)
+        if widget is not None:
+            overlay = widget.substr(sublime.Region(0, widget.size()))
+    return panel, overlay, input_text
+
+
+def _get_ui_state(params):
+    """Everything that can be in front of the person right now, in one reply.
+
+    A picker, an overlay and an input panel are three different things and none of them is a native
+    window, so an agent that asks only one of the tools can miss the other two. This asks all of them:
+    native dialogs and menus (no main thread needed, so they are reported even while one is blocking
+    the editor), then the panel/overlay/input state, then the quick panel that the recorder holds.
+    """
+
+    def native_part():
+        out = {"dialogs": [], "menus": []}
+        if not native_windows.SUPPORTED:
+            return out
+        try:
+            for window in native_windows.list_windows(_native_window_pids()):
+                kind = window.get("kind")
+                if kind == "dialog":
+                    out["dialogs"].append(_dialog_summary(window))
+                elif kind == "menu":
+                    out["menus"].append({"hwnd": window.get("hwnd"), "title": window.get("title"),
+                                         "class": window.get("class")})
+        except Exception:
+            pass
+        return out
+
+    state = native_part()
+    if state["dialogs"] or state["menus"]:
+        # A dialog or a native menu has the main thread; asking it now would only wait out the
+        # grace period (measured 2.5 s on 4215). The native answer is already the whole truth here.
+        state["main_thread_blocked"] = True
+        state["active_panel"] = None
+        state["overlay"] = {"open": False}
+        state["input_panel"] = {"open": False}
+        state["quick_panel"] = {"open": None}
+        state["anything_open"] = True
+        return state
+    try:
+        panel, overlay, input_text = _on_main(_ui_state_on_main)
+        state["active_panel"] = panel
+        state["input_panel"] = {"open": input_text is not None, "text": input_text}
+        # A panel (console, an output panel) owns a widget view of its own, and so does a quick
+        # panel's filter box: only a widget with NO panel and NO recorded picker is an overlay.
+        state["overlay"] = {"open": False}
+        if panel is None and overlay is not None:
+            state["overlay"] = {"open": True, "text": overlay, "kind": "overlay"}
+        state["main_thread_blocked"] = False
+    except TimeoutError as error:
+        state["main_thread_blocked"] = True
+        state["main_thread_note"] = str(error)[:400]
+    try:
+        w = _on_main(sublime.active_window)
+        record = _QUICK_PANELS.get(w.id())
+        if record is not None:
+            items = _quick_panel_items(record)
+            state["quick_panel"] = {"open": True, "total": len(items),
+                                    "first": items[0] if items else None,
+                                    "flags": record.get("flags")}
+            if state.get("overlay", {}).get("open"):
+                state["overlay"]["kind"] = "quick_panel_input"
+        else:
+            state["quick_panel"] = {"open": False}
+    except Exception:
+        state.setdefault("quick_panel", {"open": None})
+    state["anything_open"] = bool(state.get("dialogs") or state.get("menus")
+                                  or state.get("active_panel")
+                                  or state.get("overlay", {}).get("open")
+                                  or state.get("input_panel", {}).get("open")
+                                  or state.get("quick_panel", {}).get("open"))
+    return state
+
+
 def _get_active_panel(params):
     def fn():
         w = sublime.active_window()
         panel_name = w.active_panel()
-        out = {"active_panel": panel_name}
+        out = {"active_panel": panel_name, "name": None, "content": None}
         if panel_name and panel_name.startswith("output."):
             short_name, v = _active_output_panel_view(w)
             out["name"] = short_name
             out["content"] = v.substr(sublime.Region(0, v.size())) if v else None
+        elif panel_name == "console":
+            # The console is a panel but not an output panel, so it used to be reported exactly like
+            # "nothing is open" (measured 2026-11-11). Name it, and say where its text is read from.
+            out["name"] = "console"
+            out["note"] = "the Sublime console is showing; read its text with get_console (tail=N)"
+        # A picker (quick panel) is not a panel either: it is recorded by the quick-panel recorder, so
+        # the caller asks for it. An overlay and an input panel leave a widget view behind; report
+        # them here, because "" / null for both is what made an open command palette invisible.
+        if panel_name == "input":
+            panel_view = _find_input_panel_view(w)
+            out["input_panel"] = {
+                "open": True,
+                "text": panel_view.substr(sublime.Region(0, panel_view.size())) if panel_view else None,
+            }
+            out["overlay"] = {"open": False}
         else:
-            out["name"] = None
-            out["content"] = None
+            widget = _window_widget_view(w)
+            out["input_panel"] = {"open": False}
+            if widget is not None:
+                text = widget.substr(sublime.Region(0, widget.size()))
+                out["overlay"] = {"open": True, "view_id": widget.id(), "text": text}
+            else:
+                out["overlay"] = {"open": False}
         return out
 
     return _on_main(fn)
@@ -4553,6 +4683,7 @@ _POST = {
     "/replace_lines": _replace_lines,
     "/run_command": _run_command,
     "/notify_agent_tab": _notify_agent_tab,
+    "/ui_state": _get_ui_state,
     "/run_build": _run_build,
     "/set_status": _set_status,
     "/claim_resource": _claim_resource,
@@ -6552,6 +6683,14 @@ _MCP_TOOLS = [
          "index": {"type": "integer", "default": -1},
      }, "required": ["begin", "end", "text"]},
      _p("/replace_lines")),
+    ("get_ui_state",
+     "Report everything that can be in front of the person right now: native dialogs and menus (read\n"
+     "without the main thread, so they are reported even while one of them blocks the editor), the\n"
+     "active panel (input panel, output panel, the console), an open overlay (command palette, Goto\n"
+     "Anything) with the text typed into it, and the quick panel the recorder holds. `anything_open`\n"
+     "is true when any of them is up. One call answers whether anything is being overlooked.",
+     {"type": "object", "properties": {}},
+     _p("/ui_state")),
     ("notify_agent_tab",
      "Type one line into a terminal tab that hosts an agent CLI (omp, Claude Code, a shell), so an\n"
      "agent that has no other channel receives it at its prompt as a user message. Keystrokes go to\n"

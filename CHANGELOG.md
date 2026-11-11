@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+**`get_ui_state`: one call that says whether anything is in front of the person.** An overlay (the
+command palette, Goto Anything) left no trace in any tool: `active_panel` is null for one, the picker
+recorder does not see it, and a native window listing does not either — measured on 4215, an open
+palette was reported exactly like an empty editor. The console was mis-reported the same way
+(`active_panel: "console"` fell through the `output.` branch and came back null). `get_ui_state`
+answers all of it at once: native dialogs and native menus (read without the main thread, so they are
+still reported while one of them has the editor frozen), the active panel including the console, an
+open overlay with the text typed into it, an input panel with its text, and the quick panel the
+recorder holds with its item count — plus `anything_open` as the one-line answer. While a dialog or
+native menu is up it returns at once from the native part instead of waiting on the blocked main
+thread (2.5 s before), and a quick panel's filter box is labelled `quick_panel_input` rather than
+being called an overlay. Verified on 4215 with eight states created in turn: dialog, native menu,
+picker, input panel, command palette, Goto Anything, console, and nothing open — every one reported
+correctly, the dialog and the menu with `main_thread_blocked: true`.
+
 **`notify_agent_tab`: hand a terminal-hosted agent a line it did not ask for, without approving
 anything.** An agent CLI in a GhostShell tab owns the keyboard and offers no other channel, so the
 only way to tell it something is to type at its prompt. The new tool does the whole sequence in one

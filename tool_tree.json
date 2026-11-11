@@ -337,6 +337,7 @@
      "get_scope_at_cursor",
      "get_setting",
      "get_syntaxes",
+     "get_ui_state",
      "get_variables"
     ]
    },

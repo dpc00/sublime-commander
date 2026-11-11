@@ -52,7 +52,9 @@ reported — never clicked by a watcher — unless the person asks for it.
 ## PRs and forks
 
 No PR and no fork unless the maintainer's gate passes: a maintainer commit within 12 months and at
-least one PR ever merged. Otherwise the finding is an issue comment only, starting
+least one PR ever merged, and the repository not archived — `archived: true` counts as abandoned
+whatever the dates say (Pieces, 2026-11-11: pushed five months ago with 97 merged PRs, but archived,
+so ledger only). Otherwise the finding is an issue comment only, starting
 `omp - deepseek v4 flash reports:`. When the gate passes: fork under `dpc00`, branch `fix/<topic>`,
 clone in `~/tools/forks` (not a scratch dir — that is where fork clones live and stay), verify the
 patched files in the portable before pushing.

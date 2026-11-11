@@ -222,16 +222,24 @@ class ConsentGate:
         state = params.get("requestState") if isinstance(params, dict) else None
         answers = params.get("inputResponses") if isinstance(params, dict) else None
         if isinstance(state, str) and isinstance(answers, dict):
-            if self._take(state) == fingerprint:
-                self._clear_code()
-                answer = answers.get(REQUEST_KEY)
-                action = answer.get("action") if isinstance(answer, dict) else None
-                if action == "accept":
-                    self._log("consent: approved: " + _log_text(items))
-                    return None
-                self._log("consent: {} ({}): {}".format(
-                    "declined" if action == "decline" else "not approved", action, _log_text(items)))
-                return _denied(items, "the person did not approve")
+            if self._take(state) != fingerprint:
+                # The answer's token is unknown (expired, evicted, never issued) or was issued for
+                # different arguments. Asking again here made a reused or forged token start a
+                # second question -- this module's contract is that "a stale or reused token, or a
+                # changed call" means denied, nothing was changed (measured 2026-11-11: a token
+                # that had already been accepted came back as a fresh input_required).
+                self._log("consent: denied, the answer does not match this call: " + _log_text(items))
+                return _denied(items, "this approval answer does not belong to this call (its token "
+                                      "was stale, already used, or the arguments changed)")
+            self._clear_code()
+            answer = answers.get(REQUEST_KEY)
+            action = answer.get("action") if isinstance(answer, dict) else None
+            if action == "accept":
+                self._log("consent: approved: " + _log_text(items))
+                return None
+            self._log("consent: {} ({}): {}".format(
+                "declined" if action == "decline" else "not approved", action, _log_text(items)))
+            return _denied(items, "the person did not approve")
         if not can_ask:
             self._log("consent: denied, the client cannot be asked: " + _log_text(items))
             return _denied(items, "this client cannot be asked for approval (no elicitation support)")

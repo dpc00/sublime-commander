@@ -2332,6 +2332,9 @@ def _get_view_chars(params):
     return _on_main(fn)
 
 
+_REGIONS_LISTED = 500  # per region key in get_view_regions; `total` reports the real count
+
+
 def _get_view_regions(params):
     """Return the regions a plugin stored in a view under one or more region keys
     (view.add_regions(key, ...)): begin, end and the first 80 characters of each. The API offers no
@@ -2348,10 +2351,22 @@ def _get_view_regions(params):
         if not v:
             return {"error": "no view matching {!r}".format(name), "open_views": open_views}
         out = {}
+        totals = {}
         for k in keys:
+            regions = v.get_regions(k)
+            totals[k] = len(regions)
             out[k] = [{"begin": r.begin(), "end": r.end(), "text": v.substr(r)[:80]}
-                      for r in v.get_regions(k)[:500]]
-        return {"name": _view_display_name(v), "path": v.file_name(), "regions": out}
+                      for r in regions[:_REGIONS_LISTED]]
+        reply = {"name": _view_display_name(v), "path": v.file_name(), "regions": out,
+                 "total": totals}
+        if any(n > _REGIONS_LISTED for n in totals.values()):
+            # A plugin can hold thousands (a syntax highlighter draws one per match); the list used
+            # to stop at 500 silently, so a caller counted 500 regions in a view holding 600
+            # (measured 2026-11-11) -- and the same reply now says which it is.
+            reply["truncated"] = True
+            reply["note"] = ("each key lists at most {} regions; `total` is how many the view "
+                             "holds".format(_REGIONS_LISTED))
+        return reply
 
     return _on_main(fn)
 
@@ -3486,7 +3501,19 @@ def _find_in_file(body):
         for r in v.find_all(pattern, flags):
             row, col = v.rowcol(r.begin())
             out.append({"line": row + 1, "col": col + 1, "text": v.substr(r)})
-        return {"path": v.file_name(), "matches": out}
+        reply = {"path": v.file_name(), "matches": out}
+        if use_re and not out:
+            # Sublime's find_all answers [] for a pattern its engine rejects, which reads as "the
+            # text is absent". Python's engine is not Sublime's (Oniguruma), so this only warns --
+            # it never refuses a pattern -- and only when there was nothing to show anyway
+            # (measured 2026-11-11: "([a-z" answered {"matches": []} with no hint).
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                reply["warning"] = ("no matches, and Python's regex engine rejects this pattern "
+                                    "({}); Sublime's engine may have rejected it too, so this may "
+                                    "be a failed search rather than an absence".format(e))
+        return reply
 
     return _on_main(fn)
 
@@ -4125,8 +4152,10 @@ def _edit_file(body):
             total_lines = v.rowcol(v.size())[0] + 1
             if insert_line == 0:
                 pt = 0
+                landed_after = 0
             else:
                 clamped = min(insert_line, total_lines)
+                landed_after = clamped
                 line_region = v.full_line(v.text_point(clamped - 1, 0))
                 pt = line_region.end()
             # Normalize line endings
@@ -4143,12 +4172,20 @@ def _edit_file(body):
                 },
             )
             row, _ = v.rowcol(pt)
-            return {
+            result = {
                 "ok": True,
-                "after_line": insert_line,
+                # The line the text actually landed after, not the number asked for: insert_line 999
+                # in a 4-line file appends at the end, and echoing 999 made the reply describe a
+                # line the buffer does not have (measured 2026-11-11 in the rig).
+                "after_line": landed_after,
                 "inserted_at_pt": pt,
                 "visible_line": row + 1,
             }
+            if landed_after != insert_line:
+                result["requested_line"] = insert_line
+                result["note"] = ("insert_line {} is past the end of a {} line buffer; the text was "
+                                  "appended after line {}".format(insert_line, total_lines, landed_after))
+            return result
 
         return _on_main(insert_fn)
 
@@ -7985,6 +8022,20 @@ class _MCPHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
+        if not isinstance(body, dict):
+            # Answer on the HTTP response: dispatching a non-object body used to kill the worker
+            # thread after the 202, so the client saw a successful POST and then waited for an
+            # answer that never arrived (measured 2026-11-11 with a JSON array).
+            payload = json.dumps(_invalid_message_error(
+                "a request must be a JSON object; JSON-RPC batches (arrays) are not supported "
+                "and each request must be sent on its own")).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
         if not session_id or session_id not in _mcp_sessions:
             # A reload of this package clears _mcp_sessions, and the client keeps posting to the
             # session id it was given. Dispatching anyway meant the result was handed to a queue
@@ -8212,8 +8263,19 @@ def _note_open_dialogs(data):
 def _mcp_call_tool(params):
     """The result of a tools/call. A tool that fails is reported in the result with isError
     (all protocol versions); only a tool that does not exist raises _UnknownTool (-32602)."""
+    if not isinstance(params, dict):
+        return {"content": [{"type": "text", "text": "tools/call params must be a JSON object"}],
+                "isError": True}
     tool_name = params.get("name")
-    tool_args = params.get("arguments") or {}
+    tool_args = params.get("arguments")
+    if tool_args is None:
+        tool_args = {}
+    if not isinstance(tool_args, dict):
+        # A string, array or number here used to reach the tool's own body and fail there, so the
+        # caller got an internal message such as "'str' object has no attribute 'items'" (measured
+        # 2026-11-11). An MCP tool call's arguments are an object; say so.
+        return {"content": [{"type": "text", "text": "arguments must be a JSON object, not {}".format(
+                    type(tool_args).__name__)}], "isError": True}
     try:
         if tool_name in _DISABLED_TOOLS:
             raise ValueError(_tool_disabled_error(tool_name)["error"])
@@ -8284,12 +8346,29 @@ def _note_client_declaration(method, params):
         pass
 
 
+def _invalid_message_error(problem):
+    """A JSON-RPC -32600 answer for a body that is not a single request object.
+
+    An empty id is correct here: a body that is not an object has no id to echo. Used instead of
+    `_mcp_error`, which suppresses the whole response when the id is None."""
+    return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": problem}}
+
+
 def _mcp_dispatch(msg, headers=None, session_id=None):
     """Run one JSON-RPC message; return (http_status, response dict or None).
 
     `headers` are the HTTP request headers on Streamable HTTP (checked against the body for
     modern requests); None on the legacy SSE transport, which passes its `session_id` so a
     destructive call can ask the person over that session. A notification has no response."""
+    if not isinstance(msg, dict):
+        # A JSON array (JSON-RPC batch, which MCP dropped after 2025-03-26), a string, a number or
+        # null used to reach msg.get() below and raise: the HTTP connection was closed with no
+        # answer at all, and on the SSE transport the dispatch thread died after the 202 accepted,
+        # so the client waited for a response that was never going to come (measured 2026-11-11).
+        # JSON-RPC has an answer for this: -32600 Invalid Request.
+        return 400, _invalid_message_error(
+            "a request must be a JSON object; JSON-RPC batches (arrays) are not supported and "
+            "each request must be sent on its own")
     method = msg.get("method", "")
     msg_id = msg.get("id")
     params = msg.get("params") or {}

@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+**A JSON body that is not an object dropped the connection with no answer.** A JSON-RPC batch
+(`[{"jsonrpc":"2.0",…}]`), a bare string, a number or `null` raised `AttributeError` on `msg.get`
+before any dispatch, so Streamable HTTP closed the socket and the legacy SSE transport answered
+`202` and then killed the dispatch thread — the client waited for a reply that could never come
+(measured 2026-11-11 on both transports; MCP dropped JSON-RPC batches after 2025-03-26). Both now
+answer `-32600 Invalid Request` with `id: null`, on the HTTP response, before anything is queued.
+
+**A reused or forged approval token started a second question instead of being denied.**
+`lib/consent.py` says a stale or reused token, or a changed call, means "denied, nothing was
+changed", but `check` fell through to a fresh `input_required` whenever the token did not match:
+a token that had just been accepted, replayed, came back as a new question (measured 2026-11-11).
+An answer whose token is unknown, already used, or issued for other arguments is now denied, and
+the token stays single use.
+
+**`arguments` that is not an object reported an internal error.** `tools/call` with
+`"arguments": "abc"` reached the tool's own body and answered
+`'str' object has no attribute 'items'`; it now says `arguments must be a JSON object, not str`,
+and a `params` that is not an object is refused the same way instead of raising.
+
+**`find_in_file` said "no matches" for a regex its engine refused.** `find_all` answers `[]` for an
+invalid pattern, so `regex: true, pattern: "([a-z"` looked like an absence of matches (measured
+2026-11-11). When a regex search returns nothing and Python's engine also rejects the pattern, the
+reply carries a warning that the search may have failed rather than found nothing. A pattern is
+never refused on Python's engine alone — Sublime's is Oniguruma, not `re`.
+
+**`get_view_regions` cut its list at 500 without saying so.** A view holding 600 regions under one
+key answered 500 of them and nothing else, so a caller counted 500 and believed it (measured
+2026-11-11). The reply now carries `total` per key, and `truncated` plus a note when the list was
+cut.
+
+**`str_replace_based_edit_tool` insert echoed the line number it was given, not the one it used.**
+`insert_line: 999` in a 6-line buffer appended at the end and answered `after_line: 999`. The reply
+now carries the line the text landed after plus `requested_line` and a note when the number was past
+the end (measured 2026-11-11).
+
 **`get_view_chars` answered with a range that does not exist on a negative request.** `begin: -9,
 end: -2` on a 19-character buffer clamped only the begin, so the normalising swap answered
 `begin: -2` — a position before the start of the buffer — for content that was really an empty range

@@ -4,6 +4,7 @@ MCP server for Sublime Text 4 — lets AI agents read and control a running edit
 
 [![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue)](https://www.paypal.me/DChitester)
 
+Donate via PayPal: https://www.paypal.me/DChitester
 Contact: donaldchitester@gmail.com
 
 ## What it is

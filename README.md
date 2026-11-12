@@ -2,6 +2,8 @@
 
 MCP server for Sublime Text 4 — lets AI agents read and control a running editor.
 
+[![Support on Patreon](https://img.shields.io/badge/Support-Patreon-orange)](https://www.patreon.com/dpchitester)
+
 ## What it is
 
 sublime-commander is a Sublime Text plugin that speaks the [Model Context Protocol](https://modelcontextprotocol.io). An agent connects to it over HTTP and works with the editor you already have open: it reads files, edits text, runs commands, and — on Windows — sees the screen and answers dialogs.

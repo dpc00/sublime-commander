@@ -77,7 +77,7 @@ from .lib.search_results import panel_search_pattern, parse_find_results, search
 # Single source of truth for the version this plugin advertises over MCP.
 # Keep in step with server.json (no automated test enforces this; check by
 # hand on release).
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 from .lib.mcp_http_policy import is_oauth_discovery_path, send_no_authorization
 
@@ -1518,6 +1518,7 @@ def _capture_console_win(params):
             "panel": window.active_panel(),
             "view": view,
             "selection": [(r.a, r.b) for r in view.sel()] if view else None,
+            "viewport": view.viewport_position() if view else None,
             "clipboard": sublime.get_clipboard(),
             "foreground": foreground,
         }
@@ -1807,6 +1808,24 @@ def _capture_console_win(params):
         tr("restore_ui: clipboard + cursor restored")
         sublime.set_timeout(restore_focus, waits["restore"])
 
+    def restore_viewport():
+        """Put the reader back where they were.
+
+        Showing the console panel changes the height of the view, so the same pixel
+        offset points at different text afterwards: a capture taken while the reader was
+        scrolled up moved the tab under them (2026-11-16: "NOTHING SHOULD BE ALLOWED TO
+        CHANGE MY POSITION IN THE SCROLLBACK, EVER").
+        """
+        saved_viewport = snapshot.get("viewport")
+        view = snapshot.get("view")
+        if saved_viewport is None or not view or not view.is_valid():
+            return
+        try:
+            view.set_viewport_position(saved_viewport, False)
+            tr("restore_viewport: restored {}".format(saved_viewport))
+        except Exception as exc:
+            tr("restore_viewport: failed {}".format(exc))
+
     def restore_focus():
         tr("restore_focus: start")
         previous_view = snapshot["view"]
@@ -1817,6 +1836,9 @@ def _capture_console_win(params):
                 # A stray click or key must not leave a different selection behind.
                 previous_view.sel().clear()
                 previous_view.sel().add_all([sublime.Region(a, b) for a, b in saved])
+            # hide_panel schedules a layout pass that would clobber a synchronous set, so
+            # the position is applied on the next tick instead of inside this callback.
+            sublime.set_timeout(restore_viewport, 0)
         previous_foreground = snapshot["foreground"]
         if previous_foreground and previous_foreground != hwnd:
             tr("restore_focus: SetForegroundWindow(previous)")
@@ -1828,6 +1850,7 @@ def _capture_console_win(params):
             def burn_first_overlay():
                 snapshot["window"].run_command("show_overlay", {"overlay": "goto"})
                 snapshot["window"].run_command("hide_overlay")
+                sublime.set_timeout(restore_viewport, 0)
                 tr("restore_focus: done")
                 done.set()
             poll_until(lambda: user32.GetForegroundWindow() != hwnd,

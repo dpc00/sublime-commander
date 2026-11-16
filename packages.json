@@ -7,14 +7,19 @@
       "author": "dpc00",
       "homepage": "https://github.com/dpc00/sublime-commander",
       "details": "https://github.com/dpc00/sublime-commander",
-      "labels": ["ai", "mcp"],
+      "labels": [
+        "ai",
+        "mcp"
+      ],
       "releases": [
         {
           "sublime_text": ">=4000",
-          "platforms": ["*"],
-          "version": "1.4.0",
-          "url": "https://codeload.github.com/dpc00/sublime-commander/zip/v1.4.0",
-          "date": "2026-11-10 03:30:00"
+          "platforms": [
+            "*"
+          ],
+          "version": "1.4.1",
+          "url": "https://codeload.github.com/dpc00/sublime-commander/zip/v1.4.1",
+          "date": "2026-11-16 09:40:00"
         }
       ]
     }

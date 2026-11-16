@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**The visible console capture moved the person's scroll position.** Showing the console panel changes
+the height of the view, and the capture restored the panel, clipboard, cursor, active view, selection
+and foreground window — everything except `viewport_position()`. A capture taken while the person was
+reading therefore scrolled the tab under them: the same pixel offset then pointed at different text.
+The snapshot now records `viewport_position()`, and `restore_viewport()` re-applies it via
+`sublime.set_timeout(..., 0)` — on the next tick, because `hide_panel` queues a layout pass that would
+clobber a synchronous set — both after refocusing the view and again after the window is sent to the
+back. Reported 2026-11-16 by the person whose tab was being read: "NOTHING SHOULD BE ALLOWED TO CHANGE
+MY POSITION IN THE SCROLLBACK, EVER".
+
 **`close_duplicate_tabs`: duplicates survive a reload, so they need removing.** Sublime's session
 keeps every tab it had, so several tabs of one file stay there across a plugin reload *and* a restart
 (confirmed 2026-11-11: duplicates spread over three windows, all still present after a restart) --

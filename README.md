@@ -13,8 +13,13 @@ sublime-commander is a Sublime Text plugin that speaks the [Model Context Protoc
 
 It runs inside Sublime's own plugin host, so there is no automation layer in between and no helper process to keep alive. Everything an agent does goes through Sublime's API, which means it sees the same tabs, selections, panels and menus you do.
 
+## Scope
+
+This is a **personal developer tool**, written for one person driving their own editor on their own machine. It binds to `127.0.0.1` only and, by default, **does not authenticate**: any process running as the same user can connect, and `eval_python` runs arbitrary code in Sublime's host process by design. That posture is deliberate — it keeps the setup to one line of client configuration — and it is why the tool is not submitted to a public package channel as a general-purpose install. Run it on loopback, optionally set `auth_token` if other software on the machine is untrusted, and do not expose its ports to a network.
+
 ## Table of contents
 
+- [Scope](#scope)
 - [Install](#install)
 - [Usage](#usage)
 - [Configuration](#configuration)
